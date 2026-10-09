@@ -9,7 +9,7 @@ This is a standalone repository and product. Do not read or import from `../llm-
 ## Read first
 1. `README.md` — what it is, and the one-machine quick start (packages, Docker, macOS from source).
 2. `docs/protocol.md` — the contract (v1–v5.3). Change it only via the lead, in one commit with `crates/proto`, `sdk/ts/src/types.ts`, `controlplane/internal/events/types.go` (and `web/src/lib/types.ts`), plus the SDKs that read the changed fields (`sdk/python`, `sdk/go`, `sdk/java`; `sdk/rust` uses `crates/proto` itself).
-3. `docs/decisions.md` — D1–D32, decisions already made; do not re-open them.
+3. `docs/decisions.md` — D1–D33, decisions already made; do not re-open them.
 4. `docs/security.md` — controls in place vs deferred (M1–M45); `SECURITY.md` — how to report.
 5. `docs/deployment.md` — production: roles, ports, permissions, install methods, TLS, Firecracker workers, operations. `docs/airgap.md` — the offline install.
 

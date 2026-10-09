@@ -518,7 +518,11 @@ impl Podman {
             "env": self.sandbox_env(spec, agent_token),
             "mounts": mounts,
             "read_only_filesystem": true,
-            "no_new_privileges": true,
+            // No container-wide no_new_privileges (D33): under crun's AppArmor profile
+            // (Ubuntu 24.04) it stacks the container's label, and the profile then refuses
+            // every signal between the sandbox's own processes — the `timeout_ms` killpg,
+            // `kill`, `timeout` all fail with EACCES. The guest agent sets PR_SET_NO_NEW_PRIVS
+            // on every process it starts (`harden::apply`), so the workload still has it.
             "cap_drop": ["ALL"],
             "resource_limits": resource_limits(&spec.limits),
             // v4: NOT `remove: true`. An autoremove container is deleted the
