@@ -337,7 +337,7 @@ payload = "<sandbox_id>:<unix_exp>"
 token   = base64url(payload) + ":" + base64url(hmac_sha256(secret, payload))
 ```
 
-Verify: split on the last `:`, recompute, constant-time compare, check `exp`, check `sandbox_id` equals the path's `{id}`. Default lifetime 12 h (`SBX_TOKEN_TTL_SECS`). v2: `DELETE /sandboxes/{id}` puts the id in an in-memory deny set until that lifetime elapses, so a leaked token cannot be replayed against a reused id. Implemented once in `proto::hmac_token` and once in Go (~15 lines).
+Verify: split on the last `:`, recompute, constant-time compare, check `exp`, check `sandbox_id` equals the path's `{id}`. Default lifetime 12 h (`SBX_TOKEN_TTL_SECS`). v2: `DELETE /sandboxes/{id}` puts the id in an in-memory deny set until that lifetime elapses, so a leaked token cannot be replayed against a reused id; any request with it then answers `401 token revoked with its sandbox`, which the SDKs' `destroy()` treats as already destroyed (so destroy is idempotent). Implemented once in `proto::hmac_token` and once in Go (~15 lines).
 
 ## 6. Egress policy file (`policy/egress.json`)
 
