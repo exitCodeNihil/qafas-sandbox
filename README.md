@@ -31,10 +31,6 @@ Every sandbox has a size it cannot raise — `micro` (0.5 CPU, 512 MiB), `mini` 
 
 Control plane and worker on one Linux host (x86_64 or arm64; validated on Ubuntu 24.04, Linux Mint 22 and Rocky Linux 9; 4 CPUs and 8 GB RAM are plenty to try it). Pick **A** or **B**; **C** is a macOS developer machine.
 
-> While the repository is private, release downloads need a GitHub login: use
-> `gh release download v$V -p '<file>'` instead of `curl`, and
-> `gh auth token | docker login ghcr.io -u <you> --password-stdin` before pulling images.
-
 ### A. Packages (Ubuntu, Mint, RHEL, Rocky)
 
 ```sh
@@ -94,6 +90,8 @@ export SBX_URL=http://localhost:7800 SBX_ADMIN_TOKEN=admin      # in another ter
 
 ### Your first sandbox
 
+![sbx run on a fresh install: the workspace at the same path inside the sandbox, example.com fetched, google.com refused by the egress proxy](docs/media/quickstart.gif)
+
 Open the dashboard at `http://<this host>:7800` and sign in with `SBX_ADMIN_TOKEN`; **Hosts** shows the worker and its capacity. From the same machine:
 
 ```sh
@@ -105,6 +103,10 @@ sbx events <sandbox_id> --follow             # its process, file and network tim
 ```
 
 Inside: your current directory at the **same absolute path**, a Debian userland (git, curl, ripgrep, python3 + uv, node 22, headless Chromium), no network except what `/etc/qafas/egress.json` allows (`curl https://example.com` works, `curl https://google.com` is refused by the proxy), and the size's CPU, memory, disk and process limits.
+
+The dashboard keeps every sandbox's process, file and network timeline, each allow and deny the egress proxy decided, and the alerts — here a sandbox reading the planted `~/.aws/credentials` and probing the cloud metadata address:
+
+![The dashboard: overview, a live sandbox, egress decisions, alerts and the graded base template](docs/media/dashboard.gif)
 
 To hand access to people or agents, create an **API key** in the dashboard (pick the sizes and tiers it may use) and give them `SBX_API_KEY` instead of the admin token. Coding agents plug in through `sbx mcp` or the snippets in `deploy/harnesses/` — see the [TypeScript SDK README](sdk/ts/README.md).
 
