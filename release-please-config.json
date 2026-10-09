@@ -15,6 +15,7 @@
         { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='agent-core')].version" },
         { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='guest-agent')].version" },
         { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='qafas')].version" },
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='qafas-sandbox')].version" },
         { "type": "toml", "path": "sdk/python/pyproject.toml", "jsonpath": "$.project.version" },
         { "type": "json", "path": "sdk/ts/package.json", "jsonpath": "$.version" },
         { "type": "json", "path": "sdk/ts/package-lock.json", "jsonpath": "$.version" },
@@ -25,7 +26,12 @@
         { "type": "generic", "path": "deploy/docker/.env.example" },
         { "type": "generic", "path": "README.md" },
         { "type": "generic", "path": "docs/deployment.md" },
-        { "type": "generic", "path": "docs/airgap.md" }
+        { "type": "generic", "path": "docs/airgap.md" },
+        { "type": "generic", "path": "sdk/go/version.go" },
+        { "type": "generic", "path": "sdk/go/README.md" },
+        { "type": "generic", "path": "sdk/rust/README.md" },
+        { "type": "generic", "path": "sdk/java/pom.xml" },
+        { "type": "generic", "path": "sdk/java/src/main/java/io/github/exitcodenihil/qafas/Qafas.java" }
       ]
     }
   }
