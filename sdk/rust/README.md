@@ -8,7 +8,7 @@ From the repository (it is not published to crates.io):
 
 ```toml
 [dependencies]
-qafas-sandbox = { git = "https://github.com/exitCodeNihil/qafas-sandbox", tag = "v0.1.0" }  # x-release-please-version
+qafas-sandbox = { git = "https://github.com/exitCodeNihil/qafas-sandbox", tag = "v0.2.0" }  # x-release-please-version
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

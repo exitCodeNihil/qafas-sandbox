@@ -3,7 +3,7 @@
 How to run Qafas Sandbox beyond one machine: a control plane (the **server**) and any number of workers (the **agents**), each on its own host. It covers requirements, network and firewall rules, OS permissions, the install methods, TLS, egress, and day-2 operations. To try it on one machine first, see the [README](../README.md). For a datacenter with no internet, follow [airgap.md](airgap.md) after reading this.
 
 ```sh
-V=0.1.0      # the release every command below installs  (x-release-please-version)
+V=0.2.0      # the release every command below installs  (x-release-please-version)
 ```
 
 ## 1. Roles

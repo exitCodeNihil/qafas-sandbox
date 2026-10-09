@@ -3,7 +3,7 @@
 // Frozen at Gate A; v3 additive.
 // Change proto first, then this file and controlplane/internal/events/types.go in one commit.
 
-export const VERSION = "0.1.0"; // x-release-please-version
+export const VERSION = "0.2.0"; // x-release-please-version
 export const GUEST_AGENT_PORT = 7777;
 export const QAFAS_PORT = 7700;
 export const CONTROLPLANE_PORT = 7800;

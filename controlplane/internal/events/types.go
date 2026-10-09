@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	Version          = "0.1.0" // x-release-please-version
+	Version          = "0.2.0" // x-release-please-version
 	GuestAgentPort   = 7777
 	QafasPort        = 7700
 	ControlplanePort = 7800
