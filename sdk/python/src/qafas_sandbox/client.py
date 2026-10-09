@@ -379,7 +379,10 @@ class Sandbox:
             raise SandboxError(status, data)
 
     def destroy(self) -> None:
+        """Idempotent: a 404, or the worker's 401 for a token revoked with its sandbox, means already gone."""
         status, data = _http("DELETE", _agent_base(self.endpoint), {"Authorization": f"Bearer {self.token}"})
+        if status == 401 and b"token revoked with its sandbox" in data:
+            return
         if status >= 400 and status != 404:
             raise SandboxError(status, data)
 

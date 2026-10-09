@@ -125,6 +125,9 @@ function extractError(body: string): string | undefined {
 	}
 }
 
+/** The worker's 401 body once a sandbox's own token was revoked by its destroy (docs/protocol.md §5). */
+const REVOKED = "token revoked with its sandbox";
+
 async function throwApiError(res: Response): Promise<never> {
 	throw new SandboxApiError(res.status, await res.text());
 }
@@ -423,9 +426,13 @@ export class SandboxClient {
 		if (!res.ok) return throwApiError(res);
 	}
 
+	/** Idempotent: a 404, or the worker's 401 for a token revoked with its sandbox, means already gone. */
 	async destroy(): Promise<void> {
 		const res = await fetch(qafasBase(this.endpoint), { method: "DELETE", headers: this.headers() });
-		if (!res.ok && res.status !== 404) return throwApiError(res);
+		if (res.ok || res.status === 404) return;
+		const body = await res.text();
+		if (res.status === 401 && body.includes(REVOKED)) return;
+		throw new SandboxApiError(res.status, body);
 	}
 
 	/** Alias of destroy() — the name Daytona/E2B users expect. */
