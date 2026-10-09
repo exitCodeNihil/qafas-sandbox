@@ -71,6 +71,19 @@ jobs:
         working-directory: sdk/python
         run: python -m unittest discover -s tests
 
+      - name: go sdk — fmt, vet, tests
+        working-directory: sdk/go
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17", cache: maven, cache-dependency-path: sdk/java/pom.xml }
+      - name: java sdk — build, tests
+        working-directory: sdk/java
+        run: mvn -B verify
+
       # The template security scan (docs/security.md M43) on a stock image with the vm
       # tier's container flags: every check must pass, or the script has regressed.
       - name: template scan — probe script against debian:bookworm-slim

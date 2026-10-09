@@ -340,8 +340,25 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with: { packages-dir: sdk/python/dist }
 
+  # The Java SDK as a jar and its pom (sdk/java/README.md: mvn install:install-file); not on Maven Central.
+  java-sdk:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17", cache: maven, cache-dependency-path: sdk/java/pom.xml }
+      - name: Jar and pom
+        working-directory: sdk/java
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}", V: "${{ needs.prepare.outputs.version }}" }
+        run: |
+          mvn -B package
+          cp "target/qafas-sandbox-$V.jar" . && cp pom.xml "qafas-sandbox-$V.pom"
+          gh release upload "$TAG" "qafas-sandbox-$V.jar" "qafas-sandbox-$V.pom" --clobber
+
   finalize:
-    needs: [prepare, linux, macos, image, firecracker]
+    needs: [prepare, linux, macos, image, firecracker, java-sdk]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -350,7 +367,11 @@ jobs:
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
         run: |
           set -e; mkdir -p dl && cd dl
-          gh release download "$TAG" -p '*.tar.gz' -p '*.tar.zst' -p '*.tgz' -p '*.deb' -p '*.rpm' -p '*.txt' -p '*.sh'
+          gh release download "$TAG" -p '*.tar.gz' -p '*.tar.zst' -p '*.tgz' -p '*.deb' -p '*.rpm' -p '*.txt' -p '*.sh' -p '*.jar' -p '*.pom'
           sha256sum -- * > SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber
           gh release edit "$TAG" --draft=false --latest
+          # The Go SDK is the module in sdk/go, whose versions Go reads from sdk/go/vX.Y.Z tags.
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" -q .object.sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/sdk/go/$TAG" -f sha="$sha" >/dev/null 2>&1 ||
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/sdk/go/$TAG" -f sha="$sha" -F force=true >/dev/null
