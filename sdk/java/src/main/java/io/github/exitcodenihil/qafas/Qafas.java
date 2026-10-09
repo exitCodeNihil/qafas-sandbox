@@ -23,7 +23,7 @@ import java.util.Map;
 public final class Qafas {
     private Qafas() {}
 
-    public static final String VERSION = "0.1.0"; // x-release-please-version
+    public static final String VERSION = "0.2.0"; // x-release-please-version
 
     public static final String HDR_PI_SESSION = "x-pi-session";
     public static final String HDR_TOOL_CALL_ID = "x-tool-call-id";

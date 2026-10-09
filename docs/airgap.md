@@ -10,7 +10,7 @@ It takes four steps:
 4. **Open** the few flows the segments need, and verify nothing else leaves.
 
 ```sh
-V=0.1.0      # the release being installed  (x-release-please-version)
+V=0.2.0      # the release being installed  (x-release-please-version)
 ```
 
 ## 1. Stage the artifacts

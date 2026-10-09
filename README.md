@@ -34,7 +34,7 @@ Control plane and worker on one Linux host (x86_64 or arm64; validated on Ubuntu
 ### A. Packages (Ubuntu, Mint, RHEL, Rocky)
 
 ```sh
-V=0.1.0                                     # x-release-please-version
+V=0.2.0                                     # x-release-please-version
 R=https://github.com/exitCodeNihil/qafas-sandbox/releases/download/v$V
 
 # Debian, Ubuntu, Mint
@@ -65,7 +65,7 @@ export SBX_URL=http://127.0.0.1:7800 SBX_ADMIN_TOKEN=$(sudo sed -n 's/^SBX_ADMIN
 Needs Docker Engine 26 or later with the compose plugin (`apt install docker.io docker-compose-v2`, or [Docker's packages](https://docs.docker.com/engine/install/)). podman works too: set `CONTAINER_SOCK=/run/podman/podman.sock` in `.env`.
 
 ```sh
-V=0.1.0                                     # x-release-please-version
+V=0.2.0                                     # x-release-please-version
 G=https://raw.githubusercontent.com/exitCodeNihil/qafas-sandbox/v$V/deploy/docker
 mkdir qafas && cd qafas
 curl -fLO $G/compose.yml && curl -fL $G/.env.example -o .env
