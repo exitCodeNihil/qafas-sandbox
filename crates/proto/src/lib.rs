@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = "0.8.1"; // x-release-please-version
+pub const VERSION: &str = "0.1.0"; // x-release-please-version
 pub const GUEST_AGENT_PORT: u16 = 7777;
 pub const QAFAS_PORT: u16 = 7700;
 pub const CONTROLPLANE_PORT: u16 = 7800;

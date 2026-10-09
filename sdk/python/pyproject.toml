@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qafas-sandbox"
-version = "0.8.1"
+version = "0.1.0"
 description = "Python client for the Qafas Sandbox (qafas / control plane): acquire, exec, filesystem, upload/download, lifecycle, snapshots, sessions, preview URLs, browser CDP."
 readme = "README.md"
 requires-python = ">=3.10"
