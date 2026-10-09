@@ -7,7 +7,7 @@ Go client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-sandbox): t
 From this repository, by tag (it is not on any other registry; the module is versioned with the server, so use the SDK version that matches your server):
 
 ```bash
-go get github.com/exitCodeNihil/qafas-sandbox/sdk/go@v0.1.0
+go get github.com/exitCodeNihil/qafas-sandbox/sdk/go@v0.1.0  # x-release-please-version
 ```
 
 Each release pushes a `sdk/go/vX.Y.Z` tag, which is how Go resolves a module that lives in a subdirectory. Import as `qafas "github.com/exitCodeNihil/qafas-sandbox/sdk/go"` (package name `qafas`). Requires Go 1.22.
