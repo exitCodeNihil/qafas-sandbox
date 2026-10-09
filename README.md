@@ -116,7 +116,7 @@ To hand access to people or agents, create an **API key** in the dashboard (pick
 |---|---|
 | [docs/deployment.md](docs/deployment.md) | production: separate servers and agents, network and firewall rules, OS permissions, TLS, Firecracker workers, upgrades, backups, monitoring |
 | [docs/airgap.md](docs/airgap.md) | installing in a datacenter with no internet, including micro-segmented networks and private registries |
-| [sdk/ts](sdk/ts/README.md) · [sdk/python](sdk/python/README.md) | the SDKs, the `sbx` CLI, the MCP server and coding-agent integration |
+| [TypeScript / JavaScript](sdk/ts/README.md) · [Python](sdk/python/README.md) · [Go](sdk/go/README.md) · [Rust](sdk/rust/README.md) · [Java](sdk/java/README.md) | the SDKs (one package per language, released with the server), the `sbx` CLI, the MCP server and coding-agent integration |
 | [SECURITY.md](SECURITY.md) · [docs/security.md](docs/security.md) | reporting a vulnerability · every control in place and every one knowingly deferred |
 | [docs/protocol.md](docs/protocol.md) · [docs/decisions.md](docs/decisions.md) | the API contract · why things are the way they are (for contributors) |
 

@@ -1,6 +1,6 @@
 # Protocol — the contract everything keys on
 
-v1 frozen at Gate A (2026-09-08); **v2 additions** (marked v2) frozen 2026-09-08 for phase 2; **v5 additions** (sizes, limits, usage; marked v5, §3a "v5 sizes and limits") frozen 2026-09-15. v1 bodies stay valid: every v2–v5 field has a default. Source of truth is `crates/proto/src/lib.rs`; `sdk/ts/src/types.ts` and `controlplane/internal/events/types.go` mirror it field-for-field. Change here first, then in all three files, in the same commit.
+v1 frozen at Gate A (2026-09-08); **v2 additions** (marked v2) frozen 2026-09-08 for phase 2; **v5 additions** (sizes, limits, usage; marked v5, §3a "v5 sizes and limits") frozen 2026-09-15. v1 bodies stay valid: every v2–v5 field has a default. Source of truth is `crates/proto/src/lib.rs`; `sdk/ts/src/types.ts` and `controlplane/internal/events/types.go` mirror it field-for-field. Change here first, then in all three files, in the same commit — and in the Python, Go and Java SDKs where they read the changed fields (`sdk/rust` uses `crates/proto` directly).
 
 Data path: `pi extension → qafas → guest-agent`. The Go control plane is never on the data path; it registers hosts, mints scoped tokens, ingests events, serves the UI.
 
