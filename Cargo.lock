@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-core"
-version = "0.8.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "guest-agent"
-version = "0.8.1"
+version = "0.1.0"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.8.1"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "qafas"
-version = "0.8.1"
+version = "0.1.0"
 dependencies = [
  "agent-core",
  "anyhow",
