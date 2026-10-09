@@ -1,0 +1,39 @@
+# nfpm spec for the control plane package (deb + rpm). Built by scripts/package.sh, which
+# sets VERSION, ARCH (arm64|amd64) and CP (the static binary with the dashboard embedded).
+name: qafas-controlplane
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: admin
+priority: optional
+maintainer: Qafas Sandbox maintainers <https://github.com/exitCodeNihil/qafas-sandbox/issues>
+vendor: Qafas Sandbox
+homepage: https://github.com/exitCodeNihil/qafas-sandbox
+license: MIT
+description: |
+  Qafas Sandbox control plane.
+  Fleet registry, sandbox placement, sessions, traces, alerts and the web
+  dashboard, in one static binary on SQLite. Runs as the controlplane user;
+  tokens are minted on first install into /etc/controlplane/env.
+contents:
+  - src: ${CP}
+    dst: /usr/bin/controlplane
+    file_info:
+      mode: 0755
+  - src: deploy/controlplane/controlplane.service
+    dst: /usr/lib/systemd/system/controlplane.service
+  - src: deploy/controlplane/env.example
+    dst: /etc/controlplane/env
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: controlplane
+  - src: LICENSE
+    dst: /usr/share/doc/qafas-controlplane/copyright
+scripts:
+  preinstall: packaging/scripts/controlplane.preinstall
+  postinstall: packaging/scripts/controlplane.postinstall
+  preremove: packaging/scripts/controlplane.preremove
+  postremove: packaging/scripts/systemd.postremove

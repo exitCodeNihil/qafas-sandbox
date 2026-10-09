@@ -1,0 +1,117 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with: { go-version-file: controlplane/go.mod, cache-dependency-path: controlplane/go.sum }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            sdk/ts/package-lock.json
+            pi-extension/package-lock.json
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # rustup reads rust-toolchain.toml; the musl targets are what the release ships.
+      - run: rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install cargo-zigbuild
+
+      - name: rust — fmt, tests
+        run: |
+          cargo fmt --all --check
+          cargo test --workspace
+
+      - name: rust — release binaries for both musl targets (what a release ships)
+        run: make guest-agent qafas-linux
+
+      # web before go: the control plane go:embeds controlplane/web/dist
+      - name: web — typecheck, build
+        run: npm --prefix web ci && npm --prefix web run build
+
+      - name: go — fmt, vet, tests (race)
+        working-directory: controlplane
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race ./...
+
+      - name: ts sdk — build, tests
+        working-directory: sdk/ts
+        run: npm ci && npm run build && npm test
+
+      - name: pi extension — typecheck
+        working-directory: pi-extension
+        run: npm ci && npx tsc --noEmit
+
+      - name: python sdk — tests
+        working-directory: sdk/python
+        run: python -m unittest discover -s tests
+
+      # The template security scan (docs/security.md M43) on a stock image with the vm
+      # tier's container flags: every check must pass, or the script has regressed.
+      - name: template scan — probe script against debian:bookworm-slim
+        run: |
+          shellcheck -s sh -S warning images/probe/scan.sh
+          out=$(docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+                  --read-only --tmpfs /tmp --user 1000:1000 -v "$PWD/images/probe/scan.sh:/scan.sh:ro" \
+                  debian:bookworm-slim sh /scan.sh)
+          echo "$out"
+          test "$(echo "$out" | grep -c '"id"')" -ge 17
+          ! echo "$out" | grep -q '"ok":false'
+
+      # The air-gap image scripts (docs/airgap.md) end to end: save a list into a tarball,
+      # load it into a registry, and pull every image back from there.
+      - name: image scripts — save, load into a registry, pull back
+        run: |
+          shellcheck -S warning scripts/qafas-save-images.sh scripts/qafas-load-images.sh
+          docker run -d --rm --name reg -p 127.0.0.1:5000:5000 registry:2
+          printf 'docker.io/library/busybox:1.36\ndocker.io/library/alpine:3.20\n' > /tmp/images.txt
+          scripts/qafas-save-images.sh --image-list /tmp/images.txt --images /tmp/images.tar.gz
+          docker rmi docker.io/library/busybox:1.36 docker.io/library/alpine:3.20
+          CONTAINER_CLI=docker scripts/qafas-load-images.sh --images /tmp/images.tar.gz --image-list /tmp/images.txt --registry 127.0.0.1:5000
+          docker rmi busybox:1.36 alpine:3.20 127.0.0.1:5000/library/busybox:1.36 127.0.0.1:5000/library/alpine:3.20
+          docker pull 127.0.0.1:5000/library/busybox:1.36
+          docker pull 127.0.0.1:5000/library/alpine:3.20
+          docker rm -f reg
+
+      - name: packages — deb + rpm for both arches (what a release ships)
+        run: |
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_amd64.deb -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          for arch in arm64 amd64; do
+            (cd controlplane && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o ../dist/controlplane-linux-$arch ./cmd/controlplane)
+          done
+          scripts/package.sh "$(cat VERSION)"
+          dpkg-deb --info out/qafas_*_amd64.deb | grep -E 'Package|Depends'
+
+  macos:
+    name: macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  qafas as a per-user launchd agent.
+
+  Install:
+    cp deploy/launchd/com.sbx.qafas.plist ~/Library/LaunchAgents/
+    # edit the two absolute paths below, then:
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.sbx.qafas.plist
+    launchctl kickstart -p gui/$UID/com.sbx.qafas
+
+  Stop / uninstall:
+    launchctl bootout gui/$UID/com.sbx.qafas
+
+  A *user* agent, not a system daemon, deliberately: the native tier runs the
+  sandboxed commands as this user, against this user's toolchains and this
+  user's workspace. Running it as root would grant the sandbox more than the
+  developer has, which is the opposite of the point.
+
+  launchd stops the job with SIGTERM, which qafas handles: it destroys every
+  live sandbox and container before exiting.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sbx.qafas</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/qafas</string>
+    <string>serve</string>
+  </array>
+
+  <!-- Where relative paths in qafas.toml resolve from. -->
+  <key>WorkingDirectory</key>
+  <string>/usr/local/share/qafas</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SBX_CONFIG</key>
+    <string>/usr/local/share/qafas/qafas.toml</string>
+    <!-- podman's socket lives under a per-user temp dir, so PATH has to find
+         the CLI that reports it. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <!-- Do not respawn faster than this after a crash loop. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/qafas.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/qafas.log</string>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <!-- Warm pools, container port forwards and one listener per native sandbox
+       all cost file descriptors. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+</dict>
+</plist>

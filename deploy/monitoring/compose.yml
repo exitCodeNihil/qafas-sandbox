@@ -1,0 +1,120 @@
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.0.0
+    container_name: sbx-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./rules.yml:/etc/prometheus/rules.yml:ro
+      - ./token:/etc/prometheus/token:ro
+      - prometheus-storage:/prometheus
+    # prometheus.yml reaches the control plane as host.docker.internal; Linux needs the mapping.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    networks:
+      - sbx-monitoring
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:9090/-/healthy']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: sbx-alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    ports:
+      - '9093:9093'
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-storage:/alertmanager
+    networks:
+      - sbx-monitoring
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:9093/-/healthy']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: sbx-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-storage:/var/lib/grafana
+    networks:
+      - sbx-monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:3000/api/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Traces. The control plane pushes OTLP/HTTP to localhost:4318 (Settings → Observability,
+  # provider "otlp"); Grafana reads them back through the Jaeger datasource.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: sbx-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - '16686:16686'
+      - '4318:4318'
+    networks:
+      - sbx-monitoring
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:16686/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: sbx-node-exporter
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - '9100:9100'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - sbx-monitoring
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://localhost:9100/metrics']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  prometheus-storage:
+  alertmanager-storage:
+  grafana-storage:
+
+networks:
+  sbx-monitoring:
+    driver: bridge

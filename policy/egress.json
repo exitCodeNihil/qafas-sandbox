@@ -1,0 +1,5 @@
+{
+  "allow": ["github.com", "*.github.com", "registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "example.com", "iana.org", "*.iana.org"],
+  "deny_cidrs_extra": [],
+  "allow_private_cidrs": []
+}

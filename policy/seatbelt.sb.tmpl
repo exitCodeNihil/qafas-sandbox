@@ -1,0 +1,140 @@
+; Seatbelt profile for one native-tier sandbox. Rendered by
+; crates/qafas/src/seatbelt.rs. The only substitutions are the double-brace
+; placeholders below; everything else is literal SBPL.
+;
+; SBPL is last-match-wins, so the order below is the policy:
+;   1. deny everything
+;   2. allow the process/IPC/sysctl surface a shell and a toolchain need
+;   3. allow reads of the system, the toolchains and the sandbox's own dirs
+;   4. deny every write, tagged workspace.escape
+;   5. allow writes to the workspace, the scratch dir and the fake home
+;   6. deny reads of credential directories, tagged sensitive_path.read
+;   7. deny reads of the canaries, tagged canary.read
+;   8. allow one outbound destination: the egress proxy on loopback
+;
+; Every deny carries a message tag. `log stream` matches on it, which is how a
+; kernel denial becomes a security.alert attributed to the right sandbox — see
+; crates/qafas/src/sblog.rs.
+
+(version 1)
+(deny default (with message "{{TAG_DENIED}}"))
+
+; ---------------------------------------------------------------- process
+(allow process-exec)
+(allow process-fork)
+(allow process-info* (target same-sandbox))
+(allow signal (target same-sandbox))
+(allow mach-priv-task-port (target same-sandbox))
+(allow user-preference-read)
+(allow distributed-notification-post)
+
+; Mach services a shell, dyld, the resolver stubs and CoreFoundation need.
+; Named individually: (allow mach-lookup) with no filter is a hole big enough
+; to reach almost any system daemon.
+(allow mach-lookup
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.distributed_notifications@Uv3")
+  (global-name "com.apple.FontObjectsServer")
+  (global-name "com.apple.fonts")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.lsd.mapdb")
+  (global-name "com.apple.PowerManagement.control")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.trustd")
+  (global-name "com.apple.trustd.agent"))
+
+; POSIX shared memory and semaphores: Python multiprocessing, node's cluster.
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+
+(allow iokit-get-properties)
+(allow iokit-open
+  (iokit-registry-entry-class "IOSurfaceRootUserClient")
+  (iokit-registry-entry-class "RootDomainUserClient"))
+
+; Machine topology: every runtime reads these to size its thread pools.
+(allow sysctl-read)
+; Interface and routing tables (getifaddrs, ifconfig, netstat -r) are host
+; reconnaissance with no use inside a sandbox. kern.hostname stays readable:
+; uname(3) needs it and Node aborts without it.
+(deny sysctl-read (sysctl-name-prefix "net.") (with message "{{TAG_RECON}}"))
+(allow sysctl-write (sysctl-name "kern.tcsm_enable"))
+
+; ---------------------------------------------------------------- devices
+(allow file-ioctl
+  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random")
+  (literal "/dev/urandom") (literal "/dev/tty") (literal "/dev/dtracehelper"))
+(allow file-write-data
+  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty")
+  (literal "/dev/dtracehelper"))
+
+; ---------------------------------------------------------------- read
+(allow file-read*
+  (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt/homebrew")
+  (subpath "/System") (subpath "/Library") (subpath "/private/etc")
+  (subpath "/private/var/select") (subpath "/private/var/db/timezone")
+  (subpath "/private/var/db/mds") (subpath "/Applications/Xcode.app")
+  (subpath "/dev/fd")
+  ; The root-level symlinks themselves: readlink("/var/...") is denied without
+  ; these even when the resolved target is allowed.
+  (literal "/") (literal "/var") (literal "/tmp") (literal "/etc")
+  (literal "/private") (literal "/private/tmp") (literal "/private/var") (literal "/private/etc")
+  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random")
+  (literal "/dev/urandom") (literal "/dev/tty") (literal "/dev/dtracehelper")
+  ; CoreFoundation start-up reads every process makes; denying them is pure noise.
+  (literal "/dev/autofs_nowait")
+  (literal "{{REAL_HOME}}/.CFUserTextEncoding")
+  (regex #"^{{REAL_HOME}}/Library/Preferences/(ByHost/)?\.GlobalPreferences[^/]*\.plist$")
+  (regex #"^{{DARWIN_TMP}}/xcrun_db")
+{{READ_ALLOW}})
+
+; realpath() lstats every intermediate directory. Metadata only: this reveals
+; that a directory exists, never its contents.
+(allow file-read-metadata (vnode-type DIRECTORY))
+
+; ---------------------------------------------------------------- write
+; Broad deny first so anything the allow list below does not cover is both
+; blocked and reported as an escape attempt.
+(deny file-write* (subpath "/") (with message "{{TAG_ESCAPE}}"))
+
+(allow file-write*
+  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty")
+  (subpath "/dev/fd")
+  ; Apple's /usr/bin shims (git, python3, ...) run `xcrun`, which re-runs xcodebuild
+  ; (~900 ms) every time it cannot write its lookup cache here.
+  (regex #"^{{DARWIN_TMP}}/xcrun_db")
+{{WRITE_ALLOW}})
+
+; ---------------------------------------------------------------- secrets
+; After the read allow list, so these win over it.
+(deny file-read*
+{{READ_DENY}}
+  (with message "{{TAG_SENSITIVE_READ}}"))
+
+; Data reads only: listing the directory (metadata) is not a credential read.
+(deny file-read-data
+{{CANARY_DENY}}
+  (with message "{{TAG_CANARY}}"))
+
+; ---------------------------------------------------------------- network
+; The only reachable endpoint is the egress proxy, which enforces the domain
+; allowlist and resolves names on our side of the boundary (D7). No DNS, no
+; unix sockets.
+(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))
+(allow network-outbound (remote ip "localhost:{{PROXY_PORT}}"))
+; A dev server may listen (node binds :: by default, so the bind itself is
+; unrestricted) but only loopback peers may connect to it: the daemon's preview
+; proxy and, with SBX_NATIVE_LOOPBACK=all, the sandbox's own processes. Never
+; the LAN. Outbound to loopback is opt-in because host services listen there.
+(allow network-bind (local ip "*:*"))
+(allow network-inbound (local ip "localhost:*"))
+{{LOOPBACK_OUT}}
+; The shim's own listener, inside the scratch dir, is how the daemon reaches in.
+(allow network-bind (local unix-socket (subpath "{{SCRATCH}}")))
+(allow network-inbound (local unix-socket (subpath "{{SCRATCH}}")))

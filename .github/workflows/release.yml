@@ -1,0 +1,356 @@
+name: Release
+
+# Release Please keeps one release PR open on main, built from conventional commits
+# (release-please-config.json). Merging it bumps the version, writes CHANGELOG.md, tags
+# vX.Y.Z and opens the GitHub release as a draft; the jobs below then build everything in
+# this same run (a tag made with the default token would not start another workflow),
+# attach it, and `finalize` publishes the release once nothing is missing:
+#   qafas{,-controlplane}_<v>-1_{arm64,amd64}.deb, qafas-cli_<v>-1_all.deb      Debian/Ubuntu/Mint
+#   qafas{,-controlplane}-<v>-1.{aarch64,x86_64}.rpm, qafas-cli-<v>-1.noarch.rpm  RHEL/Rocky/Alma/Fedora
+#   qafas-<v>-linux-{aarch64,x86_64}.tar.gz   qafas + guest-agent (static musl),
+#                                              controlplane (UI embedded), deploy/ units
+#   qafas-<v>-darwin-{aarch64,x86_64}.tar.gz  qafas + controlplane for a macOS dev host
+#   qafas-sandbox-<v>.tgz                     the sbx CLI + TS SDK (npm pack)
+#   sbx-base-<v>-{arm64,amd64}.tar.zst        the guest image, for air-gapped installs
+#   qafas-firecracker-<v>-{aarch64,x86_64}.tar.zst  the microVM tier, laid out against /:
+#                                              firecracker + jailer, guest kernel, rootfs.ext4
+#                                              built from that image, guest-agent
+#   images.txt                                every image this version runs, pinned
+#   qafas-save-images.sh, qafas-load-images.sh  pull those into a tarball / load it and push
+#                                              it into a private registry (docs/airgap.md)
+#   SHA256SUMS
+# and pushes ghcr.io/<owner>/qafas-sandbox/{sbx-base,controlplane,qafas,sbx}:<v>. npm and
+# PyPI publishing run only when the repo variables PUBLISH_NPM / PUBLISH_PYPI are "true"
+# (trusted publishing, no tokens — see CLAUDE.md "Releasing").
+
+on:
+  push:
+    branches: [main]
+  # Re-run the build for a release that exists (assets are uploaded with --clobber).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: existing tag to build (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Every job below needs this one alone, so a skipped ancestor never skips them.
+  prepare:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ env.TAG }}", fetch-depth: 0 }
+      - id: v
+        run: |
+          v="${TAG#v}"
+          [ "$(cat VERSION)" = "$v" ] || { echo "::error::VERSION is $(cat VERSION) but the tag is $TAG"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      # Release Please opened it as a draft; this only covers a re-run of an older tag.
+      - name: Draft release
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Qafas Sandbox ${TAG#v}" --generate-notes --draft
+
+  linux:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: controlplane/go.mod, cache-dependency-path: controlplane/go.sum }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: web/package-lock.json }
+      - run: rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install cargo-zigbuild
+      - name: nfpm (deb + rpm packager)
+        run: |
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_amd64.deb -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+      - name: Build
+        run: |
+          make guest-agent qafas-linux
+          npm --prefix web ci && npm --prefix web run build
+          for arch in arm64 amd64; do
+            (cd controlplane && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o ../dist/controlplane-linux-$arch ./cmd/controlplane)
+          done
+      - name: Package
+        env: { V: "${{ needs.prepare.outputs.version }}" }
+        run: |
+          set -e; mkdir -p out
+          for pair in aarch64:aarch64-unknown-linux-musl:arm64 x86_64:x86_64-unknown-linux-musl:amd64; do
+            IFS=: read -r name triple goarch <<<"$pair"
+            d="qafas-$V-linux-$name"; mkdir -p "$d/bin" "$d/deploy"
+            cp "target/$triple/release/qafas" "target/$triple/release/guest-agent" "$d/bin/"
+            cp "dist/controlplane-linux-$goarch" "$d/bin/controlplane"
+            cp -r deploy/systemd deploy/controlplane deploy/qafas.toml "$d/deploy/"
+            cp LICENSE README.md "$d/"
+            tar -C . -czf "out/$d.tar.gz" "$d"
+          done
+          images/base/stage.sh
+          # deb + rpm for both arches, plus what the container images COPY (dist/) and the
+          # sbx CLI + TS SDK as an installable tarball: `npm i -g <its release URL>`.
+          (cd sdk/ts && npm ci && npm run build)
+          scripts/package.sh "$V"
+          cp "dist/qafas-sandbox-$V.tgz" out/
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with: { name: staged-guest-binaries, path: images/base/bin, if-no-files-found: error }
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-dist, path: dist, if-no-files-found: error }
+      - name: Upload
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
+        run: gh release upload "$TAG" out/* --clobber
+
+  macos:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: controlplane/go.mod, cache-dependency-path: controlplane/go.sum }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: web/package-lock.json }
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + package
+        env: { V: "${{ needs.prepare.outputs.version }}" }
+        run: |
+          set -e
+          npm --prefix web ci && npm --prefix web run build
+          mkdir -p out
+          for pair in aarch64:aarch64-apple-darwin:arm64 x86_64:x86_64-apple-darwin:amd64; do
+            IFS=: read -r name triple goarch <<<"$pair"
+            cargo build --release -p qafas --target "$triple"
+            (cd controlplane && CGO_ENABLED=0 GOOS=darwin GOARCH=$goarch go build -trimpath -ldflags='-s -w' -o "../dist/controlplane-darwin-$goarch" ./cmd/controlplane)
+            d="qafas-$V-darwin-$name"; mkdir -p "$d/bin" "$d/deploy"
+            cp "target/$triple/release/qafas" "$d/bin/"; cp "dist/controlplane-darwin-$goarch" "$d/bin/controlplane"
+            cp -r deploy/launchd deploy/qafas.toml "$d/deploy/"; cp LICENSE README.md "$d/"
+            tar -czf "out/$d.tar.gz" "$d"
+          done
+      - name: Upload
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
+        run: gh release upload "$TAG" out/* --clobber
+
+  image:
+    needs: [prepare, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - uses: actions/download-artifact@v4
+        with: { name: staged-guest-binaries, path: images/base/bin }
+      - uses: actions/download-artifact@v4
+        with: { name: linux-dist, path: dist }
+      # Artifacts drop empty directories; the control plane image COPYs this one.
+      - run: mkdir -p dist/empty
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Image names
+        id: img
+        run: |
+          repo="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "name=$repo/sbx-base" >> "$GITHUB_OUTPUT"
+      - name: Build and push sbx-base (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/base/Dockerfile
+          platforms: linux/arm64,linux/amd64
+          push: true
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ needs.prepare.outputs.version }}
+            ${{ steps.img.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build and push controlplane
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.controlplane
+          platforms: linux/arm64,linux/amd64
+          push: true
+          tags: |
+            ${{ steps.img.outputs.repo }}/controlplane:${{ needs.prepare.outputs.version }}
+            ${{ steps.img.outputs.repo }}/controlplane:latest
+      - name: Build and push qafas (worker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.qafas
+          platforms: linux/arm64,linux/amd64
+          push: true
+          build-args: VERSION=${{ needs.prepare.outputs.version }}
+          tags: |
+            ${{ steps.img.outputs.repo }}/qafas:${{ needs.prepare.outputs.version }}
+            ${{ steps.img.outputs.repo }}/qafas:latest
+      - name: Build and push sbx (CLI)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.sbx
+          platforms: linux/arm64,linux/amd64
+          push: true
+          build-args: VERSION=${{ needs.prepare.outputs.version }}
+          tags: |
+            ${{ steps.img.outputs.repo }}/sbx:${{ needs.prepare.outputs.version }}
+            ${{ steps.img.outputs.repo }}/sbx:latest
+      - name: Per-arch tarballs for air-gapped installs
+        env: { V: "${{ needs.prepare.outputs.version }}", IMG: "${{ steps.img.outputs.name }}" }
+        run: |
+          set -e; mkdir -p out
+          # Tagged with the registry name, so `podman load` yields exactly what the packages
+          # and the worker image are pinned to.
+          for arch in arm64 amd64; do
+            docker buildx build --platform linux/$arch -f images/base/Dockerfile --cache-from type=gha \
+              -o "type=docker,dest=out/sbx-base-$V-$arch.tar" -t "$IMG:$V" .
+            zstd -T0 -19 --rm "out/sbx-base-$V-$arch.tar"
+          done
+          ls -la out
+      # A release never ships a base image that fails its own security scan (security.md M43).
+      - name: Template scan of sbx-base (must be clean)
+        env: { V: "${{ needs.prepare.outputs.version }}", IMG: "${{ steps.img.outputs.name }}" }
+        run: |
+          zstd -dc "out/sbx-base-$V-amd64.tar.zst" | docker load
+          out=$(docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+                  --read-only --tmpfs /tmp --user 1000:1000 -v "$PWD/images/probe/scan.sh:/scan.sh:ro" \
+                  --entrypoint sh "$IMG:$V" /scan.sh)
+          echo "$out"
+          ! echo "$out" | grep -q '"ok":false'
+      # The list is written from the names just pushed, so it cannot drift from them.
+      - name: images.txt and the air-gap image scripts
+        env: { V: "${{ needs.prepare.outputs.version }}", REPO: "${{ steps.img.outputs.repo }}" }
+        run: |
+          for i in sbx-base controlplane qafas sbx; do echo "$REPO/$i:$V"; done > out/images.txt
+          install -m755 scripts/qafas-save-images.sh scripts/qafas-load-images.sh out/
+          cat out/images.txt
+      - name: Upload
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
+        run: gh release upload "$TAG" out/* --clobber
+
+  # The remote tier offline: everything a KVM worker needs beyond the qafas package, so
+  # an air-gapped host never fetches Firecracker or builds a rootfs (docs/airgap.md).
+  firecracker:
+    needs: [prepare, linux, image]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: [{ arch: x86_64, docker: amd64 }, { arch: aarch64, docker: arm64 }]
+    env:
+      V: ${{ needs.prepare.outputs.version }}
+      # The version the remote tier is validated on; bump it with a lima-kvm pass.
+      FC_VERSION: v1.15.0
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - uses: actions/download-artifact@v4
+        with: { name: staged-guest-binaries, path: images/base/bin }
+      - name: Bundle
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}", ARCH: "${{ matrix.arch }}", DARCH: "${{ matrix.docker }}" }
+        run: |
+          set -e
+          img="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/sbx-base:$V"
+          gh release download "$TAG" -p "sbx-base-$V-$DARCH.tar.zst"
+          # As root, as build-rootfs.sh asks: its extraction and mkfs keep the image's uids.
+          zstd -dc "sbx-base-$V-$DARCH.tar.zst" | sudo podman load
+          sudo SBX_IMAGE="$img" SBX_ARCH="$ARCH" images/build-rootfs.sh
+
+          fc="firecracker-$FC_VERSION-$ARCH"
+          curl -fsSLO "https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$fc.tgz"
+          curl -fsSLO "https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$fc.tgz.sha256.txt"
+          sha256sum -c "$fc.tgz.sha256.txt"
+          tar -xzf "$fc.tgz"
+
+          r="qafas-firecracker-$V-$ARCH"
+          install -Dm755 "release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" "$r/usr/bin/firecracker"
+          install -Dm755 "release-$FC_VERSION-$ARCH/jailer-$FC_VERSION-$ARCH" "$r/usr/bin/jailer"
+          install -Dm755 "images/base/bin/$DARCH/guest-agent" "$r/usr/libexec/qafas/guest-agent"
+          install -Dm644 images/out/vmlinux "$r/var/lib/qafas/firecracker/vmlinux"
+          install -Dm644 images/out/rootfs.ext4 "$r/var/lib/qafas/firecracker/rootfs.ext4"
+          # Our files only: no entries for /, /usr or /var, whose modes extraction would reset.
+          mkdir -p out && tar -C "$r" --sparse --owner=0 --group=0 -cf - \
+            usr/bin/firecracker usr/bin/jailer usr/libexec/qafas var/lib/qafas/firecracker | zstd -T0 -19 -o "out/$r.tar.zst"
+          ls -la out
+      - name: Upload
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
+        run: gh release upload "$TAG" out/* --clobber
+
+  sdks:
+    needs: prepare
+    if: vars.PUBLISH_NPM == 'true' || vars.PUBLISH_PYPI == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, registry-url: https://registry.npmjs.org }
+      - name: npm publish (trusted publishing, provenance)
+        if: vars.PUBLISH_NPM == 'true'
+        working-directory: sdk/ts
+        run: npm ci && npm run build && npm publish --provenance --access public
+      - uses: actions/setup-python@v5
+        if: vars.PUBLISH_PYPI == 'true'
+        with: { python-version: "3.12" }
+      - name: Build the wheel
+        if: vars.PUBLISH_PYPI == 'true'
+        working-directory: sdk/python
+        run: pip install build && python -m build
+      - name: PyPI publish (trusted publishing)
+        if: vars.PUBLISH_PYPI == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with: { packages-dir: sdk/python/dist }
+
+  finalize:
+    needs: [prepare, linux, macos, image, firecracker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.prepare.outputs.tag }}" }
+      - name: Checksums, publish
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
+        run: |
+          set -e; mkdir -p dl && cd dl
+          gh release download "$TAG" -p '*.tar.gz' -p '*.tar.zst' -p '*.tgz' -p '*.deb' -p '*.rpm' -p '*.txt' -p '*.sh'
+          sha256sum -- * > SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false --latest

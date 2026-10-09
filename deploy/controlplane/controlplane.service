@@ -1,0 +1,48 @@
+# Qafas Sandbox control plane on Linux. The qafas-controlplane package (.deb/.rpm)
+# installs this and mints the tokens; by hand:
+#   useradd --system --home-dir /var/lib/controlplane --shell /usr/sbin/nologin controlplane
+#   install -Dm755 controlplane /usr/bin/controlplane
+#   install -Dm640 -g controlplane deploy/controlplane/env.example /etc/controlplane/env   # then set the tokens
+#   install -Dm644 deploy/controlplane/controlplane.service /usr/lib/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now controlplane
+
+[Unit]
+Description=Qafas Sandbox control plane
+Documentation=https://github.com/exitCodeNihil/qafas-sandbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=controlplane
+Group=controlplane
+EnvironmentFile=/etc/controlplane/env
+# /var/lib/controlplane: the SQLite database. Created for us, kept across upgrades.
+StateDirectory=controlplane
+WorkingDirectory=/var/lib/controlplane
+ExecStart=/usr/bin/controlplane
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Not a security boundary, but a small blast radius: an unprivileged user, a
+# read-only system, no devices, no capabilities.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

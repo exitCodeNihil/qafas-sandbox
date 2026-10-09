@@ -1,0 +1,19 @@
+# Keeps `podman build -f images/base/Dockerfile .` from shipping the whole repo
+# (in particular target/, which is multiple GB of Rust build artifacts and breaks the
+# podman-machine build transfer) as build context. images/base/bin/<arch>/ (staged by
+# images/base/stage.sh) is the only thing under here the Dockerfile actually COPYs.
+target/
+node_modules/
+.git/
+web/dist/
+controlplane/web/dist/
+images/out/
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store
+bench/
+sdk/
+web/node_modules/
+pi-extension/node_modules/

@@ -1,0 +1,65 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: sbx
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - rules.yml
+
+# The control plane is host.docker.internal:7800 below — the machine this stack runs on.
+# On another machine, replace both occurrences with its address.
+scrape_configs:
+  # Service discovery for qafas workers
+  - job_name: sbx
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 5s
+    http_sd_configs:
+      - url: http://host.docker.internal:7800/api/prometheus/targets
+        refresh_interval: 30s
+        # The discovery call is authenticated separately from the scrapes.
+        authorization:
+          type: Bearer
+          credentials_file: /etc/prometheus/token
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/token
+    relabel_configs:
+      # Extract the host from labels for reference
+      - source_labels: [host_id]
+        target_label: host
+
+  # Control plane metrics
+  - job_name: controlplane
+    scheme: http
+    static_configs:
+      - targets:
+          - host.docker.internal:7800
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/token
+    relabel_configs:
+      - source_labels: []
+        target_label: job
+        replacement: controlplane
+
+  # Node exporter for host resources
+  - job_name: node
+    static_configs:
+      - targets:
+          - node-exporter:9100
+        labels:
+          instance: localhost
+
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

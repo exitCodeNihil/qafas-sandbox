@@ -1,0 +1,17 @@
+#!/bin/sh
+# After the files are in place, on install and on upgrade (deb: "configure"; rpm: 1|2).
+# Idempotent: only a CHANGE_ME token is ever rewritten.
+set -e
+env=/etc/controlplane/env
+for k in SBX_ADMIN_TOKEN SBX_HOST_TOKEN SBX_TOKEN_SECRET; do
+    if grep -q "^$k=CHANGE_ME" "$env"; then
+        sed -i "s/^$k=CHANGE_ME/$k=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')/" "$env"
+    fi
+done
+systemctl daemon-reload
+if systemctl is-active --quiet controlplane; then systemctl restart controlplane; else systemctl enable --now controlplane; fi
+# A qafas already on this machine joins now; one installed later joins from its own postinstall.
+if [ -x /usr/libexec/qafas/join-local-controlplane ]; then /usr/libexec/qafas/join-local-controlplane; fi
+cat <<EOF
+controlplane: http://$(uname -n):7800 — sign in with SBX_ADMIN_TOKEN from $env
+EOF

@@ -1,0 +1,26 @@
+# ghcr.io/exitcodenihil/qafas-sandbox/qafas — the worker as a container, containers tier.
+# It drives the HOST's container runtime over its socket — Docker Engine 26+ or podman —
+# mounted at /run/qafas/runtime.sock, so the sandboxes are ordinary host containers with
+# the same boundary the packages get; template builds go through that socket too, so the
+# image needs no CLI and no shell. Host networking: the egress proxy's relay is reached on
+# the host, and the proxy reports back through the runtime's bridge. Mount the directories
+# people work in at the same path, so the daemon can see their owner.
+# See deploy/docker/compose.yml.
+# Build context is the repo root after images/base/stage.sh and scripts/package.sh.
+FROM gcr.io/distroless/static-debian12
+ARG TARGETARCH
+ARG VERSION
+COPY images/base/bin/${TARGETARCH}/qafas /usr/bin/qafas
+COPY policy/egress.json /etc/qafas/egress.json
+COPY dist/templates.json /usr/share/qafas/templates.json
+ENV SBX_TIERS=vm \
+    SBX_LISTEN=0.0.0.0:7700 \
+    SBX_RUNTIME_SOCK=/run/qafas/runtime.sock \
+    SBX_POLICY=/etc/qafas/egress.json \
+    SBX_TEMPLATES=/usr/share/qafas/templates.json \
+    SBX_TEMPLATE_IMAGE=ghcr.io/exitcodenihil/qafas-sandbox/sbx-base:${VERSION} \
+    SBX_STATE_DIR=/var/lib/qafas \
+    RUST_LOG=info
+VOLUME /var/lib/qafas
+EXPOSE 7700
+ENTRYPOINT ["/usr/bin/qafas", "serve"]

@@ -1,0 +1,10 @@
+# ghcr.io/exitcodenihil/qafas-sandbox/sbx — the CLI for a machine with Docker but no Node.
+# Mount the directory you work in at the same path, so `sbx run` and `sbx shell` see it:
+#   alias sbx='docker run --rm -it --network host -e SBX_URL -e SBX_ADMIN_TOKEN -e SBX_API_KEY \
+#              -v "$PWD:$PWD" -w "$PWD" ghcr.io/exitcodenihil/qafas-sandbox/sbx:<version>'
+# Build context is the repo root after scripts/package.sh (dist/qafas-sandbox-<version>.tgz).
+FROM node:22-slim
+ARG VERSION
+COPY dist/qafas-sandbox-${VERSION}.tgz /tmp/qafas-sandbox.tgz
+RUN npm install -g /tmp/qafas-sandbox.tgz && rm /tmp/qafas-sandbox.tgz
+ENTRYPOINT ["sbx"]

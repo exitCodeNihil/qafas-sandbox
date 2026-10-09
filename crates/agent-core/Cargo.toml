@@ -1,0 +1,30 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Cross-platform on purpose (D17): the same handlers serve the guest-agent inside a
+# Linux VM and qafas's native tier on the host. Only the hardening layer is
+# Linux-only.
+[dependencies]
+proto = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+base64 = { workspace = true }
+tar = { workspace = true }
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+ulid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = { workspace = true }

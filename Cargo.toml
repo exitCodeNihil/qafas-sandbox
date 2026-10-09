@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["crates/proto", "crates/agent-core", "crates/guest-agent", "crates/qafas"]
+
+[workspace.package]
+version = "0.8.1"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+proto = { path = "crates/proto" }
+agent-core = { path = "crates/agent-core" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyperlocal = "0.9"
+tokio-tungstenite = "0.26"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+tokio-vsock = "0.7"
+nix = { version = "0.29", features = ["term", "process", "user", "mount", "sched", "signal", "fs", "hostname", "net"] }
+seccompiler = "0.5"
+libc = "0.2"
+ulid = "1"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+tar = "0.4"
+wildmatch = "2"
+toml = "0.8"
+landlock = "0.4"
+futures-util = "0.3"
+http-body-util = "0.1"
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+bytes = "1"
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

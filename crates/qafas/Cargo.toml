@@ -1,0 +1,43 @@
+[package]
+name = "qafas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proto = { workspace = true }
+agent-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyperlocal = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+ulid = { workspace = true }
+base64 = { workspace = true }
+wildmatch = { workspace = true }
+futures-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+nix = { workspace = true }
+toml = { workspace = true }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# https to the control plane, and the egress proxy's sink when the API is TLS.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+sha2.workspace = true
+# A one-file build context for the container runtime's /build.
+tar = { workspace = true }
+
+# Landlock is the Linux half of the native tier's boundary; there is no macOS
+# equivalent to link.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }

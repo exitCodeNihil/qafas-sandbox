@@ -1,0 +1,16 @@
+#!/bin/sh
+# Wires this machine's qafas into the control plane installed beside it: token =
+# SBX_TOKEN_SECRET, host_token = SBX_HOST_TOKEN, cp_url = loopback. Both packages run
+# it from postinstall, so the install order does not matter. A no-op once cp_url is
+# set — after that /etc/qafas/qafas.toml is yours to edit.
+set -e
+conf=/etc/qafas/qafas.toml
+env=/etc/controlplane/env
+[ -r "$conf" ] && [ -r "$env" ] || exit 0
+if grep -q '^cp_url' "$conf"; then exit 0; fi
+secret=$(sed -n 's/^SBX_TOKEN_SECRET=//p' "$env")
+host_token=$(sed -n 's/^SBX_HOST_TOKEN=//p' "$env")
+[ -n "$secret" ] && [ -n "$host_token" ] || exit 0
+sed -i "s|^token *=.*|token      = \"$secret\"|; s|^#* *cp_url *=.*|cp_url     = \"http://127.0.0.1:7800\"|; s|^#* *host_token *=.*|host_token = \"$host_token\"|" "$conf"
+systemctl try-restart qafas >/dev/null 2>&1 || true
+echo "qafas: joined the control plane on this machine"

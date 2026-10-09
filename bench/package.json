@@ -1,0 +1,10 @@
+{
+	"name": "sandbox-bench",
+	"private": true,
+	"version": "0.0.0",
+	"type": "module",
+	"dependencies": {
+		"qafas-sandbox": "file:../sdk/ts",
+		"playwright-core": "1.63.0"
+	}
+}

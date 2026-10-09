@@ -1,0 +1,21 @@
+[package]
+name = "guest-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Linux-only crate: on macOS it compiles to a stub main so `cargo check --workspace`
+# still works. Build for real with `cargo zigbuild --target *-unknown-linux-musl`.
+[target.'cfg(target_os = "linux")'.dependencies]
+agent-core = { workspace = true }
+proto = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tokio-vsock = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+anyhow = { workspace = true }

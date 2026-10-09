@@ -1,0 +1,65 @@
+# nfpm spec for the worker package (deb + rpm). Built by scripts/package.sh, which sets
+# VERSION, ARCH (arm64|amd64), QAFAS (the static binary) and STAGE (generated files).
+name: qafas
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: admin
+priority: optional
+maintainer: Qafas Sandbox maintainers <https://github.com/exitCodeNihil/qafas-sandbox/issues>
+vendor: Qafas Sandbox
+homepage: https://github.com/exitCodeNihil/qafas-sandbox
+license: MIT
+description: |
+  Qafas Sandbox host daemon (worker).
+  Runs execution sandboxes for LLM coding agents as podman or Docker containers (and as
+  Firecracker microVMs on a KVM host), with deny-by-default egress and
+  in-sandbox telemetry. Joins a qafas-controlplane when one is configured.
+# A container runtime for the vm tier: podman, or Docker Engine 26+.
+overrides:
+  deb:
+    depends:
+      - podman | docker-ce | docker.io
+  rpm:
+    depends:
+      - (podman or docker-ce or moby-engine)
+# The microVM tier (the qafas-firecracker bundle): taps, the nftables ruleset, and
+# mkfs.ext4 for templates.
+recommends:
+  - nftables
+  - iproute2
+  - e2fsprogs
+contents:
+  - src: ${QAFAS}
+    dst: /usr/bin/qafas
+    file_info:
+      mode: 0755
+  - src: deploy/systemd/qafas.service
+    dst: /usr/lib/systemd/system/qafas.service
+  # The guest image for this version, as environment so it follows every upgrade
+  # while /etc/qafas/qafas.toml (a conffile) stays the operator's.
+  - src: ${STAGE}/image.conf
+    dst: /usr/lib/systemd/system/qafas.service.d/image.conf
+  - src: packaging/qafas.toml
+    dst: /etc/qafas/qafas.toml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+  - src: policy/egress.json
+    dst: /etc/qafas/egress.json
+    type: config|noreplace
+  - src: ${STAGE}/templates.json
+    dst: /usr/share/qafas/templates.json
+  - src: packaging/scripts/join-local-controlplane
+    dst: /usr/libexec/qafas/join-local-controlplane
+    file_info:
+      mode: 0755
+  - src: deploy/qafas.toml
+    dst: /usr/share/doc/qafas/qafas.toml.example
+  - src: LICENSE
+    dst: /usr/share/doc/qafas/copyright
+scripts:
+  postinstall: packaging/scripts/qafas.postinstall
+  preremove: packaging/scripts/qafas.preremove
+  postremove: packaging/scripts/systemd.postremove

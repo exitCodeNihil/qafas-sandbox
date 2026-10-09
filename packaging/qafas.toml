@@ -1,0 +1,40 @@
+# /etc/qafas/qafas.toml — installed by the qafas package and kept across upgrades.
+# Every key, with its default and meaning: /usr/share/doc/qafas/qafas.toml.example.
+# SBX_* environment variables override this file; the package pins the guest image
+# that way (/usr/lib/systemd/system/qafas.service.d/image.conf) so it follows each
+# upgrade. Apply changes with: systemctl restart qafas
+
+# Containers via podman or Docker. Add "native" only on a trusted developer box (those
+# sandboxes run as the daemon's user — root, here). A KVM host serves "remote" instead
+# once the qafas-firecracker bundle is extracted (docs/deployment.md, Firecracker workers).
+tiers      = ["vm"]
+
+# Not loopback: the egress proxy container reports back through the podman bridge,
+# and a control plane on another machine dials in. The token guards the port.
+listen     = "0.0.0.0:7700"
+token      = "CHANGE_ME"      # minted on first install
+host_id    = "CHANGE_ME"      # this machine's short hostname, set on first install
+
+# Control plane. Filled in automatically when qafas-controlplane is installed on
+# this machine. For a fleet: its URL, its SBX_HOST_TOKEN here, and token above
+# equal to its SBX_TOKEN_SECRET.
+# cp_url     = "http://controlplane.example:7800"
+# host_token = ""
+# ca_file    = "/etc/qafas/ca.crt"    # the CA an https cp_url chains to; unset: the system bundle
+
+# What the control plane dials when it is another machine.
+# public_url = "http://this-host.example:7700"
+
+templates  = "/usr/share/qafas/templates.json"
+policy     = "/etc/qafas/egress.json"
+state_dir  = "/var/lib/qafas"
+
+# Where the qafas-firecracker-<version>-<arch>.tar.zst bundle puts the microVM tier;
+# read only when tiers has "remote". The jail sits beside the state directory so the
+# kernel, the disk and memory snapshots are hard links, not copies.
+# Dotted keys rather than a [firecracker] table, so a key appended below still
+# lands at the top level.
+guest_agent_bin       = "/usr/libexec/qafas/guest-agent"
+firecracker.kernel    = "/var/lib/qafas/firecracker/vmlinux"
+firecracker.rootfs    = "/var/lib/qafas/firecracker/rootfs.ext4"
+firecracker.jail_dir  = "/var/lib/qafas/jail"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# deb passes remove|purge|upgrade|…, rpm passes 0 (erase) or 1 (upgrade): stop only on removal.
+case "$1" in remove|purge|0) systemctl disable --now qafas >/dev/null 2>&1 || true ;; esac

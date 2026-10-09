@@ -1,0 +1,12 @@
+# Snippet for ~/.codex/config.toml (Codex CLI). Adds the Qafas Sandbox as an
+# MCP server; Codex CLI discovers its tools (sandbox_exec/read/write/ls/grep)
+# automatically. Point --isolation at whichever tier this project needs
+# (native for a fast trusted local loop, vm for the default local strong
+# boundary, remote for untrusted/multi-tenant work).
+[mcp_servers.sandbox]
+command = "node"
+args = ["/absolute/path/to/sandbox/sdk/ts/bin/sbx", "mcp", "--isolation", "vm"]
+
+[mcp_servers.sandbox.env]
+SBX_URL = "http://127.0.0.1:7800"
+SBX_ADMIN_TOKEN = "…"

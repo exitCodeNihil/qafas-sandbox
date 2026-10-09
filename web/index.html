@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Qafas Sandbox</title>
+    <script>
+      // Apply the persisted colour mode before first paint, otherwise the page
+      // flashes the OS default until React mounts. Astryx's reset.css maps
+      // data-theme on <html> to color-scheme, which is what light-dark() reads.
+      try {
+        var m = localStorage.getItem("sbx_theme");
+        document.documentElement.setAttribute("data-theme", m === "light" ? "light" : "dark");
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,52 @@
+# Qafas Sandbox on Docker (or podman): the control plane and a worker, containers tier.
+# One machine:   docker compose up -d                       (both services)
+# A fleet:       docker compose up -d controlplane          (on the control-plane host)
+#                docker compose up -d qafas                 (on each worker, with SBX_CP_URL,
+#                                                            SBX_PUBLIC_URL and SBX_HOST_ID set)
+# Prerequisite: Docker Engine 26+ (or podman with `systemctl enable --now podman.socket`,
+# and CONTAINER_SOCK=/run/podman/podman.sock in .env). Copy .env.example to .env first.
+# Host networking on purpose: the worker reaches its sandboxes through the egress proxy's
+# relay on the host, and clients dial the worker directly — exactly like the packages.
+services:
+  controlplane:
+    image: ghcr.io/exitcodenihil/qafas-sandbox/controlplane:${QAFAS_VERSION:-latest}
+    network_mode: host
+    environment:
+      SBX_LISTEN: ${SBX_CP_LISTEN:-:7800}
+      SBX_ADMIN_TOKEN: ${SBX_ADMIN_TOKEN:?set SBX_ADMIN_TOKEN in .env}
+      SBX_HOST_TOKEN: ${SBX_HOST_TOKEN:?set SBX_HOST_TOKEN in .env}
+      SBX_TOKEN_SECRET: ${SBX_TOKEN_SECRET:?set SBX_TOKEN_SECRET in .env}
+      # HTTPS: mount the pair below and set both (docs/deployment.md, TLS).
+      SBX_TLS_CERT: ${SBX_TLS_CERT:-}
+      SBX_TLS_KEY: ${SBX_TLS_KEY:-}
+    volumes:
+      - controlplane-data:/var/lib/controlplane
+      # - ./tls:/etc/controlplane/tls:ro
+    restart: unless-stopped
+
+  qafas:
+    image: ghcr.io/exitcodenihil/qafas-sandbox/qafas:${QAFAS_VERSION:-latest}
+    network_mode: host
+    environment:
+      SBX_HOST_ID: ${SBX_HOST_ID:-worker-1}
+      SBX_TOKEN: ${SBX_TOKEN_SECRET:?set SBX_TOKEN_SECRET in .env}
+      SBX_CP_URL: ${SBX_CP_URL:-http://127.0.0.1:7800}
+      SBX_HOST_TOKEN: ${SBX_HOST_TOKEN:?set SBX_HOST_TOKEN in .env}
+      # What the control plane and clients dial; empty on one machine.
+      SBX_PUBLIC_URL: ${SBX_PUBLIC_URL:-}
+      SBX_CA_FILE: ${SBX_CA_FILE:-}
+    volumes:
+      # The host's container runtime runs the sandboxes: Docker's socket by default.
+      - ${CONTAINER_SOCK:-/var/run/docker.sock}:/run/qafas/runtime.sock
+      - qafas-state:/var/lib/qafas
+      # The directories people work in, at the same path: the daemon reads their owner to
+      # mount each workspace as that owner. Add yours.
+      - /home:/home
+      - /root:/root
+      # Your egress policy instead of the image's example one.
+      # - ./egress.json:/etc/qafas/egress.json:ro
+    restart: unless-stopped
+
+volumes:
+  controlplane-data:
+  qafas-state:

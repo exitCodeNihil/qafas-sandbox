@@ -1,0 +1,125 @@
+## qafas configuration.
+##
+## Precedence: environment variable  >  this file  >  built-in default.
+## Every key below is optional and shows its default. The file is looked for at
+## $SBX_CONFIG, then ./qafas.toml, then /etc/qafas/qafas.toml, then
+## ~/.config/qafas/qafas.toml — first one found wins.
+##
+## A malformed file is a startup error, not a silent fallback: a daemon running
+## with the wrong egress policy is worse than one that refuses to start.
+## `qafas doctor` prints which file was loaded and which tiers actually work.
+
+## Tiers this host is willing to serve. A tier the host cannot run is never
+## advertised, whatever this says — configuration can subtract, never add.
+##   native  OS process sandbox: Seatbelt (macOS), bwrap + Landlock + seccomp (Linux)
+##   vm      container inside the podman machine
+##   remote  Firecracker microVM under the jailer (Linux + KVM)
+## Env: SBX_TIERS (comma separated). SBX_BACKEND is a deprecated alias.
+tiers = ["native", "vm"]
+
+## API listener. Loopback on purpose: the agent endpoints are reachable to anyone
+## who can dial the port. /metrics is open to a loopback peer and needs the admin
+## bearer token from anywhere else, so a worker may listen on 0.0.0.0.
+# listen = "127.0.0.1:7700"
+
+## Admin bearer token, and the HMAC secret scoped sandbox tokens are minted with
+## (protocol §5). Change this before anything but a dev box.
+# token = "dev"
+
+# host_id = "mac-local"
+
+## Control plane. Omit both to run standalone: qafas never depends on it.
+# cp_url = "http://127.0.0.1:7800"
+# host_token = ""
+## An https cp_url must chain to this CA bundle; unset: the system bundle.
+## Env: SBX_CA_FILE.
+# ca_file = ""
+
+## Warm sandboxes the `base` template keeps ready on the vm/remote tiers, until
+## `PUT /snapshots/base {warm}` says otherwise. The native tier has no pool:
+## creating a sandbox there is a directory and a listener.
+# pool_size = 2
+
+## v4 warm policy for every *other* template (protocol §3a). Its target is
+## max(warm, recent), where `warm` is the per-template number set at
+## `POST /snapshots {warm}` or `PUT /snapshots/{name} {warm}`, and `recent` is 1
+## while the template was acquired within pool_recent_secs. At most
+## pool_recent_max templates hold that recency slot; the least recently used
+## loses it. Env: SBX_POOL_RECENT_SECS, SBX_POOL_RECENT_MAX.
+# pool_recent_secs = 3600
+# pool_recent_max  = 4
+
+## v4 "start is a restore": capture the built-in image's memory at daemon start
+## so every `base` sandbox is a restore, not a kernel boot. The capture lives in
+## <state_dir>/snapshots/base and is rebuilt whenever the rootfs or the kernel is
+## newer than it. Firecracker hosts only, and silently skipped (with a warning)
+## when [firecracker].hugepages is on — the file memory backend cannot restore a
+## hugetlbfs guest. Env: SBX_BASE_MEMORY_SNAPSHOT.
+# base_memory_snapshot = true
+
+## Idle TTL. A sandbox with no request for this long is destroyed. 0 disables it.
+## Only consulted when auto_stop_secs is 0, so the two timers never race.
+# ttl_secs = 3600
+
+## Sleep and wake (protocol §3a, D23). A sandbox idle this long is stopped — on
+## every tier — and the next request that reaches it starts it again, so a client
+## sees a slow first call, not an error. 0 disables sleeping and hands idleness
+## back to ttl_secs. A create request may override any of these per sandbox.
+## Env: SBX_AUTO_STOP_SECS, SBX_AUTO_DELETE_SECS, SBX_MAX_AGE_SECS.
+# auto_stop_secs   = 1800     # 30 min idle → stopped
+# auto_delete_secs = 86400    # then 24 h stopped → destroyed (0 = ephemeral)
+# max_age_secs     = 0        # wall clock from create, any state → destroyed; 0 = no limit
+
+## A sandbox running (ready/busy) longer than this raises the operational alert
+## `sandbox.long_running`, again at every further multiple. It is never stopped
+## for it. 0 disables the rule. Env: SBX_LONG_RUNNING_SECS.
+# long_running_secs = 14400
+
+## Data files.
+# template_image   = "localhost/sbx-base:dev"
+# templates        = "images/templates.json"
+# policy           = "policy/egress.json"
+# seatbelt_profile = "policy/seatbelt.sb.tmpl"
+
+## Parent of every sbx-<id> scratch directory (fake HOME, canaries, profile).
+# scratch_dir = "/tmp"
+
+## Explicit resolvers for the egress proxy container. Empty means "use the
+## podman network's", which is the normal case. The sandbox never gets a
+## resolver of its own either way (D7).
+# proxy_dns = []
+
+## Let the native tier serve `tools: ["chromium"]`. Off by default: one Chromium
+## per process is shared across native sandboxes, so browser work goes to the vm
+## tier unless you know that is fine.
+# native_browser = false
+
+## TLS (docs/security.md M31). Off by default; turn it on for anything a harness
+## or control plane reaches over a network. With no cert/key the daemon generates
+## a self-signed pair once into <state_dir>/tls, keeps it across restarts, and
+## publishes its SHA-256 at GET /healthz so clients can pin it.
+## Env: SBX_TLS, SBX_TLS_CERT, SBX_TLS_KEY, SBX_STATE_DIR, SBX_PUBLIC_URL.
+# tls      = false
+# tls_cert = ""            # both or neither; a missing file is a startup error
+# tls_key  = ""
+# state_dir = "/var/lib/qafas"   # "~/.qafas" when not running as root
+
+## What clients actually dial, when that is not the listen address (port forward,
+## NAT, reverse proxy). This is the URL registered with the control plane and
+## handed to pi. Env: SBX_PUBLIC_URL.
+# public_url = ""
+
+## Lifetime of a scoped sandbox token (protocol §5). Destroying a sandbox also
+## revokes its outstanding tokens for this long. Env: SBX_TOKEN_TTL_SECS.
+# token_ttl_secs = 43200
+
+## Debug only. Runs the native tier without the OS sandbox wrapper, so denials
+## become log lines instead of errors. Never set this outside a debugging session.
+# native_permissive = false
+
+[firecracker]
+# bin      = "/usr/bin/firecracker"
+# jailer   = "/usr/bin/jailer"
+# kernel   = "images/out/vmlinux"
+# rootfs   = "images/out/rootfs.ext4"
+# jail_dir = "/srv/jail"

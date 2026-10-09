@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sandbox": {
+      "command": "node",
+      "args": ["/absolute/path/to/sandbox/sdk/ts/bin/sbx", "mcp", "--isolation", "vm"],
+      "env": {
+        "SBX_URL": "http://127.0.0.1:7800",
+        "SBX_ADMIN_TOKEN": "…"
+      }
+    }
+  }
+}

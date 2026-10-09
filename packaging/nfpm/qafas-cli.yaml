@@ -1,0 +1,37 @@
+# nfpm spec for the sbx CLI (+ TypeScript SDK), architecture-independent. Built by
+# scripts/package.sh, which unpacks `npm pack` into ${STAGE}/cli/package.
+# Needs Node 22+: the CLI uses the runtime's own WebSocket. Ubuntu/Mint ship an older
+# node — install it from NodeSource first; RHEL 9: `dnf module enable nodejs:22`.
+name: qafas-cli
+arch: all
+platform: linux
+version: ${VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Qafas Sandbox maintainers <https://github.com/exitCodeNihil/qafas-sandbox/issues>
+vendor: Qafas Sandbox
+homepage: https://github.com/exitCodeNihil/qafas-sandbox
+license: MIT
+description: |
+  sbx, the Qafas Sandbox command line.
+  Run commands and open shells in sandboxes, join one that is running, list
+  them, follow their event timeline, serve MCP to a coding agent. Also the
+  Node/TypeScript SDK it is built on (import "qafas-sandbox" from
+  /usr/lib/qafas-cli).
+overrides:
+  deb:
+    depends:
+      - nodejs (>= 22)
+  rpm:
+    depends:
+      - nodejs >= 1:22
+contents:
+  - src: ${STAGE}/cli/package/
+    dst: /usr/lib/qafas-cli/
+    type: tree
+  - src: /usr/lib/qafas-cli/bin/sbx
+    dst: /usr/bin/sbx
+    type: symlink
+  - src: LICENSE
+    dst: /usr/share/doc/qafas-cli/copyright

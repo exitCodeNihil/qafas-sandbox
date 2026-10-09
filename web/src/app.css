@@ -1,0 +1,1332 @@
+/*
+ * Qafas Sandbox console — app design layer.
+ *
+ * Astryx supplies the tokens and the interactive components. This file adds
+ * the layout system Astryx has no opinion about: the 8px spacing scale, the
+ * shell frame, the page/section/card rhythm, and the small set of primitives
+ * (status dot, tag, key-value grid, toolbar, drawer chrome) that the console
+ * repeats on every page. Everything is driven off astryx colour tokens so
+ * light and dark come for free.
+ *
+ * Scale: 4 / 8 / 12 / 16 / 24 / 32 / 48. Page gutter 32. Card padding 24.
+ * Table row 48. Drawer 560 with 32 padding.
+ */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background-body);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* ── Type helpers ─────────────────────────────────────────────── */
+
+/* Monospace + tabular figures: ids, paths, counts, durations. */
+.mono {
+  font-family: var(--font-family-code);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+/* Legacy alias kept so no page has to change import order in one go. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+.sbx-label {
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--color-text-secondary);
+}
+
+.sbx-value {
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--color-text-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sbx-truncate {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+a.sbx-link,
+.sbx-link {
+  color: var(--color-text-accent);
+  text-decoration: none;
+}
+.sbx-link:hover {
+  text-decoration: underline;
+}
+
+/* ── Shell ────────────────────────────────────────────────────── */
+
+.sbx-shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  height: 100%;
+  background: var(--color-background-body);
+}
+
+.sbx-nav {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--color-border);
+  background: var(--color-background-surface);
+}
+
+.sbx-nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 56px;
+  flex: 0 0 56px;
+  padding: 0 16px;
+  color: var(--color-text-primary);
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.sbx-nav-brand svg {
+  color: var(--color-text-accent);
+  flex: none;
+}
+
+.sbx-nav-search {
+  padding: 0 12px 12px;
+}
+
+/* ⌘K trigger — reads as an input, not a button. */
+.sbx-search-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background-muted);
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: 13px;
+  cursor: text;
+}
+.sbx-search-field > span {
+  flex: 1;
+  text-align: left;
+}
+.sbx-search-field kbd {
+  font-family: var(--font-family-code);
+  font-size: 11px;
+  line-height: 16px;
+  padding: 0 4px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text-secondary);
+  background: var(--color-background-surface);
+}
+.sbx-search-field:hover {
+  border-color: var(--color-border-emphasized);
+  color: var(--color-text-primary);
+}
+
+.sbx-nav-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 12px 16px;
+}
+
+.sbx-nav-group + .sbx-nav-group {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+.sbx-nav-group-title {
+  display: block;
+  padding: 0 8px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+.sbx-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 36px;
+  padding: 0 8px;
+  border-radius: 6px;
+  color: var(--color-text-secondary);
+  text-decoration: none;
+  font-size: 13.5px;
+  line-height: 1;
+}
+.sbx-nav-item svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+.sbx-nav-item:hover {
+  background: var(--color-background-muted);
+  color: var(--color-text-primary);
+}
+.sbx-nav-item[aria-current="page"] {
+  background: var(--color-background-muted);
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.sbx-nav-footer {
+  flex: none;
+  padding: 12px;
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sbx-conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+.sbx-conn:hover {
+  border-color: var(--color-border-emphasized);
+}
+
+.sbx-version {
+  font-family: var(--font-family-code);
+  font-size: 11px;
+  color: var(--color-text-disabled);
+  padding-left: 2px;
+}
+
+.sbx-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.sbx-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 56px;
+  flex: 0 0 56px;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-background-surface);
+}
+
+.sbx-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  min-width: 0;
+}
+.sbx-crumbs .sbx-crumb-sep {
+  color: var(--color-text-disabled);
+}
+.sbx-crumbs .sbx-crumb-current {
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.sbx-topbar-end {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.sbx-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ── Page ─────────────────────────────────────────────────────── */
+
+.sbx-page {
+  max-width: 1440px;
+  padding: 32px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.sbx-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.sbx-page-title {
+  margin: 0;
+  font-size: 28px;
+  line-height: 36px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--color-text-primary);
+}
+
+.sbx-page-subtitle {
+  margin: 4px 0 0;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+
+.sbx-page-id {
+  margin: 6px 0 0;
+  font-family: var(--font-family-code);
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--color-text-secondary);
+}
+
+.sbx-page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding-top: 2px;
+}
+
+/* Vertical rhythm inside a page: every direct block is 32 apart, set by
+ * .sbx-page's gap. Groups that need 24 or 16 use these. */
+.sbx-stack-24 {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.sbx-stack-16 {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.sbx-stack-8 {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sbx-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.sbx-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+/* ── Section ──────────────────────────────────────────────────── */
+
+.sbx-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 24px;
+  margin-bottom: 12px;
+}
+
+.sbx-section-title {
+  margin: 0;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.sbx-section-desc {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--color-text-secondary);
+  max-width: 78ch;
+}
+
+/* ── Card ─────────────────────────────────────────────────────── */
+
+.sbx-card {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background-card);
+  padding: 24px;
+}
+.sbx-card-tight {
+  padding: 16px;
+}
+.sbx-card-flush {
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ── Stat card ────────────────────────────────────────────────── */
+
+.sbx-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+.sbx-stats-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+@media (max-width: 1100px) {
+  .sbx-stats,
+  .sbx-stats-3 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.sbx-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 20px 24px;
+}
+.sbx-stat-label {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--color-text-secondary);
+}
+.sbx-stat-value {
+  font-size: 28px;
+  line-height: 34px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+.sbx-stat-sub {
+  font-size: 12px;
+  line-height: 16px;
+  min-height: 16px;
+  color: var(--color-text-secondary);
+}
+
+/* ── Key/value grid ───────────────────────────────────────────── */
+
+.sbx-kv {
+  display: grid;
+  gap: 16px 24px;
+  grid-template-columns: repeat(var(--kv-cols, 4), minmax(0, 1fr));
+}
+@media (max-width: 900px) {
+  .sbx-kv {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.sbx-kv-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sbx-kv-item > .sbx-label {
+  font-size: 12px;
+  line-height: 16px;
+}
+.sbx-kv-wide {
+  grid-column: 1 / -1;
+}
+
+/* ── Status dot + severity ────────────────────────────────────── */
+
+.sbx-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--color-text-primary);
+  white-space: nowrap;
+}
+.sbx-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--dot, var(--color-text-disabled));
+}
+.sbx-status[data-muted="true"] {
+  color: var(--color-text-secondary);
+}
+
+/* Severity: dot + text, filled pill only for critical. */
+.sbx-sev {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  color: var(--color-text-secondary);
+}
+.sbx-sev-critical {
+  color: var(--color-on-error);
+  background: var(--color-error);
+  border-radius: 4px;
+  padding: 0 6px;
+  font-weight: 500;
+}
+.sbx-sev-critical .sbx-status-dot {
+  display: none;
+}
+
+/* ── Tag (outlined) ───────────────────────────────────────────── */
+
+.sbx-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-decoration: none;
+}
+a.sbx-tag:hover {
+  border-color: var(--color-border-emphasized);
+  color: var(--color-text-primary);
+}
+.sbx-tag-mono {
+  font-family: var(--font-family-code);
+  font-size: 11.5px;
+}
+.sbx-tag-warning {
+  border-color: var(--color-warning);
+  color: var(--color-warning);
+}
+.sbx-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.sbx-tags-nowrap {
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+/* ── Toolbar ──────────────────────────────────────────────────── */
+
+.sbx-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  flex-wrap: wrap;
+}
+.sbx-toolbar-end {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Outlined filter chip, filled only when active. */
+.sbx-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sbx-chip:hover {
+  border-color: var(--color-border-emphasized);
+  color: var(--color-text-primary);
+}
+.sbx-chip[aria-pressed="true"] {
+  background: var(--color-background-muted);
+  border-color: var(--color-border-emphasized);
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+/* ── Tables ───────────────────────────────────────────────────── */
+
+.sbx-table {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background-card);
+  overflow: hidden;
+}
+/* A table wider than its container scrolls sideways rather than clipping
+ * its last column off the edge. The scrollbar is always drawn: macOS hides
+ * overlay scrollbars until a gesture, so off-screen columns would otherwise
+ * have no affordance at all. */
+.sbx-table .astryx-table-scroll-wrapper {
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sbx-border-strong, #8a8f98) transparent;
+}
+.sbx-table .astryx-table-scroll-wrapper::-webkit-scrollbar {
+  height: 8px;
+}
+.sbx-table .astryx-table-scroll-wrapper::-webkit-scrollbar-thumb {
+  background: var(--sbx-border-strong, #8a8f98);
+  border-radius: 4px;
+}
+
+/* Small-caps column headers. The sortable variant renders a button inside
+ * the <th>, so the type rules have to reach the descendants too. */
+.sbx-table .astryx-table-header-cell,
+.sbx-table .astryx-table-header-cell button,
+.sbx-table .astryx-table-header-cell span {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.sbx-table .astryx-table-header-cell {
+  height: 40px;
+  padding-block: 0;
+  background: var(--color-background-card);
+}
+
+.sbx-table .astryx-table-cell {
+  height: 48px;
+  padding-block: 0;
+  font-size: 13px;
+  color: var(--color-text-primary);
+}
+
+.sbx-table .astryx-table-header-cell:first-child,
+.sbx-table .astryx-table-cell:first-child {
+  padding-inline-start: 16px;
+}
+.sbx-table .astryx-table-header-cell:last-child,
+.sbx-table .astryx-table-cell:last-child {
+  padding-inline-end: 16px;
+}
+
+.sbx-table-empty {
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+/* ── Empty state ──────────────────────────────────────────────── */
+
+.sbx-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 72px 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background-card);
+  text-align: center;
+}
+.sbx-empty h2 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.sbx-empty p {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 20px;
+  color: var(--color-text-secondary);
+  max-width: 48ch;
+}
+.sbx-empty-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+/* ── Inline notice (destroyed / revoked / needs-v3) ───────────── */
+
+.sbx-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background-muted);
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+.sbx-notice strong {
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+.sbx-notice-success {
+  border-color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 12%, var(--color-background-muted));
+}
+.sbx-notice-error {
+  border-color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 12%, var(--color-background-muted));
+}
+
+/* ── Drawer ───────────────────────────────────────────────────── */
+
+.sbx-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 64px;
+  flex: none;
+  padding: 0 32px;
+  border-bottom: 1px solid var(--color-border);
+}
+.sbx-drawer-title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 24px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.sbx-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.sbx-drawer-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  height: 72px;
+  flex: none;
+  padding: 0 32px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-background-card);
+}
+
+.sbx-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sbx-field-label {
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--color-text-primary);
+}
+.sbx-field-help {
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--color-text-secondary);
+}
+/* ── Host commitment bars (§3a v5) ────────────────────────────── */
+.sbx-committed {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 120px;
+}
+.sbx-committed-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--color-background-muted);
+  overflow: hidden;
+}
+.sbx-committed-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--color-accent);
+}
+.sbx-committed-fill[data-warn="true"] {
+  background: var(--color-warning);
+}
+
+/* Daytona's Lifecycle block: label on the left, input on the right. */
+.sbx-numrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 200px;
+  align-items: center;
+  gap: 16px;
+}
+
+/* ── Code block ───────────────────────────────────────────────── */
+
+.sbx-code {
+  position: relative;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background-muted);
+  overflow: hidden;
+}
+.sbx-code-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 34px;
+  padding: 0 6px 0 16px;
+  border-bottom: 1px solid var(--color-border);
+  font-family: var(--font-family-code);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--color-text-disabled);
+}
+.sbx-code pre {
+  margin: 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-family: var(--font-family-code);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--color-text-primary);
+  white-space: pre;
+}
+.sbx-code-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.sbx-code-copy:hover {
+  border-color: var(--color-border);
+  color: var(--color-text-primary);
+}
+
+/* ── Get Started steps ────────────────────────────────────────── */
+
+.sbx-steps {
+  display: flex;
+  flex-direction: column;
+}
+.sbx-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  column-gap: 20px;
+  padding-bottom: 40px;
+}
+.sbx-step:last-child {
+  padding-bottom: 0;
+}
+.sbx-step-n {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--color-background-muted);
+  border: 1px solid var(--color-border);
+  font-family: var(--font-family-code);
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+/* The connector runs the whole height of the step, from under its number
+ * down to the next one - not just past the circle. */
+.sbx-step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 15px;
+  top: 40px;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-border);
+}
+.sbx-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding-top: 3px;
+}
+.sbx-step-body > h3 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 26px;
+  font-weight: 600;
+}
+.sbx-step-body > p {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 20px;
+  color: var(--color-text-secondary);
+  max-width: 76ch;
+}
+
+/* ── Event timeline ───────────────────────────────────────────── */
+
+.sbx-events {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background-card);
+  overflow: hidden;
+}
+.sbx-events-scroll {
+  max-height: 640px;
+  overflow-y: auto;
+}
+
+.sbx-event {
+  display: grid;
+  grid-template-columns: 90px 132px minmax(0, 1fr) 20px;
+  align-items: baseline;
+  column-gap: 12px;
+  padding: 9px 16px;
+  border-top: 1px solid var(--color-border);
+  font-size: 13px;
+}
+/* The container already draws a top border; the first row inside it must
+ * not add a second hairline. Covers rows nested up to three levels deep
+ * (scroll wrapper, tool-call group, row). */
+.sbx-events > :first-child:is(.sbx-event, .sbx-group),
+.sbx-events > :first-child > :first-child:is(.sbx-event, .sbx-group),
+.sbx-events > :first-child > :first-child > :first-child:is(.sbx-event, .sbx-group) {
+  border-top: none;
+}
+.sbx-event-time {
+  font-family: var(--font-family-code);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--color-text-disabled);
+  white-space: nowrap;
+}
+.sbx-event-type {
+  font-family: var(--font-family-code);
+  font-size: 11.5px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sbx-event-msg {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.sbx-event-msg > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sbx-event-toggle {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--color-text-disabled);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+}
+.sbx-event-toggle:hover {
+  color: var(--color-text-primary);
+}
+.sbx-event-data {
+  grid-column: 2 / -1;
+  margin-top: 8px;
+  font-family: var(--font-family-code);
+  background: var(--color-background-muted);
+  border: 1px solid var(--color-border);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  line-height: 17px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--color-text-secondary);
+}
+
+/* Tool-call group header inside the timeline. */
+.sbx-group {
+  display: grid;
+  /* the id spans the time + type columns of the event rows below it (90 + 12 + 132) */
+  grid-template-columns: 234px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-background-muted);
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  color: var(--color-text-primary);
+}
+.sbx-group[data-highlight="true"] {
+  box-shadow: inset 2px 0 0 var(--color-accent);
+}
+.sbx-group-id {
+  font-family: var(--font-family-code);
+  font-size: 11.5px;
+  color: var(--color-text-disabled);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sbx-group-title {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sbx-group-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+/* Process tree indentation guide. */
+.sbx-tree {
+  padding-left: 18px;
+  margin-left: 7px;
+  border-left: 1px solid var(--color-border);
+}
+
+/* Trace waterfall row hover. */
+.trace-row .trace-row-hover {
+  transition: fill 0.1s ease;
+}
+.trace-row:hover .trace-row-hover {
+  fill: var(--color-background-muted);
+}
+
+/* Chart card body: the sparkline fills the card width. */
+.sbx-chart {
+  width: 100%;
+  display: block;
+}
+
+/* ── Astryx component tuning ──────────────────────────────────── */
+
+/* Tabs sit on a hairline that runs the full content width. */
+.sbx-tabs {
+  border-bottom: 1px solid var(--color-border);
+  margin-bottom: -8px;
+}
+
+/* Astryx cards inside our pages should match the app radius/border. */
+.sbx-page .astryx-card {
+  border-radius: 8px;
+}
+
+/* ── List rows inside a flush card (Overview feeds, preview URLs) ─ */
+
+.sbx-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.sbx-list > li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 0 16px;
+  border-top: 1px solid var(--color-border);
+  min-width: 0;
+}
+.sbx-list > li:first-child {
+  border-top: none;
+}
+
+/* Inline code inside prose (Get Started steps, policy copy). */
+.sbx-step-body code,
+.sbx-section-desc code {
+  font-family: var(--font-family-code);
+  font-size: 0.92em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--color-background-muted);
+  color: var(--color-text-primary);
+}
+
+/* Nowrap relative timestamps in dense rows. */
+.sbx-ago {
+  font-size: 12.5px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Login ────────────────────────────────────────────────────── */
+
+.sbx-login {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.sbx-login-box {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+  max-width: 380px;
+}
+.sbx-login-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.sbx-login-brand svg {
+  color: var(--color-text-accent);
+  flex: none;
+}
+.sbx-login-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.sbx-login-head {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sbx-login-title {
+  margin: 0;
+  font-size: 17px;
+  line-height: 24px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.sbx-login-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 19px;
+  color: var(--color-text-secondary);
+}
+.sbx-login-desc code {
+  font-family: var(--font-family-code);
+  font-size: 0.92em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--color-background-muted);
+  color: var(--color-text-primary);
+}
+.sbx-login-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.sbx-login-version {
+  color: var(--color-text-disabled);
+}
+
+/* ── Policy host / chip ───────────────────────────────────────── */
+
+.sbx-policy-host {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.sbx-policy-host + .sbx-policy-host {
+  margin-top: 16px;
+}
+.sbx-policy-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 40px;
+  padding: 0 16px;
+  background: var(--color-background-muted);
+  border-bottom: 1px solid var(--color-border);
+}
+.sbx-policy-host-id {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.sbx-policy-host-meta {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.sbx-policy-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--color-border);
+}
+.sbx-policy-row:last-child {
+  border-bottom: none;
+}
+.sbx-policy-row-label {
+  width: 190px;
+  flex: none;
+  padding: 14px 16px;
+  border-right: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sbx-policy-row-title {
+  width: fit-content;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.sbx-policy-row-title-ok {
+  color: var(--color-success);
+}
+.sbx-policy-row-title-danger {
+  color: var(--color-error);
+}
+.sbx-policy-row-title-warn {
+  color: var(--color-warning);
+}
+.sbx-policy-row-note {
+  font-size: 11.5px;
+  color: var(--color-text-secondary);
+}
+.sbx-policy-row-chips {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  align-content: flex-start;
+  gap: 8px;
+}
+.sbx-policy-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border-emphasized);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sbx-policy-chip-allow {
+  border-color: var(--color-success);
+  color: var(--color-success);
+}
+.sbx-policy-chip-deny {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+/* v5.2 template security grade (template detail page). */
+.sbx-grade {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 56px;
+  height: 56px;
+  border-radius: 12px;
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1;
+}
+.sbx-grade-A, .sbx-grade-chip.sbx-grade-A { color: var(--color-success); background: var(--color-success-muted); }
+.sbx-grade-B { color: var(--color-accent); background: var(--color-accent-muted); }
+.sbx-grade-C { color: var(--color-warning); background: var(--color-warning-muted); }
+.sbx-grade-F { color: var(--color-error); background: var(--color-error-muted); }
+.sbx-grade-chip {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 4px; border-radius: 4px;
+  font-size: 11.5px; font-weight: 600;
+}

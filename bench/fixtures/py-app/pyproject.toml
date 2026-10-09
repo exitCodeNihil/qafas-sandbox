@@ -1,0 +1,16 @@
+[project]
+name = "bench-py-app"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31.0",
+  "click>=8.1.7",
+  "pyyaml>=6.0.1",
+  "rich>=13.7.0",
+  "attrs>=23.2.0",
+  "certifi>=2024.2.2",
+  "idna>=3.6",
+  "urllib3>=2.2.0",
+  "charset-normalizer>=3.3.2",
+  "six>=1.16.0",
+]

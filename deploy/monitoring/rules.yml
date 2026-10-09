@@ -1,0 +1,140 @@
+groups:
+  - name: sbx.rules
+    interval: 15s
+    rules:
+      # Connectivity and health
+      - alert: SbxHostDown
+        expr: up{job="sbx"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: host
+        annotations:
+          summary: "Sandbox host {{ $labels.host_id }} is down"
+          description: "Host {{ $labels.host_id }} has not been reachable for 2 minutes."
+
+      - alert: SbxHostStale
+        expr: sbxcp_hosts{state="stale"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "Sandbox host is stale"
+          description: "One or more hosts have not heartbeated recently and are marked stale."
+
+      # Security and detection
+      - alert: SbxCriticalAlert
+        expr: increase(sbx_alerts_total{severity="critical"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: security
+        annotations:
+          summary: "Critical security alert detected"
+          description: "A critical security alert was raised in the past 5 minutes. Investigate immediately."
+
+      # Sandbox lifecycle and performance
+      - alert: SbxLongRunningSandbox
+        expr: sbx_sandbox_age_seconds_max > 14400
+        for: 5m
+        labels:
+          severity: warning
+          component: sandbox
+        annotations:
+          summary: "Sandbox running longer than 4 hours on {{ $labels.tier }}"
+          description: "A sandbox on {{ $labels.tier }} / {{ $labels.host_id }} has been running for {{ $value | humanize }}s."
+
+      - alert: SbxIdleSandboxes
+        expr: sbx_sandbox_idle_seconds_max > 3600
+        for: 5m
+        labels:
+          severity: info
+          component: sandbox
+        annotations:
+          summary: "Sandbox idle for longer than 1 hour on {{ $labels.tier }}"
+          description: "A sandbox on {{ $labels.tier }} / {{ $labels.host_id }} has been idle for {{ $value | humanize }}s."
+
+      - alert: SbxResourceLimitHits
+        expr: increase(sbx_alerts_total{rule="resource.limit"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: sandbox
+        annotations:
+          summary: "Resource limit enforced on {{ $labels.host_id }}"
+          description: "Sandboxes on {{ $labels.host_id }} have hit resource limits in the past 10 minutes."
+
+      - alert: SbxHostOvercommitted
+        expr: sbxcp_host_committed_mem_mib > sbxcp_host_capacity_mem_mib
+        for: 5m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "Host {{ $labels.host_id }} is overcommitted on memory"
+          description: "Host {{ $labels.host_id }} has {{ $value | humanize }}MiB committed but only {{ $value | humanize }}MiB capacity."
+
+      # Latency and performance
+      - alert: SbxExecP99Slow
+        expr: histogram_quantile(0.99, rate(sbx_exec_duration_ms_bucket[5m])) > 500
+        for: 10m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "Execution latency p99 exceeds 500ms"
+          description: "The 99th percentile of execution latency is {{ $value | humanize }}ms on {{ $labels.host_id }}."
+
+      - alert: SbxCreateP95Slow
+        expr: histogram_quantile(0.95, rate(sbx_create_duration_ms_bucket[5m])) > 5000
+        for: 10m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "Sandbox creation latency p95 exceeds 5000ms"
+          description: "The 95th percentile of create latency is {{ $value | humanize }}ms on {{ $labels.host_id }}."
+
+      # Egress and network
+      - alert: SbxEgressDenyBurst
+        expr: rate(sbx_events_total{type="egress.deny"}[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "High rate of egress denials"
+          description: "More than 1 egress denial per second on {{ $labels.host_id }}. May indicate a probe or misconfiguration."
+
+      # Pool health
+      - alert: SbxPoolEmpty
+        expr: sum by (host_id)(sbx_pool_warm) == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: pool
+        annotations:
+          summary: "Warm pool is empty"
+          description: "The warm pool on host {{ $labels.host_id }} has been empty for 5 minutes. New sandboxes will cold-boot."
+
+      # Control plane health
+      - alert: SbxCpErrors
+        expr: (sum(rate(sbxcp_http_requests_total{code=~"5.."}[5m])) / sum(rate(sbxcp_http_requests_total[5m]))) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: controlplane
+        annotations:
+          summary: "Control plane 5xx error rate exceeds 1%"
+          description: "The control plane has a 5xx error rate > 1% in the past 5 minutes."
+
+      - alert: SbxCpDbLarge
+        expr: sbxcp_db_bytes > 5368709120
+        for: 5m
+        labels:
+          severity: warning
+          component: controlplane
+        annotations:
+          summary: "Control plane database exceeds 5 GiB"
+          description: "The control plane database is {{ $value | humanize1024 }}B. Consider running a retention sweep."

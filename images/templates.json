@@ -1,0 +1,22 @@
+{
+  "_comment": "tool -> the image that provides it, for the vm and remote tiers (D21). Tools are never installed on demand; a request for something not listed here comes back in `missing_tools` and the harness decides what to do. Versions are what images/base/Dockerfile actually installs.",
+  "default_image": "localhost/sbx-base:dev",
+  "tools": {
+    "node": { "image": "localhost/sbx-base:dev", "version": "22" },
+    "npm": { "image": "localhost/sbx-base:dev", "version": "10" },
+    "npx": { "image": "localhost/sbx-base:dev", "version": "10" },
+    "python": { "image": "localhost/sbx-base:dev", "version": "3.11" },
+    "python3": { "image": "localhost/sbx-base:dev", "version": "3.11" },
+    "uv": { "image": "localhost/sbx-base:dev", "version": "present" },
+    "rg": { "image": "localhost/sbx-base:dev", "version": "13" },
+    "ripgrep": { "image": "localhost/sbx-base:dev", "version": "13" },
+    "fd": { "image": "localhost/sbx-base:dev", "version": "8" },
+    "git": { "image": "localhost/sbx-base:dev", "version": "2" },
+    "curl": { "image": "localhost/sbx-base:dev", "version": "7" },
+    "bash": { "image": "localhost/sbx-base:dev", "version": "5" },
+    "make": { "image": "localhost/sbx-base:dev", "version": "4" },
+    "gcc": { "image": "localhost/sbx-base:dev", "version": "12" },
+    "chromium": { "image": "localhost/sbx-base:dev", "version": "1.63" },
+    "browser": { "image": "localhost/sbx-base:dev", "version": "1.63" }
+  }
+}

@@ -1,0 +1,12 @@
+# ghcr.io/exitcodenihil/qafas-sandbox/controlplane — the control plane with the dashboard
+# embedded, as an unprivileged static binary on a distroless base. Build context is the
+# repo root after scripts/package.sh (dist/controlplane-linux-<arch>, dist/empty).
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+# An empty, nonroot-owned directory: what a fresh named volume for the database inherits.
+COPY --chown=nonroot:nonroot dist/empty/ /var/lib/controlplane/
+COPY dist/controlplane-linux-${TARGETARCH} /usr/bin/controlplane
+ENV SBX_LISTEN=:7800 SBX_DB=/var/lib/controlplane/sandbox.db
+VOLUME /var/lib/controlplane
+EXPOSE 7800
+ENTRYPOINT ["/usr/bin/controlplane"]

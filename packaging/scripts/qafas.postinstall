@@ -1,0 +1,20 @@
+#!/bin/sh
+# After the files are in place, on install and on upgrade (deb: "configure"; rpm: 1|2).
+# Idempotent: only a CHANGE_ME value is ever rewritten.
+set -e
+conf=/etc/qafas/qafas.toml
+if grep -q '^token *= *"CHANGE_ME"' "$conf"; then
+    tok=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+    sed -i "s|^token *=.*|token      = \"$tok\"|; s|^host_id *=.*|host_id    = \"$(uname -n | cut -d. -f1)\"|" "$conf"
+fi
+# The vm tier talks to podman over its system socket (or to Docker's, when there is no podman).
+systemctl enable --now podman.socket >/dev/null 2>&1 || true
+systemctl daemon-reload
+# Wires token, cp_url and host_token when qafas-controlplane is on this machine.
+/usr/libexec/qafas/join-local-controlplane
+if systemctl is-active --quiet qafas; then systemctl restart qafas; else systemctl enable --now qafas; fi
+cat <<EOF
+qafas: running — journalctl -u qafas -f. Config: $conf
+       The guest image is pulled on first start. Offline: load the release's images first
+       (qafas-load-images.sh, from images.txt) — docs/airgap.md.
+EOF

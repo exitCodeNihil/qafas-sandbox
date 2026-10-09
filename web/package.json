@@ -1,0 +1,37 @@
+{
+  "name": "sandbox-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "npm run theme && vite",
+    "theme": "node node_modules/@astryxdesign/cli/bin/astryx.mjs theme build src/theme.ts -o src/theme.built.css",
+    "build": "npm run theme && tsc -b && vite build",
+    "preview": "vite preview",
+    "astryx": "node node_modules/@astryxdesign/cli/bin/astryx.mjs",
+    "typecheck": "tsc -b --force"
+  },
+  "dependencies": {
+    "@astryxdesign/core": "^0.1.8",
+    "@astryxdesign/theme-neutral": "^0.1.8",
+    "@stylexjs/stylex": "^0.19.0",
+    "@tanstack/react-query": "^5.62.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.0"
+  },
+  "devDependencies": {
+    "@astryxdesign/cli": "^0.1.8",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  },
+  "allowScripts": {
+    "@astryxdesign/cli@0.1.9": true,
+    "@astryxdesign/core@0.1.9": true,
+    "esbuild@0.25.12": true
+  }
+}

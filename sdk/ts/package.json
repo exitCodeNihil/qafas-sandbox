@@ -1,0 +1,57 @@
+{
+  "name": "qafas-sandbox",
+  "version": "0.8.1",
+  "description": "Node/TypeScript client for the Qafas Sandbox (qafas + control plane): acquire, exec, filesystem, upload/download, lifecycle, snapshots, sessions, preview URLs, browser CDP, an MCP stdio server, and the sbx CLI.",
+  "keywords": [
+    "sandbox",
+    "agent",
+    "llm",
+    "mcp",
+    "coding-agent",
+    "isolation",
+    "podman",
+    "firecracker"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/exitCodeNihil/qafas-sandbox.git",
+    "directory": "sdk/ts"
+  },
+  "homepage": "https://github.com/exitCodeNihil/qafas-sandbox/tree/main/sdk/ts#readme",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "default": "./dist/mcp.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "sbx": "./bin/sbx"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test 'test/**/*.test.mjs'"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "@types/node": "^26.0.0"
+  }
+}

@@ -1,0 +1,6 @@
+#!/bin/sh
+# The service user; its state lands in /var/lib/controlplane (StateDirectory=).
+set -e
+getent group controlplane >/dev/null || groupadd --system controlplane
+getent passwd controlplane >/dev/null ||
+    useradd --system --gid controlplane --home-dir /var/lib/controlplane --shell /usr/sbin/nologin controlplane

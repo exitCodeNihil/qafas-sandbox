@@ -1,0 +1,64 @@
+# qafas on Linux. The qafas package (.deb/.rpm) installs this; by hand:
+#   install -Dm755 qafas /usr/bin/qafas
+#   install -Dm640 packaging/qafas.toml /etc/qafas/qafas.toml    # every key: deploy/qafas.toml
+#   install -Dm644 deploy/systemd/qafas.service /usr/lib/systemd/system/qafas.service
+#   systemctl daemon-reload && systemctl enable --now qafas
+#
+# For the native tier on a developer's Linux box, install this under
+# ~/.config/systemd/user/ and use `systemctl --user` instead: the native tier
+# runs commands as the invoking user against that user's toolchains, and running
+# it as root would hand the sandbox more than the developer has.
+
+[Unit]
+Description=qafas — Qafas Sandbox host daemon
+Documentation=https://github.com/exitCodeNihil/qafas-sandbox
+# The container runtime's socket, whichever this host has (ordering only).
+After=network-online.target podman.socket docker.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/qafas serve
+# /var/lib/qafas: TLS material, snapshots, spooled events. Created for us, kept across upgrades.
+StateDirectory=qafas
+WorkingDirectory=/var/lib/qafas
+Environment=RUST_LOG=info
+
+# SIGTERM is the shutdown path qafas handles: it destroys every live sandbox,
+# container and microVM before exiting. Give it room to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+
+# The remote tier needs KVM, the TAP devices and nftables; the native tier needs
+# unprivileged user namespaces for bwrap. Nothing here needs full root, so the
+# capability set is spelled out rather than inherited. The Firecracker jailer
+# also needs FOWNER (it chmods the jail root it chowned to uid 1000), MKNOD
+# (/dev/kvm and /dev/net/tun inside the jail), and qafas needs KILL to stop a
+# microVM: it runs as uid 1000 as the init of its own PID namespace, which only
+# SIGKILL from outside ends. Without KILL a destroyed sandbox keeps its RAM.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_MKNOD CAP_KILL
+NoNewPrivileges=no
+
+# qafas's own hardening. It is not the boundary — the tiers are — but a host
+# daemon that can be compromised makes every boundary moot.
+ProtectHome=no
+ProtectSystem=full
+PrivateTmp=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+RestrictRealtime=yes
+# Not RestrictSUIDSGID: a Firecracker template build unpacks the image with its
+# modes, set-id bits included, as the container tiers keep them (inside a sandbox
+# they are inert under no_new_privs).
+LockPersonality=yes
+
+# Warm pools, published ports, per-sandbox listeners and microVM sockets.
+LimitNOFILE=65536
+LimitNPROC=8192
+
+[Install]
+WantedBy=multi-user.target

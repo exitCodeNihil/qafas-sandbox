@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+// sbx: a tiny CLI over qafas-sandbox, for scripting/debugging outside pi.
+// design: hand-rolled argv parsing (no yargs/commander) — six subcommands, a handful
+// of flags each; a parser dependency would be for parity, not a bug.
+import { acquire, SandboxClient, trustHost } from "../dist/index.js";
+import { runMcpServer } from "../dist/mcp.js";
+
+const [, , cmd, ...rest] = process.argv;
+
+function usage() {
+	console.error(`usage:
+  sbx run [--isolation native|vm|remote] [--trust trusted|untrusted] [--tools node@22,rg] [--size micro|mini|medium|high] [--limits cpus=1,mem_mib=1024,disk_mib=512[,pids=256]] [--url <base>] -- <cmd...>
+  sbx shell [<sandbox_id>] [--isolation ...] [--size ...] [--keep] [--url <base>]
+  sbx ls [--url <base>]
+  sbx events <sandbox_id> [--follow] [--url <base>]
+  sbx doctor [--url <base>]
+  sbx mcp [--isolation auto|native|vm|remote|process|docker|firecracker] [--runtime <alias>] [--template <name>|--snapshot <name>] [--tools node@22,rg] [--url <base>]`);
+	process.exit(2);
+}
+
+/** Splits rest into {flags, positionals, cmdArgs} where cmdArgs is everything after a
+ * literal "--" (sbx run's command line). */
+function parseArgs(argv) {
+	const flags = {};
+	const positionals = [];
+	let cmdArgs;
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i];
+		if (a === "--") {
+			cmdArgs = argv.slice(i + 1);
+			break;
+		}
+		if (a.startsWith("--")) {
+			const [key, inlineVal] = a.slice(2).split(/=(.*)/s);
+			if (inlineVal !== undefined) flags[key] = inlineVal;
+			else if (argv[i + 1] !== undefined && !argv[i + 1].startsWith("--")) flags[key] = argv[++i];
+			else flags[key] = "true";
+		} else {
+			positionals.push(a);
+		}
+	}
+	return { flags, positionals, cmdArgs };
+}
+
+/** "cpus=1,mem_mib=1024,disk_mib=512,pids=256" -> {cpus,mem_mib,disk_mib,pids?}, numbers. */
+function parseLimits(s) {
+	const out = {};
+	for (const pair of s.split(",")) {
+		const [k, v] = pair.split("=");
+		if (k && v !== undefined) out[k.trim()] = Number(v);
+	}
+	return out;
+}
+
+function baseUrl(flags) {
+	return flags.url ?? process.env.SBX_URL ?? "http://localhost:7800";
+}
+
+/** GET {base}/healthz, telling qafas (has `backend`) from the control plane apart, and
+ * returning the right token + API prefix for admin-style GETs. */
+async function resolveTarget(base) {
+	await trustHost(base); // SBX_CA_FILE, for an https control plane on an internal CA
+	const res = await fetch(`${base}/healthz`);
+	if (!res.ok) throw new Error(`${base}/healthz: ${res.status}`);
+	const healthz = await res.json().catch(() => ({}));
+	const isQafas = typeof healthz === "object" && healthz !== null && "backend" in healthz;
+	const token = isQafas ? (process.env.SBX_TOKEN ?? "") : (process.env.SBX_ADMIN_TOKEN ?? "");
+	const apiPrefix = isQafas ? "" : "/api";
+	return { healthz, isQafas, token, apiPrefix };
+}
+
+async function adminGet(base, path, token) {
+	const res = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+	if (!res.ok) throw new Error(`GET ${path}: ${res.status} ${await res.text()}`);
+	return res.json();
+}
+
+async function cmdRun(argv) {
+	const { flags, cmdArgs } = parseArgs(argv);
+	if (!cmdArgs || cmdArgs.length === 0) usage();
+	const base = baseUrl(flags);
+	const cwd = process.cwd();
+	const piSession = `sbx-cli-${Date.now()}`;
+	const opts = {
+		isolation: flags.isolation,
+		trust: flags.trust,
+		tools: flags.tools ? flags.tools.split(",") : undefined,
+		size: flags.size,
+		limits: flags.limits ? parseLimits(flags.limits) : undefined,
+	};
+	const acquired = await acquire(base, cwd, piSession, opts);
+	console.error(`# sandbox ${acquired.id} (${acquired.backend}${acquired.isolation ? `, ${acquired.isolation}` : ""})`);
+	if (acquired.missingTools?.length) console.error(`# missing tools: ${acquired.missingTools.join(", ")}`);
+	try {
+		const { exitCode } = await acquired.client.exec(cmdArgs.join(" "), cwd, {
+			onData: (buf) => process.stdout.write(buf),
+		});
+		process.exitCode = exitCode ?? 1;
+	} finally {
+		await acquired.client.destroy().catch(() => {});
+	}
+}
+
+/**
+ * sbx shell: an interactive shell in a sandbox over the PTY WebSocket (docs/protocol.md
+ * §2.1). Without an id a sandbox is acquired for the current directory and destroyed on
+ * exit unless --keep; with an id the shell joins that sandbox through the control plane's
+ * /api/sandboxes/{id}/exec/ws proxy, so only the caller's own credential is needed.
+ */
+async function cmdShell(argv) {
+	const { flags, positionals } = parseArgs(argv);
+	const base = baseUrl(flags);
+	const id = positionals[0];
+	const keep = flags.keep === "true" || flags.keep === true;
+	let wsUrl;
+	let headers;
+	let cwd;
+	let cleanup = async () => {};
+	if (id) {
+		const { token, apiPrefix, isQafas } = await resolveTarget(base);
+		if (isQafas) throw new Error("sbx shell <id> needs the control plane URL (SBX_URL), not a daemon");
+		const sb = await adminGet(base, `${apiPrefix}/sandboxes/${id}`, token);
+		cwd = sb.workspace_path;
+		wsUrl = `${base.replace(/^http/, "ws")}${apiPrefix}/sandboxes/${id}/exec/ws`;
+		headers = { Authorization: `Bearer ${token}` };
+		console.error(`# joining ${id} (${sb.backend}${sb.isolation ? `, ${sb.isolation}` : ""}) at ${cwd}`);
+	} else {
+		cwd = process.cwd();
+		const acquired = await acquire(base, cwd, `sbx-shell-${Date.now()}`, {
+			isolation: flags.isolation,
+			trust: flags.trust,
+			size: flags.size,
+			limits: flags.limits ? parseLimits(flags.limits) : undefined,
+		});
+		console.error(`# sandbox ${acquired.id} (${acquired.backend}${acquired.isolation ? `, ${acquired.isolation}` : ""})${keep ? " — kept; rejoin with: sbx shell " + acquired.id : ""}`);
+		wsUrl = `${acquired.client.endpoint.replace(/^http/, "ws")}/exec/ws`;
+		headers = acquired.client.headers();
+		if (!keep) cleanup = () => acquired.client.destroy().catch(() => {});
+	}
+	const tty = process.stdin.isTTY && process.stdout.isTTY;
+	const exitCode = await new Promise((resolve, reject) => {
+		// biome-ignore lint: Node's global WebSocket accepts a non-standard `headers` init.
+		const ws = new WebSocket(wsUrl, { headers });
+		const send = (o) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(o));
+		const onResize = () => send({ type: "resize", cols: process.stdout.columns, rows: process.stdout.rows });
+		const onStdin = (buf) => send({ type: "stdin", data: buf.toString("base64") });
+		const done = (v, err) => {
+			process.stdin.off("data", onStdin);
+			process.stdout.off("resize", onResize);
+			if (tty) process.stdin.setRawMode(false);
+			process.stdin.pause();
+			err ? reject(err) : resolve(v);
+		};
+		ws.onopen = () => {
+			// The agent has no "no timeout" value (0 means "already expired"): a day bounds a
+			// forgotten shell without getting in the way of a working one.
+			const start = { type: "start", cmd: tty ? "exec bash -il" : "exec bash -l", cwd, env: { TERM: process.env.TERM ?? "xterm-256color" }, timeout_ms: 86_400_000 };
+			if (tty) start.pty = { cols: process.stdout.columns, rows: process.stdout.rows };
+			ws.send(JSON.stringify(start));
+			if (tty) {
+				process.stdin.setRawMode(true);
+				process.stdout.on("resize", onResize);
+			}
+			process.stdin.resume();
+			process.stdin.on("data", onStdin);
+			process.stdin.on("end", () => send({ type: "stdin", data: Buffer.from("exit\n").toString("base64") }));
+		};
+		ws.onmessage = (ev) => {
+			const f = JSON.parse(String(ev.data));
+			if (f.type === "stdout" || f.type === "stderr") process.stdout.write(Buffer.from(f.data, "base64"));
+			else if (f.type === "exit") done(f.code ?? (f.signal ? 128 : 1));
+		};
+		ws.onerror = () => done(undefined, new Error(`websocket to ${wsUrl} failed`));
+		ws.onclose = () => done(1);
+	}).finally(cleanup);
+	process.exitCode = exitCode;
+}
+
+async function cmdLs(argv) {
+	const { flags } = parseArgs(argv);
+	const base = baseUrl(flags);
+	const { token, apiPrefix, isQafas } = await resolveTarget(base);
+	const path = isQafas ? "/sandboxes" : `${apiPrefix}/sandboxes`;
+	const list = await adminGet(base, path, token);
+	for (const sb of list) {
+		console.log(`${sb.id}\t${sb.state}\t${sb.backend}${sb.isolation ? `/${sb.isolation}` : ""}\t${sb.size ?? ""}\t${sb.workspace_path}`);
+	}
+}
+
+async function cmdEvents(argv) {
+	const { flags, positionals } = parseArgs(argv);
+	const sandboxId = positionals[0];
+	if (!sandboxId) usage();
+	const base = baseUrl(flags);
+	const { token, isQafas } = await resolveTarget(base);
+	const follow = flags.follow === "true" || flags.follow === true;
+
+	if (!isQafas) {
+		if (!follow) {
+			const list = await adminGet(base, `/api/sandboxes/${sandboxId}/events`, token);
+			for (const e of list) console.log(JSON.stringify(e));
+			return;
+		}
+		const res = await fetch(`${base}/api/events/stream?sandbox_id=${encodeURIComponent(sandboxId)}&token=${encodeURIComponent(token)}`);
+		await pipeSSE(res);
+		return;
+	}
+
+	// design: qafas has no REST event history, only the live /events/ws firehose (checked
+	// against crates/qafas/src/api.rs: no GET /events route exists); both follow and
+	// non-follow print live events for this sandbox until Ctrl-C.
+	if (!follow) console.error("# history needs the control plane; following live events");
+	const wsUrl = `${base.replace(/^http/, "ws")}/events/ws`;
+	const ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${token}` } });
+	ws.addEventListener("message", (ev) => {
+		try {
+			const e = JSON.parse(String(ev.data));
+			if (e.sandbox_id === sandboxId) console.log(JSON.stringify(e));
+		} catch {
+			/* ignore malformed frames */
+		}
+	});
+	await new Promise((resolve) => ws.addEventListener("close", resolve));
+}
+
+async function pipeSSE(res) {
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	let buf = "";
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return;
+		buf += decoder.decode(value, { stream: true });
+		let idx;
+		while ((idx = buf.indexOf("\n\n")) >= 0) {
+			const chunk = buf.slice(0, idx);
+			buf = buf.slice(idx + 2);
+			for (const line of chunk.split("\n")) {
+				if (line.startsWith("data: ")) console.log(line.slice(6));
+			}
+		}
+	}
+}
+
+async function cmdDoctor(argv) {
+	const { flags } = parseArgs(argv);
+	const base = baseUrl(flags);
+	const { healthz } = await resolveTarget(base);
+	console.log(JSON.stringify(healthz, null, 2));
+	if (healthz && typeof healthz === "object" && "tiers" in healthz) {
+		console.log(`tiers: ${(healthz.tiers ?? []).join(", ") || "(none advertised)"}`);
+	}
+}
+
+try {
+	switch (cmd) {
+		case "run":
+			await cmdRun(rest);
+			break;
+		case "shell":
+			await cmdShell(rest);
+			break;
+		case "ls":
+			await cmdLs(rest);
+			break;
+		case "events":
+			await cmdEvents(rest);
+			break;
+		case "doctor":
+			await cmdDoctor(rest);
+			break;
+		case "mcp":
+			await runMcpServer(rest);
+			break;
+		default:
+			usage();
+	}
+} catch (err) {
+	console.error(`sbx: ${err instanceof Error ? err.message : String(err)}`);
+	process.exit(1);
+}

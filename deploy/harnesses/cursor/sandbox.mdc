@@ -1,0 +1,18 @@
+---
+description: Prefer the sandbox MCP tools over the built-in shell/file tools
+alwaysApply: true
+---
+
+This project has an Qafas Sandbox MCP server (`sandbox_exec`, `sandbox_read`,
+`sandbox_write`, `sandbox_ls`, `sandbox_grep`) connected. Use it instead of
+your own built-in shell, read, write, or search tools for anything touching
+this repository:
+
+- Run shell commands with `sandbox_exec`, not a native terminal tool.
+- Read and write files with `sandbox_read`/`sandbox_write`, not a native
+  file tool, so writes land through the sandbox's audit trail.
+- Search file contents with `sandbox_grep`, not a native grep/search tool.
+
+Only fall back to a built-in tool if no `sandbox_*` tool is connected in this
+session. Never pass secrets or API keys as command arguments or file content
+— the sandbox has no route to the model's credentials by design.
