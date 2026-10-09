@@ -31,8 +31,8 @@ Rust 1.89 workspace (`crates/proto`, `crates/agent-core`, `crates/guest-agent`, 
 - `trust: untrusted` never resolves to the `native` tier. Only the harness (never the model) can widen egress.
 - Detection signals from the boundary (proxy, sandbox denials, seccomp kills) are authoritative; in-sandbox telemetry is enrichment.
 
-## Machine notes (dev Mac)
-M5 Pro, 24 GB, macOS 26. `podman-machine-default` is applehv, currently 2 vCPU / 1.9 GB — resize to 6 / 8192 before browser work. Rust has only the darwin target installed; run `make tools` first. Playwright 1.63 browsers cached under `~/Library/Caches/ms-playwright`. pi 0.83 at `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent` (its `examples/extensions/gondolin/index.ts` is the extension pattern to copy).
+## Dev machine (macOS)
+`make tools` installs the Rust cross targets and zig; `make machine` sizes the podman machine (6 vCPU / 8 GB) for browser work. The `pi` harness extension follows pi's `examples/extensions/gondolin/index.ts` pattern.
 
 ## Commands
 `make tools` · `make machine` · `make guest-agent` · `make image` · `make qafas` · `make cp` · `make web` · `make sdk` · `make dev-local` · `make test` · `make demo` · `make bench` · `make doctor` · `scripts/package.sh <version>` (deb/rpm via nfpm, plus what `deploy/docker/Dockerfile.*` COPY)
