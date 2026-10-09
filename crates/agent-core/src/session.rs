@@ -7,11 +7,14 @@
 //!
 //! ```text
 //! { <cmd>
-//! }; printf '\n__SBX_EXIT_<cid>_%d__\n' $?
+//! }; __SBX_RC=$?; printf '\n__SBX_EXIT_<cid>_%d__\n' $__SBX_RC >&2; printf '\n__SBX_EXIT_<cid>_%d__\n' $__SBX_RC; unset __SBX_RC
 //! ```
 //!
 //! Splitting stdout on that marker is what gives every command an exit code
 //! without losing the state (`cd`, `export`, shell functions) between them.
+//! stderr is its own pipe, so it carries the marker too: a command is closed out
+//! only once both streams reached it, or its last stderr bytes would land on the
+//! next command.
 //!
 //! `POST .../input` writes to the same pipe, which is why `read v` works: the
 //! shell reads the next line of its own stdin.
@@ -44,6 +47,9 @@ use crate::{now_rfc3339, Corr, Ctx};
 const SIGINT_GRACE_MS: u64 = 500;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MARK: &[u8] = b"\n__SBX_EXIT_";
+/// How long a finished command waits for stderr to reach its marker. Only a
+/// command that closed the shell's stderr (`exec 2>&-`) ever runs into it.
+const ERR_MARK_WAIT: Duration = Duration::from_secs(1);
 
 pub type Registry = Arc<Mutex<BTreeMap<String, Arc<Session>>>>;
 
@@ -153,6 +159,8 @@ pub struct Session {
     pid: u32,
     stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
     inner: Mutex<Inner>,
+    /// The id of the last command whose marker arrived on stderr.
+    err_mark: watch::Sender<String>,
 }
 
 impl Session {
@@ -269,6 +277,7 @@ async fn spawn(ctx: &Arc<Ctx>, req: &CreateSessionReq) -> std::io::Result<Arc<Se
         pid,
         stdin: tokio::sync::Mutex::new(Some(stdin)),
         inner: Mutex::new(Inner { history: Vec::new(), running: None, orphan_stderr: Vec::new(), alive: true }),
+        err_mark: watch::channel(String::new()).0,
     });
 
     // A handler (not SIG_IGN) so the shell survives the SIGINT a timeout sends
@@ -303,7 +312,11 @@ async fn read_stdout(session: Arc<Session>, ctx: Arc<Ctx>, mut out: tokio::proce
             }
             pending.drain(..consumed);
             match fin {
-                Some((cid, code)) => session.finish(&ctx, Some(&cid), code),
+                Some((cid, code)) => {
+                    let mut rx = session.err_mark.subscribe();
+                    let _ = tokio::time::timeout(ERR_MARK_WAIT, rx.wait_for(|c| *c == cid)).await;
+                    session.finish(&ctx, Some(&cid), code)
+                }
                 None => break,
             }
         }
@@ -316,12 +329,29 @@ async fn read_stdout(session: Arc<Session>, ctx: Arc<Ctx>, mut out: tokio::proce
 }
 
 async fn read_stderr(session: Arc<Session>, mut err: tokio::process::ChildStderr) {
+    let mut pending: Vec<u8> = Vec::new();
     let mut buf = [0u8; 32 * 1024];
-    while let Ok(n) = err.read(&mut buf).await {
-        if n == 0 {
-            break;
+    loop {
+        match err.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => pending.extend_from_slice(&buf[..n]),
         }
-        session.push(true, &buf[..n]);
+        loop {
+            let (emit, fin, consumed) = scan(&pending);
+            if emit > 0 {
+                session.push(true, &pending[..emit]);
+            }
+            pending.drain(..consumed);
+            match fin {
+                Some((cid, _)) => {
+                    session.err_mark.send_replace(cid);
+                }
+                None => break,
+            }
+        }
+    }
+    if !pending.is_empty() {
+        session.push(true, &pending);
     }
 }
 
@@ -423,7 +453,8 @@ pub async fn exec(
 
     // `{ … }` groups the command so `$?` is the group's, and multi-line input
     // works; the marker rides on the same logical line so it always runs.
-    let line = format!("{{ {}\n}}; printf '\\n__SBX_EXIT_{cid}_%d__\\n' $?\n", req.cmd);
+    let mark = format!("printf '\\n__SBX_EXIT_{cid}_%d__\\n' $__SBX_RC");
+    let line = format!("{{ {}\n}}; __SBX_RC=$?; {mark} >&2; {mark}; unset __SBX_RC\n", req.cmd);
     let write = {
         let mut guard = session.stdin.lock().await;
         match guard.as_mut() {
@@ -639,6 +670,22 @@ mod tests {
 
         assert_eq!(s.info().commands.len(), 3);
         assert!(s.info().commands.iter().all(|c| c.state == CommandState::Done));
+    }
+
+    /// stderr written right before a command ends belongs to that command, not
+    /// to the next one: the stdout marker used to win the race against it.
+    #[tokio::test]
+    async fn trailing_stderr_stays_with_its_command() {
+        let ctx = ctx();
+        let s = spawn(&ctx, &CreateSessionReq::default()).await.expect("bash");
+        ctx.sessions.lock().unwrap().insert(s.id.clone(), s.clone());
+        for i in 0..20 {
+            let c = run(&ctx, &s, &format!("echo out{i}; echo err{i} >&2")).await;
+            assert_eq!(c.stdout.as_deref(), Some(format!("out{i}\n").as_str()));
+            assert_eq!(c.stderr.as_deref(), Some(format!("err{i}\n").as_str()), "command {i}");
+        }
+        let c = run(&ctx, &s, "echo first; sleep 0.2; echo second >&2; false").await;
+        assert_eq!((c.exit, c.stderr.as_deref()), (Some(1), Some("second\n")));
     }
 
     #[tokio::test]
