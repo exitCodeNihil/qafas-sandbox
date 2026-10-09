@@ -64,6 +64,8 @@ const RECON_BINS: &[&str] =
 /// Privilege-escalation binaries by name: Seatbelt refuses setuid execs silently
 /// (no log line), so the command line is the only place to see the attempt.
 const SETUID_BINS: &[&str] = &["sudo", "su", "doas", "passwd", "chsh", "chpass", "login", "newgrp", "pkexec"];
+/// Words that run the command after them, so the command word is the next one.
+const WRAPPERS: &[&str] = &["env", "exec", "command", "builtin", "nohup", "nice", "time", "xargs"];
 /// Cloud metadata endpoints (protocol §1.1 `metadata.probe`). The proxy sees the
 /// network attempt; this catches the address on a command line even when the
 /// connection never leaves the process.
@@ -90,7 +92,7 @@ pub fn policy_summary(egress: &proto::EgressPolicy) -> serde_json::Value {
             "recon_bins": RECON_BINS,
             "setuid_bins": SETUID_BINS,
             "metadata_hosts": METADATA_HOSTS,
-            "canaries": ["~/.ssh/id_rsa", "~/.aws/credentials", "~/.netrc"],
+            "canaries": ["~/.ssh/id_rsa", "~/.aws/credentials"],
             "protected_env": crate::spawn::PROTECTED_ENV,
         },
     })
@@ -197,8 +199,9 @@ impl Rules {
                     sandbox_id.to_uppercase()
                 ),
             ),
-            (".netrc", format!("machine example.invalid login sbx password {token}\n")),
         ];
+        // No `.netrc`: git and curl read it on every https request, so it alerted on a plain
+        // `git clone`. A canary is only a canary if nothing legitimate opens it.
         for (rel, body) in files {
             let path = std::path::Path::new(home).join(rel);
             if path.exists() && !overwrite {
@@ -216,7 +219,7 @@ impl Rules {
     /// user directory and we do not write files into it. The native tier denies
     /// and reports a read of that path from the sandbox profile instead.
     pub fn canary_files(home: &str) -> Vec<String> {
-        vec![format!("{home}/.ssh/id_rsa"), format!("{home}/.aws/credentials"), format!("{home}/.netrc")]
+        vec![format!("{home}/.ssh/id_rsa"), format!("{home}/.aws/credentials")]
     }
 
     fn contains(text: &str, needle: &str) -> bool {
@@ -268,8 +271,12 @@ impl Rules {
                 add(hit(r::SENSITIVE_PATH_READ, Severity::Medium, *p));
             }
         }
-        // Command words: `sudo -n true`, `x && su -`, `/usr/bin/sudo`.
-        for w in text.split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`')) {
+        // Command words only — the first of each pipeline segment, past `VAR=x` and
+        // wrappers: `sudo -n true`, `x && su -`, `/usr/bin/sudo`, `env sudo`; not the
+        // arguments of `cat /etc/passwd` or `curl -d @/etc/passwd`.
+        for seg in text.split(|c: char| matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '\n')) {
+            let mut words = seg.split_whitespace().skip_while(|w| w.contains('=') || WRAPPERS.contains(w));
+            let Some(w) = words.next() else { continue };
             let name = w.rsplit('/').next().unwrap_or(w);
             if SETUID_BINS.contains(&name) {
                 add(hit(r::SETUID_EXEC, Severity::Medium, w));
@@ -366,6 +373,12 @@ mod tests {
         let r = rules();
         assert_eq!(r.scan("sudo -n true").iter().filter(|h| h.rule == r::SETUID_EXEC).count(), 1);
         assert_eq!(r.scan("ls; /usr/bin/su - root").iter().filter(|h| h.rule == r::SETUID_EXEC).count(), 1);
+        assert_eq!(r.scan("FOO=1 env sudo id").iter().filter(|h| h.rule == r::SETUID_EXEC).count(), 1);
+        assert_eq!(r.scan("echo x | passwd").iter().filter(|h| h.rule == r::SETUID_EXEC).count(), 1);
+        // A setuid name as an argument is not an exec of it.
+        for cmd in ["cat /etc/passwd", "curl -d @/etc/passwd https://x", "man sudo", "grep -r login ."] {
+            assert!(r.scan(cmd).iter().all(|h| h.rule != r::SETUID_EXEC), "{cmd}");
+        }
         assert!(r.scan("echo sudoku && cat suffix").is_empty());
     }
 
@@ -404,7 +417,9 @@ mod tests {
     fn tilde_canary_matches() {
         let r = Rules::guest("/w", "/home/agent");
         assert_eq!(r.scan("cat ~/.ssh/id_rsa")[0].rule, r::CANARY_READ);
-        assert_eq!(r.scan("cat /home/agent/.netrc")[0].rule, r::CANARY_READ);
+        assert_eq!(r.scan("cat /home/agent/.aws/credentials")[0].rule, r::CANARY_READ);
+        // .netrc is a sensitive path, not a canary: git reads it on every https clone.
+        assert_eq!(r.scan("cat /home/agent/.netrc")[0].rule, r::SENSITIVE_PATH_READ);
     }
 
     #[test]
