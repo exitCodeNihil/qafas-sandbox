@@ -4,12 +4,12 @@ Node/TypeScript client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafa
 
 ## Install
 
-From a release (`qafas-sandbox-<version>.tgz`; it is also inside the `qafas-cli` deb/rpm, which puts `sbx` on the PATH):
-
 ```bash
-npm install -g ./qafas-sandbox-<version>.tgz      # the CLI
-npm install ./qafas-sandbox-<version>.tgz         # the library, in a project
+npm install qafas-sandbox          # the library, in a project
+npm install -g qafas-sandbox       # the `sbx` CLI
 ```
+
+Offline (an air-gapped site): the same package is a release asset, `qafas-sandbox-<version>.tgz` — `npm install ./qafas-sandbox-<version>.tgz` — and it is inside the `qafas-cli` deb/rpm, which puts `sbx` on the PATH.
 
 Node 22+. No runtime dependencies; uses the global `fetch` and `WebSocket`.
 

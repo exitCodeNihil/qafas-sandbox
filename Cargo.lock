@@ -14,7 +14,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "nix 0.29.0",
- "proto",
+ "qafas-proto",
  "seccompiler",
  "serde",
  "serde_json",
@@ -650,7 +650,7 @@ dependencies = [
  "axum",
  "libc",
  "nix 0.29.0",
- "proto",
+ "qafas-proto",
  "serde",
  "serde_json",
  "tokio",
@@ -1140,18 +1140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proto"
-version = "0.2.0"
-dependencies = [
- "base64 0.22.1",
- "hmac",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
-]
-
-[[package]]
 name = "qafas"
 version = "0.2.0"
 dependencies = [
@@ -1171,7 +1159,7 @@ dependencies = [
  "landlock",
  "libc",
  "nix 0.29.0",
- "proto",
+ "qafas-proto",
  "rcgen",
  "rustls",
  "serde",
@@ -1188,6 +1176,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qafas-proto"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+]
+
+[[package]]
 name = "qafas-sandbox"
 version = "0.2.0"
 dependencies = [
@@ -1199,7 +1199,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "percent-encoding",
- "proto",
+ "qafas-proto",
  "rcgen",
  "rustls",
  "rustls-native-certs",

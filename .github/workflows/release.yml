@@ -32,6 +32,10 @@ on:
       tag:
         description: existing tag to build (vX.Y.Z)
         required: true
+      sdks_only:
+        description: only publish the SDKs to their registries (no build, no assets)
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -87,6 +91,7 @@ jobs:
 
   linux:
     needs: prepare
+    if: ${{ !inputs.sdks_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,6 +144,7 @@ jobs:
 
   macos:
     needs: prepare
+    if: ${{ !inputs.sdks_only }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -314,20 +320,30 @@ jobs:
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}", TAG: "${{ needs.prepare.outputs.tag }}" }
         run: gh release upload "$TAG" out/* --clobber
 
+  # The SDKs into their registries; Go needs none (the sdk/go/vX.Y.Z tag in finalize). Each
+  # registry is off until its repo variable is "true", and each skips a version it already has,
+  # so `workflow_dispatch` with sdks_only can publish an existing release's SDKs again.
   sdks:
     needs: prepare
-    if: vars.PUBLISH_NPM == 'true' || vars.PUBLISH_PYPI == 'true'
+    if: vars.PUBLISH_NPM == 'true' || vars.PUBLISH_PYPI == 'true' || vars.PUBLISH_CRATES == 'true' || vars.PUBLISH_MAVEN == 'true'
     runs-on: ubuntu-latest
     environment: release
+    env: { V: "${{ needs.prepare.outputs.version }}" }
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ needs.prepare.outputs.tag }}" }
+
       - uses: actions/setup-node@v4
+        if: vars.PUBLISH_NPM == 'true'
         with: { node-version: 22, registry-url: https://registry.npmjs.org }
-      - name: npm publish (trusted publishing, provenance)
+      - name: npm (trusted publishing, provenance)
         if: vars.PUBLISH_NPM == 'true'
         working-directory: sdk/ts
-        run: npm ci && npm run build && npm publish --provenance --access public
+        run: |
+          if npm view "qafas-sandbox@$V" version >/dev/null 2>&1; then echo "qafas-sandbox@$V is on npm"; exit 0; fi
+          npm install -g npm@11   # trusted publishing needs npm 11.5.1 or later
+          npm ci && npm run build && npm publish --provenance --access public
+
       - uses: actions/setup-python@v5
         if: vars.PUBLISH_PYPI == 'true'
         with: { python-version: "3.12" }
@@ -335,14 +351,54 @@ jobs:
         if: vars.PUBLISH_PYPI == 'true'
         working-directory: sdk/python
         run: pip install build && python -m build
-      - name: PyPI publish (trusted publishing)
+      - name: PyPI (trusted publishing)
         if: vars.PUBLISH_PYPI == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
-        with: { packages-dir: sdk/python/dist }
+        with: { packages-dir: sdk/python/dist, skip-existing: true }
+
+      - name: crates.io token (trusted publishing)
+        if: vars.PUBLISH_CRATES == 'true'
+        id: crates
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: crates.io
+        if: vars.PUBLISH_CRATES == 'true'
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.crates.outputs.token }}" }
+        run: |
+          # qafas-proto first: the SDK depends on that exact version.
+          for c in qafas-proto qafas-sandbox; do
+            if curl -fsS -A "qafas-release (github.com/${{ github.repository }})" "https://crates.io/api/v1/crates/$c/$V" >/dev/null 2>&1; then
+              echo "$c $V is on crates.io"; continue
+            fi
+            cargo publish -p "$c"
+          done
+
+      - uses: actions/setup-java@v4
+        if: vars.PUBLISH_MAVEN == 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_TOKEN
+          gpg-private-key: "${{ secrets.MAVEN_GPG_PRIVATE_KEY }}"
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+      - name: Maven Central
+        if: vars.PUBLISH_MAVEN == 'true'
+        working-directory: sdk/java
+        env:
+          CENTRAL_USERNAME: "${{ secrets.CENTRAL_USERNAME }}"
+          CENTRAL_TOKEN: "${{ secrets.CENTRAL_TOKEN }}"
+          MAVEN_GPG_PASSPHRASE: "${{ secrets.MAVEN_GPG_PASSPHRASE }}"
+        run: |
+          if curl -fsS -o /dev/null "https://repo1.maven.org/maven2/io/github/exitcodenihil/qafas-sandbox/$V/qafas-sandbox-$V.pom"; then
+            echo "qafas-sandbox $V is on Maven Central"; exit 0
+          fi
+          mvn -B -P release -DskipTests deploy
 
   # The Java SDK as a jar and its pom (sdk/java/README.md: mvn install:install-file); not on Maven Central.
   java-sdk:
     needs: prepare
+    if: ${{ !inputs.sdks_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
