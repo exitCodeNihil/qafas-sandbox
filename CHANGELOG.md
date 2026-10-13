@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.2.0...v0.3.0) (2026-10-13)
+
+
+### Features
+
+* **sdk:** publish the SDKs to npm, PyPI, crates.io and Maven Central ([3b9892d](https://github.com/exitCodeNihil/qafas-sandbox/commit/3b9892d2243c00a8f841f01ad185c7b56c8b2816))
+
 ## [0.2.0](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.1.0...v0.2.0) (2026-10-09)
 
 
