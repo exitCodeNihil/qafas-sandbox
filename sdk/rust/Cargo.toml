@@ -5,13 +5,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+readme = "README.md"
+keywords = ["sandbox", "llm", "agents", "firecracker", "isolation"]
+categories = ["api-bindings", "development-tools"]
 
 [lib]
 name = "qafas_sandbox"
 
 [dependencies]
-proto = { path = "../../crates/proto" }
+proto = { workspace = true }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

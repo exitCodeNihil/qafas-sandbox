@@ -4,15 +4,13 @@ Async Rust client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-san
 
 ## Install
 
-From the repository (it is not published to crates.io):
-
 ```toml
 [dependencies]
-qafas-sandbox = { git = "https://github.com/exitCodeNihil/qafas-sandbox", tag = "v0.2.0" }  # x-release-please-version
+qafas-sandbox = "0.2.0"  # x-release-please-version
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Or from a source checkout: `qafas-sandbox = { path = "path/to/sdk/rust" }`. Import as `qafas_sandbox`. Needs Rust 1.89.
+It pulls in `qafas-proto`, the wire types it shares with the daemon. Offline, from a source checkout: `qafas-sandbox = { path = "path/to/sdk/rust" }`. Import as `qafas_sandbox`. Needs Rust 1.89.
 
 ## 30 seconds
 

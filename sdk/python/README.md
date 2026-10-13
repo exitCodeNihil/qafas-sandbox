@@ -4,12 +4,12 @@ Sync Python client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-sa
 
 ## Install
 
-From the repository or a source checkout (it is not published to PyPI):
-
 ```bash
-pip install ./sdk/python                 # stdlib only
-pip install "./sdk/python[stream]"       # + streaming exec()/logs() and events() (websockets)
+pip install qafas-sandbox                # stdlib only
+pip install "qafas-sandbox[stream]"      # + streaming exec()/logs() and events() (websockets)
 ```
+
+Offline, from a source checkout: `pip install ./sdk/python` (or `"./sdk/python[stream]"`).
 
 Import as `qafas_sandbox`.
 

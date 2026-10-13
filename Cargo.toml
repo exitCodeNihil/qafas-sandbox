@@ -7,9 +7,10 @@ version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
+repository = "https://github.com/exitCodeNihil/qafas-sandbox"
 
 [workspace.dependencies]
-proto = { path = "crates/proto" }
+proto = { package = "qafas-proto", path = "crates/proto", version = "0.2.0" }
 agent-core = { path = "crates/agent-core" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }

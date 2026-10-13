@@ -4,26 +4,21 @@ Synchronous Java 17 client for [Qafas Sandbox](https://github.com/exitCodeNihil/
 
 ## Install
 
-It is not published to Maven Central. Download `qafas-sandbox-<version>.jar` and `qafas-sandbox-<version>.pom` from the [GitHub release](https://github.com/exitCodeNihil/qafas-sandbox/releases), install them into your local repository, then depend on it as usual (the pom pulls in Gson and commons-compress):
-
-```bash
-mvn install:install-file -Dfile=qafas-sandbox-<version>.jar -DpomFile=qafas-sandbox-<version>.pom
-```
+From Maven Central (it pulls in Gson and commons-compress):
 
 ```xml
 <dependency>
   <groupId>io.github.exitcodenihil</groupId>
   <artifactId>qafas-sandbox</artifactId>
-  <version><!-- the version you installed --></version>
+  <version>0.2.0</version> <!-- x-release-please-version -->
 </dependency>
 ```
 
-Gradle (`mavenLocal()` must come first in `repositories`):
-
 ```groovy
-repositories { mavenLocal(); mavenCentral() }
-dependencies { implementation 'io.github.exitcodenihil:qafas-sandbox:<version>' }
+implementation 'io.github.exitcodenihil:qafas-sandbox:0.2.0' // x-release-please-version
 ```
+
+Offline (an air-gapped site): download `qafas-sandbox-<version>.jar` and `.pom` from the [GitHub release](https://github.com/exitCodeNihil/qafas-sandbox/releases), `mvn install:install-file -Dfile=qafas-sandbox-<version>.jar -DpomFile=qafas-sandbox-<version>.pom`, and put `mavenLocal()` first in Gradle's `repositories`; Gson and commons-compress then come from your Maven mirror.
 
 From a source checkout, `cd sdk/java && mvn -B verify` builds `target/qafas-sandbox-<version>.jar`. The package is `io.github.exitcodenihil.qafas`.
 
