@@ -6,7 +6,7 @@ Async Rust client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-san
 
 ```toml
 [dependencies]
-qafas-sandbox = "0.2.0"  # x-release-please-version
+qafas-sandbox = "0.3.0"  # x-release-please-version
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

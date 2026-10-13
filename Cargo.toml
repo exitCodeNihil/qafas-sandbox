@@ -3,14 +3,14 @@ resolver = "2"
 members = ["crates/proto", "crates/agent-core", "crates/guest-agent", "crates/qafas", "sdk/rust"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/exitCodeNihil/qafas-sandbox"
 
 [workspace.dependencies]
-proto = { package = "qafas-proto", path = "crates/proto", version = "0.2.0" }
+proto = { package = "qafas-proto", path = "crates/proto", version = "0.3.0" }
 agent-core = { path = "crates/agent-core" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
