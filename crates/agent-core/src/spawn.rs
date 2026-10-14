@@ -5,7 +5,7 @@
 //!   * The native tier uses the same `Hardened` inside `qafas shim`, which is
 //!     itself wrapped once in the OS sandbox (`sandbox-exec` / `bwrap`); the
 //!     process-level confinement the OS cannot express is a `Confine` applied
-//!     when the shim is spawned.
+//!     to every command the shim spawns.
 
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
@@ -155,11 +155,14 @@ fn join_work_cgroup() {}
 /// Inside the VM/container: `harden::apply` does uid drop + seccomp.
 pub struct Hardened {
     pub limits: Limits,
+    /// Applied to every command before `harden::apply` (the native tier's
+    /// Landlock on Linux); `None` inside a container or microVM.
+    pub confine: Option<Confine>,
 }
 
 impl Default for Hardened {
     fn default() -> Self {
-        Self { limits: Limits::default() }
+        Self { limits: Limits::default(), confine: None }
     }
 }
 
@@ -191,11 +194,15 @@ impl Hardened {
         }
         c.kill_on_drop(true);
         let limits = self.limits.headroom();
+        let confine = self.confine.clone();
         unsafe {
             c.pre_exec(move || {
                 own_process_group()?;
                 join_work_cgroup();
                 limits.apply()?;
+                if let Some(f) = &confine {
+                    f()?;
+                }
                 harden(true)
             });
         }
@@ -206,10 +213,14 @@ impl Hardened {
     /// the syscalls the deny-list removes (D8) — but the same OS sandbox.
     pub fn helper(&self, program: &str) -> std::process::Command {
         let mut c = std::process::Command::new(program);
+        let confine = self.confine.clone();
         unsafe {
-            c.pre_exec(|| {
+            c.pre_exec(move || {
                 own_process_group()?;
                 join_work_cgroup();
+                if let Some(f) = &confine {
+                    f()?;
+                }
                 harden(false)
             });
         }
@@ -225,8 +236,10 @@ impl Hardened {
 // ------------------------------------------------------------------ confine
 
 /// Extra confinement the OS wrapper cannot express, applied between fork and
-/// exec of the native tier's shim so everything it spawns inherits it. macOS
-/// has none (Seatbelt is the wrapper); Linux installs Landlock and seccomp here.
+/// exec of every command the native tier's shim spawns. macOS has none
+/// (Seatbelt is the wrapper); Linux installs Landlock here. Not on the shim
+/// itself: it runs under `bwrap`, which Landlock (no mounts) and the seccomp
+/// deny-list (no `unshare`) would stop from building its sandbox at all.
 pub type Confine = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
 #[cfg(test)]

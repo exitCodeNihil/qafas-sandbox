@@ -178,12 +178,14 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-/// The first config file that exists, and where it came from.
+/// The first config file that exists, and where it came from. `SBX_CONFIG`
+/// only has to exist, so `/dev/null` means "no file", even beside a root-only
+/// `/etc/qafas/qafas.toml` a developer's own daemon cannot read.
 pub fn config_path() -> Option<PathBuf> {
-    let mut cands: Vec<PathBuf> = Vec::new();
-    if let Some(p) = env("SBX_CONFIG") {
-        cands.push(p.into());
+    if let Some(p) = env("SBX_CONFIG").map(PathBuf::from).filter(|p| p.exists()) {
+        return Some(p);
     }
+    let mut cands: Vec<PathBuf> = Vec::new();
     cands.push("qafas.toml".into());
     cands.push("/etc/qafas/qafas.toml".into());
     if let Some(h) = env("HOME") {
@@ -244,7 +246,8 @@ impl Config {
         let path = config_path();
         let file: FileConfig = match &path {
             Some(p) => {
-                toml::from_str(&std::fs::read_to_string(p)?).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?
+                let text = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display()))?;
+                toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?
             }
             None => FileConfig::default(),
         };
