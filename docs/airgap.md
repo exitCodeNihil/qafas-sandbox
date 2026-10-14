@@ -9,7 +9,7 @@ This page installs Qafas Sandbox in a datacenter with no route to the internet, 
 - Set the release you are installing; every command below uses `$V`:
 
 ```sh
-V=0.3.0      # the release being installed  (x-release-please-version)
+V=0.3.1      # the release being installed  (x-release-please-version)
 ```
 
 The install runs in this order:

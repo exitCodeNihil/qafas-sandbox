@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.1](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.3.0...v0.3.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **guest:** track an exec pid before the PID 1 reaper can reap it ([bafd08e](https://github.com/exitCodeNihil/qafas-sandbox/commit/bafd08ec588dd4e3201846472875c35b98a6807e))
+* **guest:** watch the workspace owner's home, not a root daemon's ([1d3c1a8](https://github.com/exitCodeNihil/qafas-sandbox/commit/1d3c1a857f3150c6f0d99e39c6bc69d4e1c9d91e))
+* log why a create failed and when base.warm overrides pool_size ([32e8daa](https://github.com/exitCodeNihil/qafas-sandbox/commit/32e8daa57be949e573c01d318fec6bf138272a57))
+* **native:** make the native tier work on Linux ([f3b3b99](https://github.com/exitCodeNihil/qafas-sandbox/commit/f3b3b99d491fd12ba74921b6e3c45e4b6a273f57))
+* **pool:** no leaks on a failed resize or at shutdown; keep workspaces ([ddfcb8d](https://github.com/exitCodeNihil/qafas-sandbox/commit/ddfcb8d2b2ea6505262ca59fec9819def2ac5786))
+* **scan:** tear down the scan sandbox when the daemon stops mid-scan ([f0a91d6](https://github.com/exitCodeNihil/qafas-sandbox/commit/f0a91d60585028ce1637df2b6509f7e8bde4da44))
+* **vm:** clean up failed starts and serialise rootless keep-id creates ([1ec6ccb](https://github.com/exitCodeNihil/qafas-sandbox/commit/1ec6ccb232662806bb13a351fb4844a3b86d6f54))
+
+
+### Performance Improvements
+
+* set TCP_NODELAY on every hop and stream reads in 64 KiB chunks ([5976dfc](https://github.com/exitCodeNihil/qafas-sandbox/commit/5976dfc81513d3efe52c5c505689e70e51bad9c3))
+
 ## [0.3.0](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.2.0...v0.3.0) (2026-10-13)
 
 

@@ -8,7 +8,7 @@ This guide is for operators who install and run Qafas Sandbox on more than one h
 Every command below installs this release:
 
 ```sh
-V=0.3.0      # the release every command below installs  (x-release-please-version)
+V=0.3.1      # the release every command below installs  (x-release-please-version)
 ```
 
 ## Contents
