@@ -1,6 +1,6 @@
 # qafas-sandbox (Python)
 
-Sync Python client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-sandbox): the control plane (`:7800`), which places the sandbox and hands back the worker to use, or one worker (`:7700`) directly. Stdlib HTTP (`urllib`); streaming exec and live events are an optional extra.
+Sync Python client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-sandbox). Stdlib HTTP (`urllib`); streaming exec and live events are an optional extra.
 
 ## Install
 
@@ -13,7 +13,7 @@ Offline, from a source checkout: `pip install ./sdk/python` (or `"./sdk/python[s
 
 Import as `qafas_sandbox`.
 
-## 30 seconds
+## Quick start
 
 ```python
 from qafas_sandbox import Sandbox
@@ -31,9 +31,33 @@ finally:
 
 - `runtime` is `"process" | "docker" | "firecracker"` (the wire's `native | vm | remote`, which `isolation` also takes). Omit it and the control plane picks, Firecracker first.
 - Pass a `cwd` as the second argument to start from a local directory: it is mounted at the same path (`native`, `vm`) or tarred and uploaded (`remote`, unless `upload_workspace=False`).
-- `acquire()` is the same path as a context manager; the handle also covers lifecycle and sleep/wake, sessions, snapshots (the `Image` Dockerfile builder) and preview URLs. The types mirror the wire contract, `docs/protocol.md`.
+- `acquire()` is the same path as a context manager.
 
-Configuration: `SBX_API_KEY` (an API key from the dashboard, preferred) or `SBX_ADMIN_TOKEN` against the control plane, `SBX_TOKEN` against a worker, and `SBX_CA_FILE` for an `https://` control plane or worker on an internal CA.
+## Connecting
+
+Point the client at the control plane (`:7800`), which places the sandbox and hands back the worker to use, or directly at one worker (`:7700`).
+
+| variable | |
+|---|---|
+| `SANDBOX_URL` | the default URL |
+| `SBX_API_KEY` | an API key from the dashboard, for the control plane (preferred) |
+| `SBX_ADMIN_TOKEN` | the control plane's admin token, when there is no key |
+| `SBX_TOKEN` | a worker's own token, when talking to a worker directly |
+| `SBX_CA_FILE` | a CA bundle for an `https://` control plane or worker on an internal CA |
+
+## Common operations
+
+| task | call |
+|---|---|
+| run a command, wait for the result | `sb.exec_buffered(cmd)` |
+| stream output as it arrives (the `stream` extra) | `sb.exec(cmd, on_output=fn)` |
+| files | `read_file`, `write_file`, `listdir`, `stat`, `mkdir`, `upload`, `download` |
+| shell sessions | `sb.create_session()`, then `exec`, `logs`, `input`, `delete` on the session |
+| lifecycle and sleep/wake | `stop`, `start`, `pause`, `resume`, `archive`, `info`, `delete` |
+| live events (the `stream` extra) | `sb.events()` |
+| preview URL | `sb.preview(port)` |
+| browser (CDP) | `sb.cdp_url` |
+| snapshots | `snapshots(url, token)`, with the `Image` Dockerfile builder |
 
 ## Tests and examples
 
@@ -42,3 +66,8 @@ python3 -m unittest discover -s tests -v   # most tests need a reachable qafas (
 python3 examples/run_command.py
 python3 examples/agent_loop.py
 ```
+
+## Links
+
+- [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-sandbox#readme): what it is and how to run it.
+- [Wire protocol](https://github.com/exitCodeNihil/qafas-sandbox/blob/main/docs/protocol.md) (`docs/protocol.md`): the types mirror it.
