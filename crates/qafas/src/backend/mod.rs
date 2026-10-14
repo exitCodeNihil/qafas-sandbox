@@ -278,6 +278,12 @@ pub trait Backend: Send + Sync {
     fn apply_limits(&self, _sb: &Sandbox, _l: &proto::SandboxLimits) -> BoxFut<'_, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
+    /// `create` put the sandbox at exactly `spec.limits`, so a warm one handed out
+    /// at the size it was booted with needs no `apply_limits`. Not a restored
+    /// microVM: its vCPUs and RAM come out of the memory snapshot.
+    fn create_sets_limits(&self) -> bool {
+        false
+    }
     /// One boundary sample, read on the reaper's 5 s tick. `None` when the tier
     /// cannot answer right now (a stopped sandbox, an unreachable guest).
     fn usage(&self, _sb: &Sandbox) -> BoxFut<'_, Option<proto::SandboxUsage>> {
@@ -359,14 +365,17 @@ impl Backend for Unavailable {
     }
 }
 
-/// Waits for the guest-agent to answer `/healthz` on a fresh sandbox.
+/// Waits for the guest-agent to answer `/healthz` on a fresh sandbox. Each probe
+/// is held to what is left of `timeout`: a relay dial to an address nobody holds
+/// any more waits out ARP, seconds past a 1 s warm-pool liveness check.
 pub async fn wait_healthy(conn: &Connector, timeout: std::time::Duration) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut last = String::from("never attempted");
-    while std::time::Instant::now() < deadline {
-        match probe(conn).await {
-            Ok(()) => return Ok(()),
-            Err(e) => last = e.to_string(),
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, probe(conn)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => last = e.to_string(),
+            Err(_) => last = "probe timed out".into(),
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }

@@ -38,6 +38,8 @@ pub struct Podman {
     relay: std::sync::Mutex<Option<SocketAddr>>,
     /// Container name → current address on the sandbox network, for `Relay`.
     table: super::RelayTable,
+    /// Held across a libpod create under rootless `keep-id` (`create`).
+    creating: tokio::sync::Mutex<()>,
 }
 
 /// Where the proxy container listens for the host's relay CONNECTs.
@@ -80,6 +82,7 @@ impl Podman {
             proxy_ip: std::sync::Mutex::new(String::new()),
             relay: std::sync::Mutex::new(None),
             table: Default::default(),
+            creating: Default::default(),
         })
     }
 
@@ -149,6 +152,21 @@ impl Podman {
         {
             let _ = self.call("DELETE", &format!("{api}/containers/{name}?force=true&v=true&timeout=0"), None).await;
             tracing::info!(container = %name, "removed orphaned sandbox from a previous run");
+        }
+        Ok(())
+    }
+
+    /// Force-removes one sandbox container, already gone counting as done.
+    /// `timeout=0`: SIGKILL at once. Without it libpod's force remove still waits
+    /// out the 10 s stop grace, which also races the control plane's 10 s
+    /// forwarding timeout into a spurious 502.
+    async fn remove(&self, name: &str) -> anyhow::Result<()> {
+        self.table.lock().unwrap().remove(name);
+        let api = self.api();
+        let (status, body) =
+            self.call("DELETE", &format!("{api}/containers/{name}?force=true&v=true&timeout=0"), None).await?;
+        if !(200..300).contains(&status) && status != 404 {
+            anyhow::bail!("destroy {name}: {status} {}", String::from_utf8_lossy(&body));
         }
         Ok(())
     }
@@ -700,34 +718,60 @@ impl Backend for Podman {
             // podman binds it next, and nothing of ours runs in between.
             drop(reserved);
             let api = self.api();
-            match self.is_docker() {
-                true => self.json("POST", &format!("/containers/create?name={name}"), Some(body)).await?,
-                false => self.json("POST", &format!("{API}/containers/create"), Some(body)).await?,
-            };
-            self.json("POST", &format!("{api}/containers/{name}/start"), None).await?;
+            if self.is_docker() {
+                self.json("POST", &format!("/containers/create?name={name}"), Some(body)).await?;
+            } else {
+                // ponytail: one libpod create at a time under rootless keep-id. podman
+                // 5.6 sometimes gives a container created alongside another only the
+                // `1000:0:1` mapping, no subuid ranges, and crun then fails its start
+                // (`ping_group_range … Invalid argument`, `uid_map … not permitted`):
+                // 3-5 of 10 concurrent creates, 0 of 30 serialised (2026-10-13). A
+                // create is ~7 ms, so ten queue for ~70 ms; starts stay concurrent.
+                // Drop the lock once podman computes keep-id mappings safely.
+                let _one = match rootful() {
+                    true => None,
+                    false => Some(self.creating.lock().await),
+                };
+                self.json("POST", &format!("{API}/containers/create"), Some(body)).await?;
+            }
+            // From here the container exists, and nothing but this call knows it
+            // does: a failure removes it again rather than leave it for the next
+            // boot's `sweep_orphans`.
+            let up = async {
+                self.json("POST", &format!("{api}/containers/{name}/start"), None).await?;
+                let info = self.json("GET", &format!("{api}/containers/{name}/json"), None).await?;
+                let port = Self::published_port(&info);
+                let peer_ip: Option<IpAddr> =
+                    info["NetworkSettings"]["Networks"][NETWORK]["IPAddress"].as_str().and_then(|s| s.parse().ok());
 
-            let info = self.json("GET", &format!("{api}/containers/{name}/json"), None).await?;
-            let port = Self::published_port(&info);
-            let peer_ip: Option<IpAddr> =
-                info["NetworkSettings"]["Networks"][NETWORK]["IPAddress"].as_str().and_then(|s| s.parse().ok());
-
-            let relay = *self.relay.lock().unwrap();
-            let connector = match (relay, peer_ip) {
-                (Some(via), Some(ip)) => {
-                    self.table.lock().unwrap().insert(name.clone(), ip);
-                    Connector::Relay {
-                        via,
-                        name: name.clone(),
-                        port: proto::GUEST_AGENT_PORT,
-                        table: self.table.clone(),
+                let relay = *self.relay.lock().unwrap();
+                let connector = match (relay, peer_ip) {
+                    (Some(via), Some(ip)) => {
+                        self.table.lock().unwrap().insert(name.clone(), ip);
+                        Connector::Relay {
+                            via,
+                            name: name.clone(),
+                            port: proto::GUEST_AGENT_PORT,
+                            table: self.table.clone(),
+                        }
                     }
-                }
-                _ => {
-                    let port = port.ok_or_else(|| anyhow::anyhow!("no published port for {name}, and no relay"))?;
-                    Connector::Tcp(SocketAddr::from(([127, 0, 0, 1], port)))
+                    _ => {
+                        let port = port.ok_or_else(|| anyhow::anyhow!("no published port for {name}, and no relay"))?;
+                        Connector::Tcp(SocketAddr::from(([127, 0, 0, 1], port)))
+                    }
+                };
+                super::wait_healthy(&connector, Duration::from_secs(10)).await?;
+                anyhow::Ok((connector, peer_ip))
+            };
+            let (connector, peer_ip) = match up.await {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Err(rm) = self.remove(&name).await {
+                        tracing::warn!(error = %format!("{rm:#}"), container = %name, "could not remove a sandbox that failed to start");
+                    }
+                    return Err(e);
                 }
             };
-            super::wait_healthy(&connector, Duration::from_secs(10)).await?;
             Ok(Sandbox {
                 id: spec.id,
                 template: spec.template,
@@ -743,20 +787,12 @@ impl Backend for Podman {
     }
 
     fn destroy(&self, sb: &Sandbox) -> BoxFut<'_, anyhow::Result<()>> {
-        // `timeout=0`: SIGKILL at once. Without it libpod's force remove still
-        // waits out the 10 s stop grace, which also races the control plane's
-        // 10 s forwarding timeout into a spurious 502.
         let name = format!("sbx-{}", sb.id);
-        Box::pin(async move {
-            self.table.lock().unwrap().remove(&name);
-            let api = self.api();
-            let (status, body) =
-                self.call("DELETE", &format!("{api}/containers/{name}?force=true&v=true&timeout=0"), None).await?;
-            if !(200..300).contains(&status) && status != 404 {
-                anyhow::bail!("destroy {name}: {status} {}", String::from_utf8_lossy(&body));
-            }
-            Ok(())
-        })
+        Box::pin(async move { self.remove(&name).await })
+    }
+
+    fn create_sets_limits(&self) -> bool {
+        true // `resource_limits`/`docker_limits` at create, the same block `apply_limits` sends
     }
 
     /// v5 §3a. One libpod `update`, which rewrites the running container's
@@ -1024,6 +1060,7 @@ mod tests {
             proxy_ip: std::sync::Mutex::new("10.0.0.2".into()),
             relay: std::sync::Mutex::new(None),
             table: Default::default(),
+            creating: Default::default(),
         }
     }
 
@@ -1162,6 +1199,67 @@ mod tests {
         let bind = named.iter().find(|m| m["type"] == "bind").expect("the named path is mounted");
         assert_eq!(bind["destination"], "/w", "at the identical path, in and out");
         assert_eq!(bind["source"], "/w");
+    }
+
+    /// A container whose start fails is removed again, not left for the next
+    /// boot's sweep; and under rootless keep-id no two creates overlap (podman
+    /// 5.6 gives one of them a broken ID map). Against a fake libpod socket.
+    #[tokio::test]
+    async fn a_failed_start_is_removed_and_keep_id_creates_never_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        #[derive(Default)]
+        struct Seen {
+            creating: AtomicUsize,
+            overlaps: AtomicUsize,
+            removed: AtomicUsize,
+        }
+        let seen = Arc::new(Seen::default());
+        let (c, r) = (seen.clone(), seen.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v5.0.0/libpod/containers/create",
+                axum::routing::post(move || async move {
+                    if c.creating.fetch_add(1, SeqCst) > 0 {
+                        c.overlaps.fetch_add(1, SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    c.creating.fetch_sub(1, SeqCst);
+                    (axum::http::StatusCode::CREATED, "{}")
+                }),
+            )
+            .route(
+                "/v5.0.0/libpod/containers/{name}/start",
+                axum::routing::post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "crun: boom") }),
+            )
+            .route(
+                "/v5.0.0/libpod/containers/{name}",
+                axum::routing::delete(move || async move {
+                    r.removed.fetch_add(1, SeqCst);
+                    axum::http::StatusCode::OK
+                }),
+            );
+        let sock = std::env::temp_dir().join(format!("sbx-fake-libpod-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let l = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let p = Arc::new(Podman { sock: sock.display().to_string(), ..podman() });
+        let tasks: Vec<_> = (0..4)
+            .map(|i| {
+                let (p, spec) =
+                    (p.clone(), Spec { id: format!("sbx_{i}"), workspace_path: "/home/agent".into(), ..spec_for() });
+                tokio::spawn(async move { p.create(spec).await })
+            })
+            .collect();
+        for t in tasks {
+            let e = t.await.unwrap().unwrap_err();
+            assert!(e.to_string().contains("boom"), "{e}");
+        }
+        assert_eq!(seen.removed.load(SeqCst), 4, "every created container is removed again");
+        if !rootful() {
+            assert_eq!(seen.overlaps.load(SeqCst), 0, "keep-id creates run one at a time");
+        }
+        let _ = std::fs::remove_file(&sock);
     }
 
     /// A fresh 32-byte secret per sandbox, never a reused one.
