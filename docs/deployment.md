@@ -322,6 +322,7 @@ A worker restart destroys its running `vm` sandboxes; `remote` sandboxes are pau
 | `Docker Engine … is too old` | upgrade to Docker 26 or later |
 | `… is owned by root` / `… does not exist; on the Docker runtime …` | run from an existing directory a regular user owns |
 | `pull …: …` on first start | the guest image is not loaded and the registry is unreachable: load it (`airgap.md`) |
+| a changed `pool_size` has no effect | an earlier `PUT /snapshots/base {warm}` is kept in `/var/lib/qafas/snapshots/base.warm` and wins (the log says so at start): delete the file, or `PUT` the new number |
 | `mem_mib … exceeds this host's template RAM` | raise `[firecracker] mem_mib`, or ask for a smaller size |
 | `template … failed its security scan` | an untrusted sandbox asked for an F-graded template: open it under **Templates** to see why |
 

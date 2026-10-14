@@ -126,10 +126,19 @@ impl Store {
         // from an older daemon; drop it rather than serve two answers.
         map.remove(BASE);
         tracing::info!(snapshots = map.len(), dir = %dir.display(), "snapshot store");
-        let base_warm = std::fs::read_to_string(dir.join("base.warm"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(cfg.pool_size);
+        let saved: Option<u32> =
+            std::fs::read_to_string(dir.join("base.warm")).ok().and_then(|s| s.trim().parse().ok());
+        if let Some(w) = saved.filter(|w| *w != cfg.pool_size) {
+            // A `PUT /snapshots/base` outlives restarts and wins over the config;
+            // say so, or a changed `pool_size` looks ignored.
+            tracing::warn!(
+                warm = w,
+                pool_size = cfg.pool_size,
+                file = %dir.join("base.warm").display(),
+                "base warm target comes from an earlier PUT /snapshots/base, not pool_size",
+            );
+        }
+        let base_warm = saved.unwrap_or(cfg.pool_size);
         let base_security =
             std::fs::read_to_string(dir.join("base.security.json")).ok().and_then(|s| serde_json::from_str(&s).ok());
         Self {
