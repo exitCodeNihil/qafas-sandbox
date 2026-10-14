@@ -195,6 +195,9 @@ pub async fn run(
 pub async fn serve(l: TcpListener, ctx: Arc<ProxyCtx>) -> anyhow::Result<()> {
     loop {
         let (sock, peer) = l.accept().await?;
+        // A relay forwards whatever arrives as it arrives; Nagle would hold a
+        // short tail back for the peer's delayed ACK. Both sides, as on the relay.
+        let _ = sock.set_nodelay(true);
         let ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(sock, peer, &ctx).await {
@@ -212,6 +215,7 @@ pub async fn serve(l: TcpListener, ctx: Arc<ProxyCtx>) -> anyhow::Result<()> {
 pub async fn serve_relay(l: TcpListener, net: (IpAddr, u8)) -> anyhow::Result<()> {
     loop {
         let (mut sock, peer) = l.accept().await?;
+        let _ = sock.set_nodelay(true);
         tokio::spawn(async move {
             if in_cidr(peer.ip(), net) {
                 return;
@@ -232,6 +236,7 @@ pub async fn serve_relay(l: TcpListener, net: (IpAddr, u8)) -> anyhow::Result<()
                     sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                 return;
             };
+            let _ = up.set_nodelay(true);
             if sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_ok() {
                 let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
             }
@@ -338,6 +343,7 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow
     }
 
     let mut up = TcpStream::connect(&ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect::<Vec<_>>()[..]).await?;
+    let _ = up.set_nodelay(true);
 
     if method == "CONNECT" {
         sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;

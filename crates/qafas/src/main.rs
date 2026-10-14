@@ -316,13 +316,21 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
                 }
             });
             // With connect info: `/metrics` is open to a loopback peer only (§3 v4).
-            axum_server::bind_rustls(cfg.listen, rustls_cfg)
+            // TCP_NODELAY on both listeners, as on the guest agent's: replies stream
+            // through here in several writes.
+            let tls = axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg)
+                .acceptor(axum_server::accept::NoDelayAcceptor::new());
+            axum_server::bind(cfg.listen)
+                .acceptor(tls)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await?;
         }
         None => {
-            let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
+            use axum::serve::ListenerExt;
+            let listener = tokio::net::TcpListener::bind(cfg.listen).await?.tap_io(|tcp| {
+                let _ = tcp.set_nodelay(true);
+            });
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async move {
                     terminate().await;

@@ -32,6 +32,10 @@ use crate::rfc3339_millis;
 
 // ------------------------------------------------------------------ handlers
 
+/// Read size for streamed replies. `ReaderStream`'s default is 4 KiB: a 1 MiB file
+/// was 256 chunks, each its own write and chunk header.
+const CHUNK: usize = 64 * 1024;
+
 /// Streamed, so reading a file never costs its size in memory. The open is what
 /// decides the status code; anything that goes wrong afterwards can only cut the
 /// body short, which is what a chunked reply already means to a client.
@@ -39,7 +43,7 @@ pub async fn read(Query(q): Query<PathQ>) -> Response {
     match tokio::fs::File::open(&q.path).await {
         Ok(f) => (
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            Body::from_stream(tokio_util::io::ReaderStream::new(f)),
+            Body::from_stream(tokio_util::io::ReaderStream::with_capacity(f, CHUNK)),
         )
             .into_response(),
         Err(e) => io_err(e),
@@ -213,7 +217,7 @@ pub async fn tar_get(Query(q): Query<PathQ>) -> Response {
     });
     (
         [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
-        Body::from_stream(tokio_util::io::ReaderStream::new(rx)),
+        Body::from_stream(tokio_util::io::ReaderStream::with_capacity(rx, CHUNK)),
     )
         .into_response()
 }
