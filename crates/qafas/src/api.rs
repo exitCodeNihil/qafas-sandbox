@@ -1295,7 +1295,8 @@ async fn update_snapshot(
     st.pool.set_warm(&name, req.warm).await;
     // design: only a workspace-agnostic pool (microVMs) can fill a template
     // nobody has asked for yet — a container pool needs the workspace, which
-    // only a create request carries, so there the number takes effect then.
+    // only a create request carries, so there the number fills the workspaces
+    // the pool has served (`set_warm` above) and a new one at its first create.
     if !st.pool.backend().pool_by_workspace() {
         let dir = st.snapshots.dir_of(&name);
         // `base` boots the host's own rootfs until its memory has been captured;
