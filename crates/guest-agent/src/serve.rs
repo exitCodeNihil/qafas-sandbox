@@ -73,7 +73,13 @@ pub async fn run() -> anyhow::Result<()> {
         return serve_vsock(app, port.into()).await;
     }
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    // TCP_NODELAY: a streamed reply (`/fs/read`, `/fs/tar`) is several writes, and
+    // with Nagle on the last one waits for an ACK the peer delays by 40 ms — every
+    // file read cost that, whatever its size (measured 2026-10-13).
+    use axum::serve::ListenerExt;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     tracing::info!(port, "guest-agent listening");
     axum::serve(listener, app).await?;
     Ok(())

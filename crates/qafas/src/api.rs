@@ -156,7 +156,11 @@ impl AppState {
             pool,
             bus,
             live: Default::default(),
-            agent: Client::builder(TokioExecutor::new()).build(HttpConnector::new()),
+            agent: Client::builder(TokioExecutor::new()).build({
+                let mut c = HttpConnector::new();
+                c.set_nodelay(true); // a request body is several writes too (Nagle, as in `main`)
+                c
+            }),
             caps,
             metrics: Metrics::new(),
             templates,

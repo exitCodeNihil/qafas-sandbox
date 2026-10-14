@@ -84,11 +84,16 @@ pub enum Connector {
 impl Connector {
     pub async fn connect(&self) -> anyhow::Result<Conn> {
         match self {
-            Connector::Tcp(addr) => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
+            Connector::Tcp(addr) => {
+                let s = tokio::net::TcpStream::connect(addr).await?;
+                s.set_nodelay(true)?; // Nagle stalls a multi-write body by the peer's delayed ACK
+                Ok(Box::new(s))
+            }
             Connector::Relay { via, name, port, table } => {
                 let ip = table.lock().unwrap().get(name).copied();
                 let Some(ip) = ip else { anyhow::bail!("{name} has no address on the sandbox network") };
                 let mut s = tokio::net::TcpStream::connect(via).await?;
+                s.set_nodelay(true)?;
                 s.write_all(format!("CONNECT {ip}:{port} HTTP/1.1\r\nHost: {ip}:{port}\r\n\r\n").as_bytes()).await?;
                 let mut r = BufReader::new(&mut s);
                 let mut line = String::new();
