@@ -31,7 +31,7 @@ Validated on Ubuntu 24.04, Linux Mint 22 and Rocky Linux 9.
 1. Set the release and download location:
 
    ```sh
-   V=0.3.0                                     # x-release-please-version
+   V=0.3.1                                     # x-release-please-version
    R=https://github.com/exitCodeNihil/qafas-sandbox/releases/download/v$V
    ```
 
@@ -81,7 +81,7 @@ Needs Docker Engine 26 or later with the compose plugin (`apt install docker.io 
 1. Fetch the compose file and generate the tokens:
 
    ```sh
-   V=0.3.0                                     # x-release-please-version
+   V=0.3.1                                     # x-release-please-version
    G=https://raw.githubusercontent.com/exitCodeNihil/qafas-sandbox/v$V/deploy/docker
    mkdir qafas && cd qafas
    curl -fLO $G/compose.yml && curl -fL $G/.env.example -o .env

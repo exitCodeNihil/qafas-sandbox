@@ -10,12 +10,12 @@ From Maven Central (it pulls in Gson and commons-compress):
 <dependency>
   <groupId>io.github.exitcodenihil</groupId>
   <artifactId>qafas-sandbox</artifactId>
-  <version>0.3.0</version> <!-- x-release-please-version -->
+  <version>0.3.1</version> <!-- x-release-please-version -->
 </dependency>
 ```
 
 ```groovy
-implementation 'io.github.exitcodenihil:qafas-sandbox:0.3.0' // x-release-please-version
+implementation 'io.github.exitcodenihil:qafas-sandbox:0.3.1' // x-release-please-version
 ```
 
 The package is `io.github.exitcodenihil.qafas`.
