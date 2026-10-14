@@ -301,7 +301,15 @@ pub fn push_usage(ctx: &crate::Ctx, corr: &crate::Corr) {
 /// through `statvfs`; a plain directory (macOS native, where the scratch is a
 /// directory under `/tmp`) has to be walked.
 pub fn scratch_bytes(dir: &str) -> u64 {
-    if cfg!(target_os = "linux") {
+    measure(dir, cfg!(target_os = "linux") && std::env::var_os("SBX_SCRATCH").is_none())
+}
+
+/// `own_fs`: `dir` is a filesystem of its own (the tmpfs of a container or a
+/// microVM), so one `statvfs` is the answer. The native tier's `SBX_SCRATCH` is a
+/// plain directory on the host's disk, where `statvfs` charged the sandbox for
+/// the whole disk and the watchdog killed it at once: count its files instead.
+fn measure(dir: &str, own_fs: bool) -> u64 {
+    if own_fs {
         if let Ok(s) = nix::sys::statvfs::statvfs(dir) {
             return (s.blocks() - s.blocks_free()) as u64 * s.fragment_size();
         }
@@ -326,6 +334,18 @@ fn walk_bytes(p: &std::path::Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A scratch that is a plain directory is charged for its own files, not
+    /// for the disk it sits on (symlinks to toolchains count for nothing).
+    #[test]
+    fn a_plain_scratch_directory_is_charged_for_its_files_only() {
+        let d = std::env::temp_dir().join(format!("sbx-scratch-walk-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("home")).unwrap();
+        std::fs::write(d.join("home/f"), vec![0u8; 4096]).unwrap();
+        let _ = std::os::unix::fs::symlink("/usr", d.join("home/toolchain"));
+        assert_eq!(super::measure(d.to_str().unwrap(), false), 4096);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     use super::*;
 
     /// The scratch measurement has to see a file that is actually there,

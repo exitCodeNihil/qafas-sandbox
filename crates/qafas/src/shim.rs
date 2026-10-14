@@ -1,7 +1,8 @@
 //! `qafas shim --socket <path>`: the native tier's in-sandbox agent.
 //!
 //! The daemon spawns this once per native sandbox, already wrapped in the OS
-//! sandbox (`sandbox-exec` on macOS, `bwrap` + Landlock + seccomp on Linux). It
+//! sandbox (`sandbox-exec` on macOS, `bwrap` on Linux, where every command it
+//! spawns also gets Landlock and seccomp). It
 //! serves the same handlers as guest-agent on a unix socket in the sandbox's
 //! scratch directory, so every command is a plain fork from a confined parent
 //! instead of a fresh `sandbox-exec` (which recompiles the profile: ~5 ms on
@@ -23,12 +24,20 @@ fn env(k: &str, d: &str) -> String {
 }
 
 pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
+    // The seccomp programs `Hardened` installs on every command, built once here
+    // as guest-agent builds them at its start; without this the shim's commands
+    // ran with no filter at all on Linux.
+    #[cfg(target_os = "linux")]
+    agent_core::harden::init_filter();
     let bus = serve::bus();
     let id = env("SBX_ID", "");
     let home = env("HOME", "/tmp");
     let workspace = env("SBX_WORKSPACE", &home);
     let rules = Rules::guest(&workspace, &home);
-    let ctx = Ctx::new(Hardened::default(), serve::emitter(&bus, &env("SBX_HOST_ID", ""), &id), rules);
+    let scratch = socket.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let spawner =
+        Hardened { confine: crate::backend::native::linux::confine(&workspace, &scratch), ..Default::default() };
+    let ctx = Ctx::new(spawner, serve::emitter(&bus, &env("SBX_HOST_ID", ""), &id), rules);
 
     // Every exec's process group goes on disk before it runs, so a daemon that
     // dies without calling `destroy` can still clean up on its next start.
@@ -41,10 +50,14 @@ pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
     tracing::info!(sandbox_id = %id, socket = %socket.display(), "shim listening");
 
     // No PR_SET_PDEATHSIG on macOS: notice the daemon going away by re-parenting.
-    tokio::spawn(async {
+    // Re-parenting, not "parent is 1": under bwrap's pid namespace the parent is
+    // its init, pid 1 from the start, and that test killed every Linux shim a
+    // second after it came up. There `--die-with-parent` covers the daemon.
+    let parent = unsafe { libc::getppid() };
+    tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if unsafe { libc::getppid() } == 1 {
+            if unsafe { libc::getppid() } != parent {
                 tracing::info!("daemon gone; shim exiting");
                 std::process::exit(0);
             }

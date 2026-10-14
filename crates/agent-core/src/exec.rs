@@ -600,7 +600,8 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s = seen.clone();
         let ev = Emitter::new("h", "sbx", Arc::new(move |e| s.lock().unwrap().push(e)));
-        let ctx = Ctx::new(Hardened { limits: Limits::default() }, ev, Rules::guest("/tmp", "/tmp/nohome"));
+        let ctx =
+            Ctx::new(Hardened { limits: Limits::default(), confine: None }, ev, Rules::guest("/tmp", "/tmp/nohome"));
 
         let r = buffered(
             &ctx,

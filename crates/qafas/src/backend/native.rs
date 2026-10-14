@@ -276,17 +276,12 @@ impl Native {
         // undo these. macOS keeps the default `nproc` (RLIMIT_NPROC is per-uid
         // there, so a per-sandbox value would throttle the whole login session).
         let limits = Limits::from(l).headroom();
-        let confine = linux::confine(workspace, scratch);
         unsafe {
             c.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                limits.apply()?;
-                match &confine {
-                    Some(f) => f(),
-                    None => Ok(()),
-                }
+                limits.apply()
             });
         }
         let child = c.spawn()?;
@@ -315,9 +310,10 @@ impl Native {
     }
 }
 
-/// The argv that wraps every command. macOS: `sandbox-exec -f <profile>`.
-/// Linux: `bwrap` with the mount plan of PLAN §2.2; the Landlock and seccomp
-/// halves are applied in `pre_exec` instead (see `linux::confine`).
+/// The argv that wraps the shim. macOS: `sandbox-exec -f <profile>`. Linux:
+/// `bwrap` with the mount plan of PLAN §2.2; Landlock and seccomp go on every
+/// command the shim spawns (`linux::confine`, `Hardened::confine`), because on
+/// `bwrap` itself they forbid the mounts and namespaces it is there to make.
 fn wrapper_prefix(
     cfg: &Config,
     profile: &Path,
@@ -638,12 +634,42 @@ pub mod linux {
         abi() >= 4
     }
 
-    /// PLAN §2.2. The whole filesystem read-only, the workspace and the scratch
-    /// dir writable, private pid/uts/ipc namespaces, and the process dies with
-    /// the daemon. The network namespace stays shared so the egress proxy on
-    /// loopback stays reachable; Landlock closes the rest of the network.
+    /// One real `bwrap` start with the namespaces the shim gets. A non-root
+    /// daemon needs an unprivileged user namespace for it, which Ubuntu 24.04
+    /// and later refuse unless an AppArmor profile allows `bwrap`.
+    pub fn bwrap_probe(bwrap: &str) -> (bool, String) {
+        let args = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-pid", "--unshare-uts"];
+        match std::process::Command::new(bwrap).args(args).args(["--unshare-ipc", "--", "/bin/true"]).output() {
+            Ok(o) if o.status.success() => (true, "starts as this user".into()),
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .is_ok_and(|s| s.trim() == "1");
+                match restricted {
+                    true => (
+                        false,
+                        format!(
+                            "{err}: AppArmor restricts unprivileged user namespaces; allow bwrap (docs/deployment.md)"
+                        ),
+                    ),
+                    false => (false, err),
+                }
+            }
+            Err(e) => (false, e.to_string()),
+        }
+    }
+
+    /// PLAN §2.2, mirroring the Seatbelt profile: the system read-only; every
+    /// home, `/root` and `/run` (the user's credentials, the podman, Docker and
+    /// D-Bus sockets) replaced by empty tmpfs; the daemon user's toolchains and
+    /// this binary read-only again; the workspace and the scratch dir writable;
+    /// the credential paths covered even inside the workspace; private
+    /// pid/uts/ipc namespaces; and the process dies with the daemon. The network
+    /// namespace stays shared so the egress proxy on loopback stays reachable;
+    /// Landlock closes the rest of the network.
     pub fn bwrap_prefix(workspace: &str, scratch: &Path, disk_mib: u64) -> Vec<String> {
         let Some(bw) = bwrap() else { return Vec::new() };
+        let real_home = std::env::var("HOME").unwrap_or_default();
         let s = scratch.display().to_string();
         let mut v: Vec<String> = vec![bw.display().to_string()];
         for a in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"] {
@@ -652,8 +678,23 @@ pub mod linux {
         // v5 §3a: `--size` applies to the next `--tmpfs`, so the scratch cap is
         // a mount option rather than anything the workload can remount.
         v.extend(["--size".into(), (disk_mib * 1024 * 1024).to_string(), "--tmpfs".into(), "/tmp".into()]);
+        for hidden in ["/home", "/root", "/run"].into_iter().filter(|d| Path::new(d).is_dir()) {
+            v.extend(["--tmpfs".into(), hidden.into()]);
+        }
+        let mut readable = crate::seatbelt::default_toolchains(&real_home);
+        readable.extend(std::env::current_exe().ok().map(|p| p.display().to_string()));
+        for p in readable {
+            v.extend(["--ro-bind".into(), p.clone(), p]);
+        }
         v.extend(["--bind".into(), workspace.into(), workspace.into()]);
         v.extend(["--bind".into(), s.clone(), s]);
+        for p in crate::seatbelt::default_sensitive(&real_home) {
+            match std::fs::metadata(&p) {
+                Ok(m) if m.is_dir() => v.extend(["--tmpfs".into(), p]),
+                Ok(_) => v.extend(["--ro-bind".into(), "/dev/null".into(), p]),
+                Err(_) => {}
+            }
+        }
         for a in ["--unshare-pid", "--unshare-uts", "--unshare-ipc", "--die-with-parent", "--new-session"] {
             v.push(a.into());
         }
@@ -669,9 +710,10 @@ pub mod linux {
         v
     }
 
-    /// Filesystem and network rules mirroring the Seatbelt profile, applied
-    /// between fork and exec so everything the shell spawns inherits them, plus
-    /// the same seccomp deny-list the VM tier installs (D8/D18).
+    /// Filesystem and network rules mirroring the Seatbelt profile, applied to
+    /// each command between fork and exec, so everything it spawns inherits
+    /// them; `Hardened` adds the seccomp deny-list the VM tier installs right
+    /// after (D8/D18).
     pub fn confine(workspace: &str, scratch: &Path) -> Option<agent_core::spawn::Confine> {
         use landlock::{
             Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
@@ -689,11 +731,15 @@ pub mod linux {
                 rs = rs.handle_access(AccessNet::from_all(abi)).map_err(|e| err(e.to_string()))?;
             }
             let mut created = rs.create().map_err(|e| err(e.to_string()))?;
-            // Read the world, write only the sandbox's own two directories.
+            // Read the world, write only the sandbox's own two directories and
+            // the devices every shell writes to (Seatbelt allows the same three).
             for (path, access) in [
                 ("/", AccessFs::from_read(abi)),
                 (ws.as_str(), AccessFs::from_all(abi)),
                 (sc.as_str(), AccessFs::from_all(abi)),
+                ("/dev/null", AccessFs::from_file(abi)),
+                ("/dev/zero", AccessFs::from_file(abi)),
+                ("/dev/tty", AccessFs::from_file(abi)),
             ] {
                 if let Ok(fd) = PathFd::new(path) {
                     created = created.add_rule(PathBeneath::new(fd, access)).map_err(|e| err(e.to_string()))?;
@@ -710,7 +756,7 @@ pub mod linux {
             if status.ruleset == RulesetStatus::NotEnforced {
                 return Err(err("Landlock is not enforced on this kernel".into()));
             }
-            agent_core::harden::apply(true)
+            Ok(())
         }))
     }
 }
@@ -746,6 +792,9 @@ pub mod linux {
     }
     pub fn confine(_workspace: &str, _scratch: &Path) -> Option<agent_core::spawn::Confine> {
         None
+    }
+    pub fn bwrap_probe(_bwrap: &str) -> (bool, String) {
+        (false, "Linux only".into())
     }
 }
 

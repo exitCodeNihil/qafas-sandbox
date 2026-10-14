@@ -76,6 +76,21 @@ pub async fn run_checks(cfg: &Config) -> Vec<Check> {
             },
         ));
         out.push(check("seccomp", true, "deny-list compiled into the binary (D8)"));
+        let uid = nix::unistd::Uid::effective();
+        out.push(check(
+            "native user",
+            !uid.is_root(),
+            match uid.is_root() {
+                true => {
+                    "root: native runs commands as the daemon's own user, so a root daemon does not serve it".into()
+                }
+                false => format!("uid {uid}"),
+            },
+        ));
+        if let (Some(bw), false) = (&bw, uid.is_root()) {
+            let (ok, detail) = native::linux::bwrap_probe(bw);
+            out.push(check("bwrap sandbox", ok, detail));
+        }
     }
 
     // --- vm
@@ -132,7 +147,7 @@ fn able(checks: &[Check]) -> Caps {
         native: if cfg!(target_os = "macos") {
             ok("seatbelt") && ok("seatbelt profile")
         } else {
-            ok("bubblewrap") && native::linux::abi() >= 2
+            ok("bubblewrap") && native::linux::abi() >= 2 && ok("native user") && ok("bwrap sandbox")
         },
         vm: ok("podman"),
         remote: ok("firecracker") && ok("kvm"),
