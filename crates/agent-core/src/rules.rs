@@ -156,10 +156,11 @@ impl Rules {
     /// Points the rules at a workspace: explicitly (`SBX_WORKSPACE`, the kernel
     /// cmdline) or when a tar lands in a pooled guest that had none yet.
     pub fn set_workspace(&self, workspace: &str) {
-        let host_home = std::env::var("SBX_HOST_HOME")
-            .ok()
-            .filter(|h| !h.is_empty())
-            .or_else(|| home_of(workspace))
+        // The workspace owner's home, read off its path, before the daemon's own
+        // (`SBX_HOST_HOME`): a root-run worker's HOME is `/root`, which left every
+        // check on `/home/<user>` blind on Linux workers.
+        let host_home = home_of(workspace)
+            .or_else(|| std::env::var("SBX_HOST_HOME").ok().filter(|h| !h.is_empty()))
             .filter(|h| *h != self.home);
         *self.loc.write().unwrap() = Loc { workspace: workspace.to_string(), host_home };
     }
@@ -390,6 +391,17 @@ mod tests {
         let hits = r.scan("touch /Users/me/outside");
         assert!(hits.iter().any(|h| h.rule == r::WORKSPACE_ESCAPE));
         assert!(r.scan("ls /Users/me/repo/src").is_empty(), "the workspace itself is fine");
+    }
+
+    /// A root-run worker hands the guest `SBX_HOST_HOME=/root`; the workspace's
+    /// owner is still the home the checks watch.
+    #[test]
+    fn the_workspace_owner_wins_over_a_root_daemon_home() {
+        std::env::set_var("SBX_HOST_HOME", "/root");
+        let r = Rules::guest("/home/alice/app", "/home/agent");
+        std::env::remove_var("SBX_HOST_HOME");
+        assert!(r.scan("touch /home/alice/proof").iter().any(|h| h.rule == r::WORKSPACE_ESCAPE));
+        assert!(r.scan("cat /home/alice/.ssh/id_rsa").iter().any(|h| h.rule == r::SENSITIVE_PATH_READ));
     }
 
     #[test]
