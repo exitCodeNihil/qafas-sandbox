@@ -37,6 +37,20 @@ pub fn is_tracked(pid: i32) -> bool {
     TRACKED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pid))
 }
 
+/// Spawns with the pid already in `TRACKED`. PID 1's reaper decides under the
+/// same lock, so it either looks before the child exists or after it is marked
+/// ours: a command that is done before `spawn` returns (`echo ok` under load)
+/// can no longer be reaped out from under tokio, whose `wait()` then failed and
+/// the exec reported `exit -1` with its output intact (3 in 2000 on Docker).
+fn spawn_tracked(c: &mut tokio::process::Command) -> std::io::Result<Child> {
+    let mut tracked = TRACKED.lock().unwrap();
+    let child = c.spawn()?;
+    if let Some(pid) = child.id() {
+        tracked.get_or_insert_with(HashSet::new).insert(pid as i32);
+    }
+    Ok(child)
+}
+
 fn track(ctx: &Arc<Ctx>, pid: u32, corr: &Corr) {
     TRACKED.lock().unwrap().get_or_insert_with(HashSet::new).insert(pid as i32);
     ctx.mon.watch(pid, corr.clone());
@@ -193,7 +207,7 @@ pub async fn buffered(ctx: &Arc<Ctx>, corr: Corr, req: ExecReq) -> std::io::Resu
     let cwd = resolve_cwd(ctx, &req.cwd);
     let mut cmd = ctx.spawner.command(&req.cmd, &cwd, &ctx.env_with_defaults(&req.env));
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let mut child = spawn_tracked(&mut cmd)?;
     let pid = child.id().unwrap_or(0);
     track(ctx, pid, &corr);
 
@@ -337,7 +351,7 @@ fn spawn_session(
     match pty {
         None => {
             c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            let mut child = c.spawn()?;
+            let mut child = spawn_tracked(&mut c)?;
             let io = Io::Pipes {
                 stdin: child.stdin.take().unwrap(),
                 stdout: child.stdout.take().unwrap(),
@@ -366,7 +380,7 @@ fn spawn_session(
                     Ok(())
                 });
             }
-            let child = c.spawn()?;
+            let child = spawn_tracked(&mut c)?;
             // The parent's copy of the slave must go, or the master never sees EOF.
             drop(slave);
             let write = master.try_clone()?;
@@ -542,6 +556,17 @@ mod tests {
     use super::*;
     use crate::spawn::{Hardened, Limits};
     use crate::{rules::Rules, Emitter};
+
+    /// PID 1's reaper leaves a zombie alone only if its pid is in `TRACKED`, so
+    /// the pid has to be there by the time `spawn` hands the child back.
+    #[tokio::test]
+    async fn a_child_is_tracked_before_spawn_returns() {
+        let mut child = spawn_tracked(&mut tokio::process::Command::new("true")).unwrap();
+        let pid = child.id().unwrap() as i32;
+        assert!(is_tracked(pid));
+        assert!(child.wait().await.unwrap().success());
+        TRACKED.lock().unwrap().as_mut().unwrap().remove(&pid);
+    }
 
     #[test]
     fn signal_names() {
