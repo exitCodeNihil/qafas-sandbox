@@ -110,6 +110,8 @@ struct Inner {
     refilling: HashSet<String>,
     /// v4 `warm` per template, from the snapshot store and `PUT /snapshots/{name}`.
     warm: HashMap<String, u32>,
+    /// Set by `drain` at shutdown: nothing is pooled or handed out after it.
+    closed: bool,
 }
 
 impl Inner {
@@ -213,6 +215,7 @@ impl Pool {
             let recent = recency_slots(g.ages(), &self.policy);
             let targets: HashMap<String, u32> =
                 g.slots.values().map(|s| (s.template.clone(), g.target(&s.template, &recent, &self.policy))).collect();
+            let explicit: HashSet<String> = g.warm.keys().cloned().collect();
             g.slots.retain(|_, s| {
                 let t = targets[&s.template] as usize;
                 while s.warm.len() > t {
@@ -221,8 +224,11 @@ impl Pool {
                 if s.warm.len() < t {
                     short.push((s.template.clone(), s.workspace.clone(), s.image.clone(), s.snapshot.clone()));
                 }
-                // An empty key nobody wants any more stops holding a recency slot.
-                t > 0 || !s.warm.is_empty()
+                // An empty key nobody wants any more stops holding a recency slot,
+                // unless its template has a `warm` someone set, even 0: a container
+                // pool learns a workspace only from a create, so forgetting it left
+                // a later `PUT /snapshots/{name} {warm: n}` nothing to fill.
+                t > 0 || !s.warm.is_empty() || explicit.contains(&s.template)
             });
         }
         for sb in extra {
@@ -271,7 +277,7 @@ impl Pool {
                 Ok(sb)
             }
             Err(e) => {
-                let _ = self.bus.send(ev(EventType::Error, json!({"msg": e.to_string()})));
+                let _ = self.bus.send(ev(EventType::Error, json!({"msg": format!("{e:#}")})));
                 Err(e)
             }
         }
@@ -340,11 +346,24 @@ impl Pool {
                 // moved onto the request's ceilings before the client ever sees
                 // it. A resize we cannot do is a create failure, not a sandbox
                 // handed out with somebody else's limits.
-                self.backend.apply_limits(&sb, limits).await?;
+                let booted_at = self.backend.create_sets_limits() && *limits == self.default_limits;
+                if !booted_at {
+                    if let Err(e) = self.backend.apply_limits(&sb, limits).await {
+                        // Off the queue and handed to nobody: nothing else would remove it.
+                        let _ = self.backend.destroy(&sb).await;
+                        return Err(e);
+                    }
+                }
                 (sb, true)
             }
             None => (self.create(template, workspace, egress_allow, image, snapshot.clone(), *limits).await?, false),
         };
+        // A create that finished after `drain` would never be destroyed: the
+        // shutdown has already gone through the live table.
+        if self.inner.lock().await.closed {
+            let _ = self.backend.destroy(&out.0).await;
+            anyhow::bail!("qafas is shutting down");
+        }
         self.spawn_refill(template.to_string(), workspace.to_string(), image.to_string(), snapshot);
         Ok(out)
     }
@@ -367,6 +386,9 @@ impl Pool {
             loop {
                 let (have, want) = {
                     let g = this.inner.lock().await;
+                    if g.closed {
+                        break;
+                    }
                     let recent = recency_slots(g.ages(), &this.policy);
                     let have = g.slots.get(&k).map_or(0, |s| s.warm.len()) as u32;
                     (have, g.target(&template, &recent, &this.policy))
@@ -378,6 +400,12 @@ impl Pool {
                 match this.create(&template, &workspace, &[], &image, snapshot.clone(), this.default_limits).await {
                     Ok(sb) => {
                         let mut g = this.inner.lock().await;
+                        if g.closed {
+                            // Booted while `drain` ran: pooled now, it would outlive the daemon.
+                            drop(g);
+                            let _ = this.backend.destroy(&sb).await;
+                            break;
+                        }
                         let s = g.slots.entry(k.clone()).or_insert_with(|| Slot {
                             template: template.clone(),
                             workspace: workspace.clone(),
@@ -398,7 +426,7 @@ impl Pool {
                         ));
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, template, workspace, "pool refill failed");
+                        tracing::warn!(error = %format!("{e:#}"), template, workspace, "pool refill failed");
                         break;
                     }
                 }
@@ -424,13 +452,26 @@ impl Pool {
         out
     }
 
-    /// Destroys every warm sandbox. Called on shutdown.
+    /// Called on shutdown. Destroys every warm sandbox and closes the pool, then
+    /// waits for refills still booting: each destroys
+    /// what it finishes instead of pooling it. Without the wait, every refill in
+    /// flight at shutdown left a running container behind (10 after a burst).
     pub async fn drain(&self) {
-        let all: Vec<Sandbox> = self.inner.lock().await.slots.drain().flat_map(|(_, s)| s.warm).collect();
+        let all: Vec<Sandbox> = {
+            let mut g = self.inner.lock().await;
+            g.closed = true;
+            g.slots.drain().flat_map(|(_, s)| s.warm).collect()
+        };
         for sb in all {
             if let Err(e) = self.backend.destroy(&sb).await {
                 tracing::warn!(error = %e, id = sb.id, "drain failed");
             }
+        }
+        // ponytail: polled, and bounded by a container's 10 s boot budget; a
+        // microVM still booting past it is left to the next start's sweep.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !self.inner.lock().await.refilling.is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 }
@@ -569,6 +610,110 @@ mod tests {
         // Out-of-window entries never take a slot from an in-window one.
         let s = recency_slots(used(&[("old", 99_999), ("a", 50), ("b", 40)]), &p);
         assert!(s.contains("a") && s.contains("b") && !s.contains("old"));
+    }
+
+    /// Setting `warm` to 0 must not make the pool forget a workspace it has
+    /// served: a later `warm: 2` fills it again without waiting for a create.
+    #[tokio::test]
+    async fn warm_zero_then_two_refills_a_known_workspace() {
+        let backend = Arc::new(Fake(AtomicU32::new(0), healthz().await));
+        let pool = Pool::new(backend, policy(1), crate::events::bus(), "h".into(), MINI);
+        pool.acquire("base", "/w", &[], "", None, &MINI).await.unwrap();
+        settle(&pool, 1).await;
+        pool.set_warm("base", 0).await;
+        assert_eq!(pool.warm_ready("base").await, 0);
+        pool.set_warm("base", 2).await;
+        settle(&pool, 2).await;
+    }
+
+    /// v5 §3a: on a tier whose create sets the limits, a warm sandbox taken at the
+    /// size it was booted with needs no resize call; any other size does, and a
+    /// resize that fails destroys the sandbox instead of dropping it on the floor.
+    #[tokio::test]
+    async fn a_resize_is_skipped_at_the_boot_size_and_a_failed_one_destroys() {
+        struct Sizing(Fake, AtomicU32, AtomicU32, bool);
+        impl Backend for Sizing {
+            fn name(&self) -> &'static str {
+                "sizing"
+            }
+            fn create(&self, spec: Spec) -> BoxFut<'_, anyhow::Result<Sandbox>> {
+                self.0.create(spec)
+            }
+            fn destroy(&self, _sb: &Sandbox) -> BoxFut<'_, anyhow::Result<()>> {
+                self.2.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+            fn apply_limits(&self, _sb: &Sandbox, _l: &proto::SandboxLimits) -> BoxFut<'_, anyhow::Result<()>> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let fail = self.3;
+                Box::pin(async move {
+                    if fail {
+                        anyhow::bail!("update refused")
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+            fn create_sets_limits(&self) -> bool {
+                true
+            }
+        }
+        const BIG: proto::SandboxLimits = proto::SandboxLimits { cpus: 2.0, mem_mib: 2048, disk_mib: 2048, pids: 512 };
+        for fail in [false, true] {
+            let b =
+                Arc::new(Sizing(Fake(AtomicU32::new(0), healthz().await), AtomicU32::new(0), AtomicU32::new(0), fail));
+            let pool = Pool::new(b.clone(), policy(1), crate::events::bus(), "h".into(), MINI);
+            pool.acquire("base", "/w", &[], "", None, &MINI).await.unwrap(); // cold: created at MINI
+            settle(&pool, 1).await;
+            let (_sb, warm) = pool.acquire("base", "/w", &[], "", None, &MINI).await.unwrap();
+            assert!(warm);
+            assert_eq!(b.1.load(Ordering::SeqCst), 0, "booted at MINI and asked for MINI: no resize");
+            settle(&pool, 1).await;
+            let r = pool.acquire("base", "/w", &[], "", None, &BIG).await;
+            assert_eq!(b.1.load(Ordering::SeqCst), 1, "any other size is a resize");
+            match fail {
+                false => assert!(r.unwrap().1),
+                true => {
+                    assert!(r.is_err());
+                    assert_eq!(b.2.load(Ordering::SeqCst), 1, "the popped sandbox is destroyed, not leaked");
+                }
+            }
+        }
+    }
+
+    /// Shutdown: a refill still booting when `drain` runs must not pool what it
+    /// makes (that container would outlive the daemon); `drain` waits for it and
+    /// the refill destroys it instead.
+    #[tokio::test]
+    async fn a_refill_in_flight_at_drain_destroys_what_it_makes() {
+        struct Slow(Fake, AtomicU32);
+        impl Backend for Slow {
+            fn name(&self) -> &'static str {
+                "slow"
+            }
+            fn create(&self, spec: Spec) -> BoxFut<'_, anyhow::Result<Sandbox>> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    self.0.create(spec).await
+                })
+            }
+            fn destroy(&self, _sb: &Sandbox) -> BoxFut<'_, anyhow::Result<()>> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let b = Arc::new(Slow(Fake(AtomicU32::new(0), healthz().await), AtomicU32::new(0)));
+        let pool = Pool::new(b.clone(), policy(2), crate::events::bus(), "h".into(), MINI);
+        pool.acquire("base", "/w", &[], "", None, &MINI).await.unwrap(); // the caller's; a refill starts
+        tokio::time::sleep(Duration::from_millis(10)).await; // the refill is mid-create
+        pool.drain().await;
+        let (made, gone) = (b.0 .0.load(Ordering::SeqCst), b.1.load(Ordering::SeqCst));
+        assert_eq!(made, 2, "the acquired one and the refill in flight");
+        assert_eq!(gone, 1, "the refill's sandbox is destroyed, not pooled");
+        assert!(pool.stats().await.values().all(|s| s.warm == 0));
+        let e = pool.acquire("base", "/w", &[], "", None, &MINI).await.unwrap_err();
+        assert!(e.to_string().contains("shutting down"), "{e}");
+        assert_eq!(b.1.load(Ordering::SeqCst), 2, "and so is one created after the drain");
     }
 
     /// B-bug: a warm entry whose guest died must not be handed out as a 201 with
