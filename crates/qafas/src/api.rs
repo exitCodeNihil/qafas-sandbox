@@ -1988,6 +1988,7 @@ pub async fn shutdown(st: &AppState) {
         tracing::info!(parked, "parked {parked} running sandboxes for restart");
     }
     st.pool.drain().await;
+    crate::scan::stop(st.pool.backend()).await;
 }
 
 /// v4d: restart what `shutdown` parked, by the same path `POST /start` takes —

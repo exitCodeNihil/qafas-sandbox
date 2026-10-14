@@ -15,6 +15,47 @@ use crate::snapshots::{podman_image, BASE};
 
 const SCRIPT: &str = include_str!("../../../images/probe/scan.sh");
 
+/// Scan sandboxes alive right now. They are in no pool and no live table, so a
+/// shutdown mid-scan (the `base` scan runs at every start) left the microVM
+/// running until the next start's sweep; `stop` tears them down instead.
+static SCANNING: std::sync::Mutex<Vec<crate::backend::Sandbox>> = std::sync::Mutex::new(Vec::new());
+/// Set by `stop`: a scan sandbox that finishes booting afterwards removes itself.
+static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Scans between "create asked for" and "torn down": `stop` waits for these,
+/// because a microVM still booting is in `SCANNING` only once its create returns.
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct InFlight;
+impl InFlight {
+    fn new() -> Self {
+        IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlight
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Shutdown: destroys every scan sandbox still alive, then waits for any still
+/// booting, each of which removes itself once it is up.
+pub async fn stop(backend: &std::sync::Arc<dyn crate::backend::Backend>) {
+    STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let alive = std::mem::take(&mut *SCANNING.lock().unwrap());
+    for sb in alive {
+        if let Err(e) = backend.destroy(&sb).await {
+            tracing::warn!(error = %e, sandbox_id = %sb.id, "scan sandbox not torn down at shutdown");
+        }
+    }
+    // ponytail: polled, and bounded like the pool's drain; a microVM booting past
+    // it (nested virtualisation) is left to the next start's sweep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Scans `template` and records the result on it.
 pub async fn run(st: &AppState, template: &str) -> anyhow::Result<TemplateSecurity> {
     let sec = scan(st, template).await?;
@@ -38,6 +79,7 @@ pub async fn scan(st: &AppState, template: &str) -> anyhow::Result<TemplateSecur
         (false, true) => (String::new(), Some(crate::backend::SnapshotRef { dir: st.snapshots.dir_of(template) })),
     };
     let digest = digest(st, &image, remote, template).await;
+    let _in_flight = InFlight::new();
     let sb = backend
         .create(crate::backend::Spec {
             id: format!("{}scan", crate::pool::new_id()),
@@ -53,9 +95,22 @@ pub async fn scan(st: &AppState, template: &str) -> anyhow::Result<TemplateSecur
             limits: st.cfg.default_limits(),
         })
         .await?;
-    let checks = exec_scan(&sb).await;
-    if let Err(e) = backend.destroy(&sb).await {
-        tracing::warn!(error = %e, sandbox_id = %sb.id, "scan sandbox not torn down");
+    SCANNING.lock().unwrap().push(sb.clone());
+    let checks = match STOPPED.load(std::sync::atomic::Ordering::SeqCst) {
+        true => Err(anyhow::anyhow!("qafas is shutting down")),
+        false => exec_scan(&sb).await,
+    };
+    // Whoever takes it off the list tears it down: this scan, or `stop`.
+    let mine = {
+        let mut g = SCANNING.lock().unwrap();
+        let n = g.len();
+        g.retain(|s| s.id != sb.id);
+        g.len() < n
+    };
+    if mine {
+        if let Err(e) = backend.destroy(&sb).await {
+            tracing::warn!(error = %e, sandbox_id = %sb.id, "scan sandbox not torn down");
+        }
     }
     let checks = checks?;
     let sec = TemplateSecurity {
