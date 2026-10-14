@@ -36,8 +36,10 @@ tiers = ["native", "vm"]
 # ca_file = ""
 
 ## Warm sandboxes the `base` template keeps ready on the vm/remote tiers, until
-## `PUT /snapshots/base {warm}` says otherwise. The native tier has no pool:
-## creating a sandbox there is a directory and a listener.
+## `PUT /snapshots/base {warm}` says otherwise. That number is kept across
+## restarts in /var/lib/qafas/snapshots/base.warm; delete the file to come back to
+## this one. The native tier has no pool: creating a sandbox there is a directory
+## and a listener.
 # pool_size = 2
 
 ## v4 warm policy for every *other* template (protocol §3a). Its target is

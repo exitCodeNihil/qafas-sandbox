@@ -664,10 +664,7 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
                     spawn_guest_events(st.clone(), sb.id.clone(), sb.connector.clone(), sb.agent_token.clone());
                     (sb, native as Arc<dyn Backend>, false)
                 }
-                Err(e) => {
-                    st.emit(&id, &corr, EventType::Error, json!({"msg": e.to_string()}));
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
+                Err(e) => return create_failed(&st, &id, &corr, &template, e),
             }
         }
         _ => match st.pool.acquire(&template, &workspace, &req.egress_allow, &image, snap_ref.clone(), &limits).await {
@@ -691,10 +688,7 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
                 st.metrics.pool_result(warm);
                 (sb, st.pool.backend().clone(), warm)
             }
-            Err(e) => {
-                st.emit("", &corr, EventType::Error, json!({"msg": e.to_string()}));
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
+            Err(e) => return create_failed(&st, "", &corr, &template, e),
         },
     };
 
@@ -771,6 +765,16 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
     // re-derive the name or the timer defaults from what the client sent.
     let resp = CreateSandboxResp { info: Some(Box::new(st.info(&live))), ..resp };
     (StatusCode::CREATED, Json(resp)).into_response()
+}
+
+/// A create that failed: logged with its whole cause chain (`{:#}` — the bare
+/// error of a podman socket hiccup is just "client error (SendRequest)"), on the
+/// bus, and as the 500 body.
+fn create_failed(st: &AppState, id: &str, corr: &Corr, template: &str, e: anyhow::Error) -> Response {
+    let msg = format!("{e:#}");
+    tracing::warn!(error = %msg, sandbox_id = id, template, "sandbox create failed");
+    st.emit(id, corr, EventType::Error, json!({"msg": msg}));
+    (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
 }
 
 /// v5 §3a. The 409 body for a request that fits no host ceiling, naming the
