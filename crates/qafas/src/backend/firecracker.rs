@@ -601,11 +601,13 @@ impl Firecracker {
     }
 
     /// The jail keeps files a second jailer run refuses to recreate: the device
-    /// nodes, the pid file, the API socket and the vsock UDS. Measured on
-    /// firecracker 1.15 — without this the jailer dies with `MknodDev EEXIST`.
+    /// nodes, the pid file, the API socket, the vsock UDS and the copied
+    /// firecracker binary, which a VM still tearing down keeps busy (ETXTBSY on
+    /// the jailer's write; unlinking is allowed). Measured on firecracker 1.15 —
+    /// without this the jailer dies with `MknodDev EEXIST`.
     fn clean_for_restart(root: &std::path::Path) {
         let _ = std::fs::remove_dir_all(root.join("dev"));
-        for f in ["firecracker.pid", "run/fc.sock"] {
+        for f in ["firecracker.pid", "firecracker", "run/fc.sock"] {
             let _ = std::fs::remove_file(root.join(f));
         }
         if let Ok(rd) = std::fs::read_dir(root) {
