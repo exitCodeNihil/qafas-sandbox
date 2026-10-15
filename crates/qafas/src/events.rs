@@ -295,7 +295,16 @@ pub fn spawn_egress_rules(bus: Bus, host_id: String) {
     tokio::spawn(async move {
         let mut denies: std::collections::HashMap<String, Vec<i64>> = Default::default();
         let mut burst_reported: std::collections::HashMap<String, i64> = Default::default();
-        while let Ok(e) = rx.recv().await {
+        loop {
+            let e = match rx.recv().await {
+                Ok(e) => e,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // One burst must not silence metadata/egress alerts host-wide.
+                    tracing::warn!(dropped = n, "egress rules lagged");
+                    continue;
+                }
+                Err(_) => return,
+            };
             if !matches!(e.r#type, EventType::EgressAllow | EventType::EgressDeny) {
                 continue;
             }
@@ -486,5 +495,42 @@ mod tests {
         }
         assert_eq!(bursts, 1, "one alert per burst, not one per denial");
         assert_eq!(metadata, 1);
+    }
+
+    /// A flood that overruns the bus before the rules task runs must not end
+    /// it: the metadata alert behind the flood still fires.
+    #[tokio::test]
+    async fn egress_rules_survive_lag() {
+        let bus = bus();
+        spawn_egress_rules(bus.clone(), "h".into());
+        let mut rx = bus.subscribe();
+        let deny = |host: &str| {
+            new_event(
+                "h",
+                "sbx_1",
+                &Corr::default(),
+                EventType::EgressDeny,
+                serde_json::json!({"host": host, "port": 443, "bytes": 0}),
+            )
+        };
+        // No await between the sends, so the rules task cannot drain any of
+        // them: 1,100 > the bus capacity.
+        for i in 0..1100 {
+            let _ = bus.send(deny(&format!("noise{i}.example")));
+        }
+        let _ = bus.send(deny("169.254.169.254"));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut metadata = 0;
+        while tokio::time::Instant::now() < deadline && metadata == 0 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(e)) if e.r#type == EventType::SecurityAlert && e.data["rule"] == "metadata.probe" => {
+                    metadata += 1
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(metadata, 1, "the alert behind a lagging burst still fires");
     }
 }

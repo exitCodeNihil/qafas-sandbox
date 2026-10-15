@@ -586,7 +586,15 @@ async fn stream_logs(cmd: Arc<Cmd>, mut sock: WebSocket) {
         }
     }
     if !done {
-        while let Ok(f) = rx.recv().await {
+        loop {
+            let f = match rx.recv().await {
+                Ok(f) => f,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "session attach stream lagged");
+                    continue;
+                }
+                Err(_) => break,
+            };
             let last = matches!(f, ExecFrame::Exit { .. });
             if send(&mut sock, &f).await.is_err() || last {
                 break;
