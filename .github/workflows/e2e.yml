@@ -1,0 +1,160 @@
+name: e2e
+
+# The only job that starts a real daemon: it builds qafas and the guest image, runs the
+# adversarial escape battery on the vm and native tiers, and smokes the API. Not a required
+# check (yet). Linux x86_64 only; the remote (Firecracker) tier needs KVM and is not covered.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  QAFAS: target/x86_64-unknown-linux-musl/release/qafas
+  URL: http://127.0.0.1:7700
+  # The daemon's default token (config.rs), also what escape.mjs and `qafas bench` are given.
+  TOKEN: dev
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain setup as ci.yml's linux job, for the one target the runner needs.
+      - run: rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install cargo-zigbuild
+      # escape.mjs opens its event socket with the global WebSocket and a headers option: Node 22.
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: build qafas and the guest agent
+        run: cargo zigbuild --release -p qafas -p guest-agent --target x86_64-unknown-linux-musl
+
+      # The image's own `qafas` runs the egress proxy, so it must come from this same build.
+      # On the Docker runtime qafas only looks in Docker's image store, hence `docker build`.
+      - name: build the guest image
+        run: |
+          images/base/stage.sh
+          docker build -t localhost/sbx-base:dev -f images/base/Dockerfile .
+
+      # ---- vm tier -------------------------------------------------------------------------
+      - name: vm — start the daemon as root
+        run: |
+          # The workspace must be owned by the CI user: on Docker a root-owned one is refused.
+          mkdir -p "$HOME/ws"
+          # Root, because it drives the Docker socket. The socket is named because the runner
+          # also has podman, which qafas would find first. `env` carries the settings through sudo.
+          # shellcheck disable=SC2024 # the log is meant to be written by the CI user, not root
+          sudo env SBX_TIERS=vm SBX_RUNTIME_SOCK=/var/run/docker.sock SBX_CONFIG=/dev/null RUST_LOG=info \
+            "$QAFAS" serve > vm.log 2>&1 &
+          for _ in $(seq 60); do
+            curl -sf "$URL/healthz" | jq -e '.tiers | index("vm")' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sf "$URL/healthz" | jq -e '.tiers | index("vm")'   # fails loudly if the loop gave up
+          # The template scan boots one sandbox at start; probing before it ends would race it.
+          # A failed scan logs "base security scan failed" and never "template scanned": stop there, not at the timeout.
+          for _ in $(seq 120); do
+            grep -qE "template scanned|base security scan is current" vm.log && break
+            if grep -q "base security scan failed" vm.log; then
+              echo "::error::$(grep "base security scan failed" vm.log | head -1)"; exit 1
+            fi
+            sleep 2
+          done
+          grep -E "template scanned|base security scan" vm.log || { echo "::error::no base security scan result within 240 s"; exit 1; }
+
+      - name: vm — escape battery
+        run: node tests/escape.mjs "$URL" "$TOKEN" vm "$HOME/ws"
+
+      - name: vm — bench smoke
+        run: SBX_CONFIG=/dev/null "$QAFAS" bench --url "$URL" --isolation vm --count 50 --workspace "$HOME/ws"
+
+      - name: vm — create, exec, 1 MiB file round trip, destroy
+        run: |
+          sb=$(curl -sf -X POST "$URL/sandboxes" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            -d "{\"template\":\"base\",\"isolation\":\"vm\",\"size\":\"micro\",\"pi_session\":\"e2e\",\"workspace\":{\"host_path\":\"$HOME/ws\"}}")
+          id=$(jq -r .id <<<"$sb"); ep=$(jq -r .endpoint <<<"$sb"); tok=$(jq -r .token <<<"$sb")
+          A=(-H "Authorization: Bearer $tok" -H "X-Pi-Session: e2e")
+          curl -sf "${A[@]}" -H 'content-type: application/json' -d "{\"cmd\":\"echo ok\",\"cwd\":\"$HOME/ws\",\"timeout_ms\":30000}" "$ep/exec" \
+            | jq -e '.exit == 0 and (.stdout | startswith("ok"))'
+          head -c 1048576 /dev/urandom > big.bin
+          curl -sf "${A[@]}" -X PUT --data-binary @big.bin "$ep/fs/write?path=$HOME/ws/big.bin"
+          curl -sf "${A[@]}" "$ep/fs/read?path=$HOME/ws/big.bin" -o back.bin
+          cmp big.bin back.bin
+          curl -sf -X DELETE "$URL/sandboxes/$id" -H "Authorization: Bearer $TOKEN"
+
+      - name: vm — ten concurrent creates
+        run: |
+          body="{\"template\":\"base\",\"isolation\":\"vm\",\"size\":\"micro\",\"pi_session\":\"e2e-burst\",\"workspace\":{\"host_path\":\"$HOME/ws\"}}"
+          seq 10 | xargs -P10 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/sandboxes" \
+            -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$body" > codes.txt
+          cat codes.txt
+          # Left running on purpose: the shutdown below has to clean them up.
+          test "$(grep -c '^201$' codes.txt)" = 10
+
+      - name: vm — SIGTERM leaves no sandbox container behind
+        run: |
+          sudo pkill -TERM -f 'release/qafas serve$'
+          for _ in $(seq 90); do pgrep -f 'release/qafas serve$' >/dev/null || break; sleep 1; done
+          if pgrep -f 'release/qafas serve$'; then echo "::error::the daemon did not exit within 90 s of SIGTERM"; exit 1; fi
+          if docker ps -a --format '{{.Names}}' | grep -q '^sbx-sbx_'; then
+            echo "::error::sandbox containers survived the shutdown"; docker ps -a; exit 1
+          fi
+
+      # ---- native tier (the vm daemon is gone: both bind :7700) -----------------------------
+      - name: native — bubblewrap and the AppArmor profile
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces; without this profile bwrap
+          # fails with "setting up uid map: Permission denied" (docs/deployment.md §5.5).
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+
+      - name: native — start the daemon as the CI user
+        run: |
+          # The binary stays under target/, not /tmp: a native sandbox mounts a fresh /tmp.
+          export SBX_TIERS=native SBX_CONFIG=/dev/null RUST_LOG=info
+          "$QAFAS" doctor || true   # the human-readable table, for the log
+          # Gate: if the host cannot serve native, say so here rather than as a connect error later.
+          "$QAFAS" doctor --json | jq -e '.serving | index("native")'
+          "$QAFAS" serve > native.log 2>&1 &
+          for _ in $(seq 60); do
+            curl -sf "$URL/healthz" | jq -e '.tiers | index("native")' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sf "$URL/healthz" | jq -e '.tiers | index("native")'
+
+      - name: native — escape battery
+        run: node tests/escape.mjs "$URL" "$TOKEN" native "$HOME/ws"
+
+      - name: logs and containers on failure
+        if: failure()
+        run: |
+          for f in vm.log native.log; do echo "::group::$f"; tail -n 200 "$f" 2>/dev/null || echo "no $f"; echo "::endgroup::"; done
+          docker ps -a || true
