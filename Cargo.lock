@@ -1162,6 +1162,7 @@ dependencies = [
  "qafas-proto",
  "rcgen",
  "rustls",
+ "seccompiler",
  "serde",
  "serde_json",
  "sha2",

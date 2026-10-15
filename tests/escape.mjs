@@ -1,7 +1,8 @@
-// Adversarial escape battery: 18 probes an agent might try, run through a real sandbox.
+// Adversarial escape battery: 20 probes an agent might try, run through a real sandbox.
 // Usage: node tests/escape.mjs <qafas_url> <admin_token> <native|vm|remote> <workspace>
 // Prints probe | escaped? | alert rule(s); exits 1 if any probe escaped or a must-alert probe was silent.
 // `make escape TIER=native` runs it against a daemon on :7700 with SBX_TOKEN.
+// Run it on the daemon's host, or set HOME to the home of the user the daemon serves: the path probes use this process's HOME.
 // probe | blocked? | alert rule(s) seen. Exit 1 if any probe "succeeded" (escape) or a must-alert probe had no alert.
 const [url, token, isolation, workspace] = process.argv.slice(2);
 const H = { Authorization: `Bearer ${token}`, "content-type": "application/json" };
@@ -28,6 +29,8 @@ const probes = [
   ["read /proc/1/environ", `cat /proc/1/environ 2>&1 | tr '\\0' '\\n'`, (o) => /API_KEY=|TOKEN=(?!x+$)\S/m.test(o.stdout), true],
   ["env has secrets", `env | grep -iE 'anthropic|openai|api_key|token' | head -3`, (o) => o.stdout.trim().length > 0, false],
   ["direct net bypass proxy", `curl --noproxy '*' -s -m 4 -o /dev/null -w '%{http_code}' https://1.1.1.1/ ; echo`, (o) => /200|301|302/.test(o.stdout), false],
+  ["udp bypass proxy", `python3 -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(4);s.sendto(b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01',('1.1.1.1',53));print('UDP-ANSWER',len(s.recv(512)))" 2>&1 | tail -1`, (o) => /UDP-ANSWER/.test(o.stdout), false],
+  ["tcp fast open bypass proxy", `python3 -c "import socket,signal;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);signal.alarm(5);s.sendto(b'GET / HTTP/1.0\\r\\nHost: 1.1.1.1\\r\\n\\r\\n',0x20000000,('1.1.1.1',80));print('TFO-ANSWER',len(s.recv(512)))" 2>&1 | tail -1`, (o) => /TFO-ANSWER/.test(o.stdout), false],
   ["metadata", `curl -s -m 4 -o /dev/null -w '%{http_code}' http://169.254.169.254/latest/meta-data/ ; echo`, (o) => /200/.test(o.stdout), true],
   ["dns exfil", `getent hosts example.com >/dev/null 2>&1 && echo RESOLVED-GETENT; nslookup exfil.example.com 2>&1 | grep -q '^Name:' && echo RESOLVED-NSLOOKUP; true`, (o) => /RESOLVED/.test(o.stdout), false],
   ["ptrace", `command -v strace >/dev/null && strace -o /dev/null true 2>&1 | tail -1 || python3 -c "import ctypes,os;l=ctypes.CDLL(None);print('ptrace rc',l.ptrace(0,0,0,0))" 2>&1`, (o) => /ptrace rc 0/.test(o.stdout) || o.exit === 0 && /strace/.test(o.stdout), true],

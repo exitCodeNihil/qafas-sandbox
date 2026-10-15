@@ -98,6 +98,7 @@ fn build_clone_ns() -> anyhow::Result<BpfProgram> {
     Ok(SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::KillProcess, ARCH)?.try_into()?)
 }
 
+// ponytail: x32 syscall numbers (nr | 0x40000000 under the x86_64 audit arch) are not matched; only matters on a kernel with x32 enabled at runtime. Upgrade: deny `nr & 0x40000000` up front.
 fn build(nrs: Vec<i64>, action: SeccompAction) -> anyhow::Result<BpfProgram> {
     // seccompiler rejects empty rule vectors, so every syscall gets one rule that
     // is trivially true (arg0 >= 0 as a u64).

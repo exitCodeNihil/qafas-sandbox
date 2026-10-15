@@ -700,7 +700,7 @@ pub mod linux {
         }
         // If Landlock cannot restrict the network on this kernel, take the whole
         // namespace away instead and log the downgrade (PLAN §5 risks). The
-        // sandbox then reaches the proxy over a unix-socket bridge, which is why
+        // sandbox then has no network at all, not even the proxy, which is why
         // `doctor` prints which of the two a host is using.
         if !landlock_net_available() {
             tracing::warn!(abi = abi(), "Landlock network rules unavailable; using --unshare-net");
@@ -708,6 +708,67 @@ pub mod linux {
         }
         v.push("--".into());
         v
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const ARCH: seccompiler::TargetArch = seccompiler::TargetArch::aarch64;
+    #[cfg(target_arch = "x86_64")]
+    const ARCH: seccompiler::TargetArch = seccompiler::TargetArch::x86_64;
+
+    /// `socket()` returns EPERM for AF_INET/AF_INET6 unless it is plain TCP.
+    /// Landlock ABI 4 governs TCP bind/connect only, and the sandbox shares the
+    /// host's network namespace, so without this any command could send UDP
+    /// (DNS to 8.8.8.8, QUIC) or open a raw, SCTP or MPTCP socket straight past
+    /// the egress proxy. Also refuses TCP Fast Open's `MSG_FASTOPEN` sends: they
+    /// connect inside `sendto`/`sendmsg`/`sendmmsg` without passing the connect
+    /// hook Landlock's port rule hangs on.
+    // ponytail: x32 syscall numbers (nr | 0x40000000 under the x86_64 audit
+    // arch) are not matched; that only matters on a kernel with x32 enabled at
+    // runtime. Upgrade: deny `nr & 0x40000000` up front.
+    pub fn socket_filter() -> anyhow::Result<seccompiler::BpfProgram> {
+        use seccompiler::{SeccompAction, SeccompCmpArgLen::Dword, SeccompCmpOp::*, SeccompCondition as C};
+        use seccompiler::{SeccompFilter, SeccompRule};
+        let (sock_stream, type_mask) = (libc::SOCK_STREAM as u64, 0xf); // SOCK_TYPE_MASK
+        let mut rules = Vec::new();
+        for domain in [libc::AF_INET, libc::AF_INET6] {
+            let dom = || C::new(0, Dword, Eq, domain as u64);
+            // Every type but SOCK_STREAM, masked so NONBLOCK/CLOEXEC don't slip by.
+            for ty in [
+                libc::SOCK_DGRAM,
+                libc::SOCK_RAW,
+                libc::SOCK_RDM,
+                libc::SOCK_SEQPACKET,
+                6,  /* DCCP */
+                10, /* PACKET */
+            ] {
+                rules.push(SeccompRule::new(vec![dom()?, C::new(1, Dword, MaskedEq(type_mask), ty as u64)?])?);
+            }
+            // Stream, but not TCP (SCTP is 132, MPTCP 262): Landlock ignores both.
+            rules.push(SeccompRule::new(vec![
+                dom()?,
+                C::new(1, Dword, MaskedEq(type_mask), sock_stream)?,
+                C::new(2, Dword, Ne, 0)?,
+                C::new(2, Dword, Ne, libc::IPPROTO_TCP as u64)?,
+            ])?);
+        }
+        // `flags` is arg3 of sendto and sendmmsg, arg2 of sendmsg.
+        let fastopen = |arg| -> anyhow::Result<Vec<SeccompRule>> {
+            let flag = libc::MSG_FASTOPEN as u64;
+            Ok(vec![SeccompRule::new(vec![C::new(arg, Dword, MaskedEq(flag), flag)?])?])
+        };
+        let filter = SeccompFilter::new(
+            [
+                (libc::SYS_socket, rules),
+                (libc::SYS_sendto, fastopen(3)?),
+                (libc::SYS_sendmsg, fastopen(2)?),
+                (libc::SYS_sendmmsg, fastopen(3)?),
+            ]
+            .into(),
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            ARCH,
+        )?;
+        Ok(filter.try_into()?)
     }
 
     /// Filesystem and network rules mirroring the Seatbelt profile, applied to
@@ -721,6 +782,9 @@ pub mod linux {
         };
         let (ws, sc) = (workspace.to_string(), scratch.display().to_string());
         let net = landlock_net_available();
+        // Built once here, not per command; a build failure fails every command
+        // rather than silently leaving UDP open.
+        let socks = socket_filter().map_err(|e| e.to_string());
         Some(Arc::new(move || {
             let err = |e: String| std::io::Error::other(e);
             // V2 is the floor we require; the crate's best-effort compatibility
@@ -756,7 +820,8 @@ pub mod linux {
             if status.ruleset == RulesetStatus::NotEnforced {
                 return Err(err("Landlock is not enforced on this kernel".into()));
             }
-            Ok(())
+            // restrict_self() set no_new_privs, so the filter needs no privilege.
+            seccompiler::apply_filter(socks.as_ref().map_err(|e| err(e.clone()))?).map_err(|e| err(e.to_string()))
         }))
     }
 }
@@ -868,5 +933,95 @@ mod tests {
         assert!(!root.join("sbx-abc").exists());
         assert!(root.join("someone-elses").exists(), "we only clean up our own");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Linux only: the forked child below is the one place the socket filter is
+/// proven to return EPERM, so it can't run on macOS.
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::linux::socket_filter;
+
+    fn errno_of(domain: i32, ty: i32, proto: i32) -> i32 {
+        let fd = unsafe { libc::socket(domain, ty, proto) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            return 0;
+        }
+        std::io::Error::last_os_error().raw_os_error().unwrap()
+    }
+
+    #[test]
+    fn only_tcp_sockets_survive_the_filter() {
+        let prog = socket_filter().unwrap();
+        // A fork, because the filter cannot be removed from the test process.
+        // The child only makes syscalls; its exit code is 0 or the failed check.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let code = (|| {
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+                seccompiler::apply_filter(&prog).map_err(|_| 100)?;
+                let (inet, inet6, cloexec) = (libc::AF_INET, libc::AF_INET6, libc::SOCK_CLOEXEC);
+                let denied = [
+                    errno_of(inet, libc::SOCK_DGRAM, 0),
+                    errno_of(inet6, libc::SOCK_DGRAM | cloexec, 0),
+                    errno_of(inet, libc::SOCK_RAW, 1),
+                    errno_of(inet, libc::SOCK_STREAM, 132),
+                    errno_of(inet6, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 262),
+                ];
+                for (i, e) in denied.iter().enumerate() {
+                    if *e != libc::EPERM {
+                        return Err(1 + i as i32);
+                    }
+                }
+                let allowed = [
+                    errno_of(inet, libc::SOCK_STREAM, 0),
+                    errno_of(inet6, libc::SOCK_STREAM | cloexec, libc::IPPROTO_TCP),
+                    errno_of(libc::AF_UNIX, libc::SOCK_DGRAM, 0),
+                ];
+                for (i, e) in allowed.iter().enumerate() {
+                    if *e != 0 {
+                        return Err(10 + i as i32);
+                    }
+                }
+                // TCP Fast Open: unfiltered, this fails with ECONNREFUSED or
+                // EINPROGRESS (port 1 has no listener), never EPERM.
+                let tcp = unsafe { libc::socket(inet, libc::SOCK_STREAM, 0) };
+                let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                to.sin_family = inet as u16;
+                to.sin_port = 1u16.to_be();
+                to.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+                let sent = unsafe {
+                    libc::sendto(
+                        tcp,
+                        b"x".as_ptr().cast(),
+                        1,
+                        libc::MSG_FASTOPEN,
+                        (&raw const to).cast(),
+                        std::mem::size_of_val(&to) as u32,
+                    )
+                };
+                if sent >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+                    return Err(20);
+                }
+                // A plain send (sendto with flags 0) still works.
+                let mut pair = [0; 2];
+                if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) } != 0
+                    || unsafe { libc::send(pair[0], b"x".as_ptr().cast(), 1, 0) } != 1
+                {
+                    return Err(21);
+                }
+                Ok(())
+            })();
+            unsafe { libc::_exit(code.err().unwrap_or(0)) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child did not exit: {status:#x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "failed check (1-5 denied, 10-12 allowed, 20 fastopen, 21 send, 100 apply)"
+        );
     }
 }
