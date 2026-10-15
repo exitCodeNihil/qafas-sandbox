@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// bench/run.mjs --backend native|vm|remote|e2b [--cases acquire,exec,fs,git,npm,uv,browser]
+// bench/run.mjs --backend native|vm|remote|e2b [--cases acquire,exec,fs,git,npm,uv,browser,first]
 //   [--url <base>] [--n 200]
 //
 // Drives qafas/control-plane through qafas-sandbox (never qafas's HTTP API
@@ -22,7 +22,7 @@ const BENCH_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SMALL_DIR = path.join(BENCH_DIR, "fixtures", "small");
 fs.mkdirSync(SMALL_DIR, { recursive: true });
 fs.writeFileSync(path.join(SMALL_DIR, "index.js"), "console.log('bench')\n");
-const ALL_CASES = ["acquire", "exec", "fs", "git", "npm", "uv", "browser"];
+const ALL_CASES = ["acquire", "exec", "fs", "git", "npm", "uv", "browser", "first"];
 
 const { values: flags } = parseArgs({
 	options: {
@@ -228,6 +228,43 @@ async function caseBrowser(results) {
 	}
 }
 
+/** The first command after a warm acquire against the ones after it. BENCH_FIRST
+ * names a variant that tells the cause apart: `sleep` (1 s idle before the first
+ * exec: background work such as the refill), `healthz` (GET /healthz first: the
+ * connection setup), `tmp` (the first exec runs in /tmp: the workspace lookup). */
+async function caseFirst(results) {
+	const variant = process.env.BENCH_FIRST ?? "";
+	const acq = [];
+	const first = [];
+	const steady = [];
+	const both = [];
+	for (let i = 0; i < 20; i++) {
+		await waitForWarm();
+		const a = await timeit(() => acquireForBackend(undefined));
+		const { client, workspacePath } = a.result;
+		try {
+			if (variant === "sleep") await new Promise((res) => setTimeout(res, 1000));
+			if (variant === "healthz") await fetch(`${client.endpoint}/healthz`);
+			const cwd = variant === "tmp" ? "/tmp" : workspacePath;
+			const f = await timeit(() => client.execBuffered("true", cwd));
+			const s = await timeit(() => client.execBuffered("true", cwd));
+			acq.push(a.ms);
+			first.push(f.ms);
+			steady.push(s.ms);
+			both.push(a.ms + f.ms);
+		} finally {
+			await client.destroy().catch(() => {});
+		}
+	}
+	results.first = {
+		variant: variant || "none",
+		acquire: percentiles(acq),
+		first_exec: percentiles(first),
+		steady_exec: percentiles(steady),
+		acquire_plus_first: percentiles(both),
+	};
+}
+
 async function runE2B(results) {
 	if (!process.env.E2B_API_KEY) {
 		console.error("bench: --backend e2b requires E2B_API_KEY; skipping.");
@@ -259,7 +296,7 @@ const results = { backend, host: os.hostname(), url, at: new Date().toISOString(
 if (backend === "e2b") {
 	await runE2B(results.cases);
 } else {
-	const runners = { acquire: caseAcquire, exec: caseExec, fs: caseFs, git: caseGit, npm: caseNpm, uv: caseUv, browser: caseBrowser };
+	const runners = { acquire: caseAcquire, exec: caseExec, fs: caseFs, git: caseGit, npm: caseNpm, uv: caseUv, browser: caseBrowser, first: caseFirst };
 	for (const c of cases) {
 		console.error(`# running case: ${c}`);
 		try {
