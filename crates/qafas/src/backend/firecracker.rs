@@ -250,17 +250,19 @@ impl Firecracker {
         }
         Ok(bytes)
     }
+}
 
-    async fn wait_for(&self, path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if path.exists() {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+/// Ready is a connect that succeeds: firecracker's `bind` creates the socket file
+/// before its `listen`, so the file existing says nothing about being served.
+async fn wait_for(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return Ok(());
         }
-        anyhow::bail!("{} never appeared", path.display())
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    anyhow::bail!("{} never accepted a connection", path.display())
 }
 
 impl Backend for Firecracker {
@@ -676,7 +678,7 @@ impl Firecracker {
         // 20 s: under load (rootfs builds, several restores) the jailer has been
         // seen to take more than 5 s to expose the socket; a wait costs nothing
         // when it is fast.
-        self.wait_for(&api_sock, Duration::from_secs(20)).await?;
+        wait_for(&api_sock, Duration::from_secs(20)).await?;
         Ok(api_sock)
     }
 
@@ -700,7 +702,7 @@ impl Firecracker {
 
     async fn wait_agent(&self, root: &std::path::Path) -> anyhow::Result<Connector> {
         let vsock_uds = root.join("v.sock");
-        self.wait_for(&vsock_uds, Duration::from_secs(5)).await?;
+        wait_for(&vsock_uds, Duration::from_secs(5)).await?;
         let connector =
             Connector::Vsock { uds: vsock_uds, port: proto::GUEST_AGENT_PORT as u32, keepalive: Default::default() };
         // An idle cold boot answers in ~2.5 s; one boot costs ~1.7 cores (guest
@@ -834,6 +836,35 @@ impl Firecracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound socket that is not yet listening (firecracker between `bind` and
+    /// `listen`) is not ready; once it listens, it is. `path.exists()` fails this.
+    #[tokio::test]
+    async fn a_socket_is_ready_when_it_accepts_not_when_it_exists() {
+        let path = std::env::temp_dir().join(format!("sbx-wf-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: plain libc calls on an fd and a sockaddr_un this test owns.
+        let fd = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as _;
+            for (d, b) in addr.sun_path.iter_mut().zip(c.as_bytes()) {
+                *d = *b as _;
+            }
+            assert_eq!(
+                libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of_val(&addr) as _),
+                0
+            );
+            fd
+        };
+        assert!(path.exists());
+        assert!(wait_for(&path, Duration::from_millis(100)).await.is_err(), "bound, not listening");
+        assert_eq!(unsafe { libc::listen(fd, 1) }, 0);
+        wait_for(&path, Duration::from_millis(100)).await.unwrap();
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Liveness without forking `pgrep`. A pid that is not this jail's VM any
     /// more must read dead, a missing pid file must read alive (the reaper
