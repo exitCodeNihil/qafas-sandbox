@@ -927,16 +927,16 @@ pub mod rules {
     /// (rule, default severity, what it means) — shipped to the control plane in
     /// `HostRegister.policy` so the dashboard can show operators what is watched.
     pub const CATALOGUE: &[(&str, &str, &str)] = &[
-        (SECCOMP_VIOLATION, "critical", "Process killed by seccomp: ptrace, mount, namespaces, bpf, keyctl or another blocked syscall"),
         (CANARY_READ, "critical", "A planted decoy credential (~/.ssh/id_rsa, ~/.aws/credentials, ~/.netrc) was read"),
         (ESCAPE_PROBE, "critical", "Touching container/VM escape surfaces: docker.sock, /proc/sysrq-trigger, cgroup release_agent, nsenter, unshare, runc"),
-        (PTRACE_ATTEMPT, "critical", "ptrace/debug attach attempt on another process"),
-        (MOUNT_ATTEMPT, "critical", "mount/pivot_root/setns attempt"),
+        (SECCOMP_VIOLATION, "high", "Process killed by seccomp: ptrace, mount, namespaces, bpf, keyctl or another blocked syscall"),
+        (PTRACE_ATTEMPT, "high", "ptrace/debug attach attempt on another process, or a command that runs strace, ltrace or gdb -p"),
+        (MOUNT_ATTEMPT, "high", "mount/pivot_root/setns attempt"),
         (SANDBOX_DENIED, "high", "The boundary refused an action: Seatbelt/nftables/bwrap denial, direct network bypassing the proxy"),
         (METADATA_PROBE, "high", "Cloud metadata endpoint referenced (169.254.169.254, metadata.google.internal, ...)"),
-        (EGRESS_DENY_BURST, "high", "Many egress denials in a short window: scanning or exfiltration attempts"),
-        (WORKSPACE_ESCAPE, "high", "Write outside the workspace and scratch directories"),
         (SENSITIVE_PATH_WRITE, "high", "Write to shell rc files, /etc, cron, systemd, launchd or SSH configuration"),
+        (EGRESS_DENY_BURST, "medium", "Many egress denials in a short window: scanning or exfiltration attempts"),
+        (WORKSPACE_ESCAPE, "medium", "Write outside the workspace and scratch directories"),
         (SENSITIVE_PATH_READ, "medium", "Read of credential or secret material: ~/.ssh, ~/.aws, ~/.netrc, gh/gcloud/kube configs, /etc/shadow"),
         (SETUID_EXEC, "medium", "setuid binary executed: sudo, su, doas, passwd, mount, pkexec"),
         (HOST_RECON, "medium", "Host reconnaissance: interface/route enumeration, hardware and OS inventory, net.* sysctls, port scanners"),
@@ -1122,5 +1122,24 @@ mod tests {
         .unwrap();
         assert!(i.size.is_empty() && i.usage.is_none() && i.limits.is_none(), "pre-v5 heartbeats stay valid");
         assert!(!serde_json::to_string(&i).unwrap().contains("\"usage\""), "absent usage is not serialised as null");
+    }
+
+    /// The dashboard's Policy page shows CATALOGUE; protocol.md §1.1 is the
+    /// contract. They had drifted apart (critical vs high for seccomp, ptrace and
+    /// mount), so a row that disagrees with the doc fails here.
+    #[test]
+    fn catalogue_severities_match_the_protocol() {
+        let doc = include_str!("../../../docs/protocol.md");
+        for (rule, sev, _) in rules::CATALOGUE {
+            // Graded per operation by its emitter (sblog.rs), not one value.
+            if *rule == rules::SANDBOX_DENIED {
+                continue;
+            }
+            let row = doc
+                .lines()
+                .find(|l| l.split('|').nth(1).is_some_and(|c| c.contains(&format!("`{rule}`"))))
+                .unwrap_or_else(|| panic!("{rule} is not in protocol.md"));
+            assert_eq!(row.split('|').nth(2).map(str::trim), Some(*sev), "{rule}");
+        }
     }
 }

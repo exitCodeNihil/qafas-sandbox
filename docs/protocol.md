@@ -49,7 +49,7 @@ Data path: `pi extension → qafas → guest-agent`. The Go control plane is nev
 | `egress.deny_burst` | medium | ≥ 5 `egress.deny` for one sandbox within 10 s |
 | `metadata.probe` | high | any attempt to reach 169.254.169.254, `metadata.google.internal`, `100.100.100.200` |
 | `escape.probe` | critical | open/exec of `/var/run/docker.sock`, `/run/podman/*.sock`, `/dev/kvm`, `/proc/1/root`, `/proc/sys/kernel/core_pattern`, `/sys/fs/cgroup/release_agent`, nsenter/unshare/setns binaries |
-| `ptrace.attempt` / `mount.attempt` | high | eBPF or SIGSYS attribution of the specific syscall |
+| `ptrace.attempt` / `mount.attempt` | high | eBPF or SIGSYS attribution of the specific syscall; `ptrace.attempt` also when a command runs `strace`/`ltrace`, or `gdb` with `-p`/`--pid`/`attach` |
 | `setuid.exec` | medium | exec of a setuid/setgid binary (sudo, su, passwd, ...) |
 | `workspace.escape` | medium | native tier: sandbox denied a filesystem op outside the allowed paths |
 | `resource.limit` | low | pids/memory/cpu limit hit |
