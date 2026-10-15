@@ -38,7 +38,8 @@ sha2.workspace = true
 # A one-file build context for the container runtime's /build.
 tar = { workspace = true }
 
-# Landlock is the Linux half of the native tier's boundary; there is no macOS
-# equivalent to link.
+# Landlock and seccomp are the Linux half of the native tier's boundary; there
+# is no macOS equivalent to link.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
+seccompiler = { workspace = true }
