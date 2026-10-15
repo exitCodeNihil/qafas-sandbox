@@ -342,8 +342,20 @@ impl Podman {
             self.json("POST", &format!("/containers/create?name={PROXY_CONTAINER}"), Some(spec)).await?;
             // Dual-homed on purpose: the sandbox network has no other exit (D7).
             let ep = static_ip.map_or(json!({}), |ip| json!({"IPAMConfig": {"IPv4Address": ip}}));
-            let join = json!({"Container": PROXY_CONTAINER, "EndpointConfig": ep});
-            self.json("POST", &format!("/networks/{NETWORK}/connect"), Some(join)).await?;
+            let path = format!("/networks/{NETWORK}/connect");
+            let (s, b) =
+                self.call("POST", &path, Some(json!({"Container": PROXY_CONTAINER, "EndpointConfig": ep}))).await?;
+            if s == 400 && String::from_utf8_lossy(&b).contains("user configured subnets") {
+                // ponytail: the pin is kept where Docker accepts it (< 28). The dynamic address is
+                // safe because sweep_orphans removes every sandbox before ensure_infra recreates
+                // the proxy, so no sandbox outlives a proxy address. Upgrade path: create the
+                // network with an explicit subnet if a sandbox ever has to survive a recreation.
+                tracing::warn!("this Docker refuses a static IP on {NETWORK}; the proxy takes a dynamic address");
+                let join = json!({"Container": PROXY_CONTAINER, "EndpointConfig": {}});
+                self.json("POST", &path, Some(join)).await?;
+            } else if !(200..300).contains(&s) {
+                anyhow::bail!("podman POST {path} -> {s}: {}", String::from_utf8_lossy(&b));
+            }
         } else {
             let mut spec = json!({
                 "name": PROXY_CONTAINER,
