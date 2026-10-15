@@ -285,6 +285,16 @@ impl Rules {
             if RECON_BINS.contains(&name) {
                 add(hit(r::HOST_RECON, Severity::Medium, w));
             }
+            // The seccomp filter kills the tracer, but only a shell that prints
+            // "Bad system call" lets the exec see it; the attempt itself is
+            // worth a line. `gdb ./a.out` debugs a file, `gdb -p 1` a process.
+            // ponytail: word match on the segment; `-p1` or an `attach` that is a
+            // file name over-fires or misses. Parse gdb's argv if that matters.
+            if matches!(name, "strace" | "ltrace")
+                || (name == "gdb" && words.any(|a| matches!(a, "-p" | "--pid" | "attach") || a.starts_with("--pid=")))
+            {
+                add(hit(r::PTRACE_ATTEMPT, Severity::High, w));
+            }
         }
         let loc = self.loc.read().unwrap().clone();
         for p in READ_HOME {
@@ -440,6 +450,26 @@ mod tests {
         assert!(r.scan("ifconfig -a | head").iter().any(|h| h.rule == r::HOST_RECON));
         assert!(r.scan("netstat -rn").iter().any(|h| h.rule == r::HOST_RECON));
         assert!(r.scan("git status").is_empty());
+    }
+
+    #[test]
+    fn tracing_a_process_is_reported() {
+        let r = rules();
+        for cmd in [
+            "strace -f ls",
+            "ltrace ls",
+            "gdb -p 1",
+            "gdb --pid 1",
+            "gdb --pid=1",
+            "gdb attach 5",
+            "ls; /usr/bin/strace x",
+        ] {
+            let hits = r.scan(cmd);
+            assert!(hits.iter().any(|h| h.rule == r::PTRACE_ATTEMPT && h.severity == Severity::High), "{cmd}");
+        }
+        for cmd in ["gdb ./a.out", "man strace", "cat strace.log", "echo gdb -p"] {
+            assert!(r.scan(cmd).iter().all(|h| h.rule != r::PTRACE_ATTEMPT), "{cmd}");
+        }
     }
 
     #[test]
