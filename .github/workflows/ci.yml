@@ -5,6 +5,8 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # release.yml dispatches this on the release PR's branch (a PR opened with the workflow token starts no pull_request run).
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}

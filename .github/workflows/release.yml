@@ -57,6 +57,11 @@ jobs:
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
     steps:
       - id: rp
         if: github.event_name == 'push'
@@ -64,6 +69,11 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: run CI on the release PR (a PR opened with GITHUB_TOKEN starts no pull_request workflow)
+        if: steps.rp.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml -R "$GITHUB_REPOSITORY" --ref release-please--branches--main
 
   # Every job below needs this one alone, so a skipped ancestor never skips them.
   prepare:
