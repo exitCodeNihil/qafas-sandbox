@@ -1710,9 +1710,10 @@ fn query_path(uri: &Uri) -> String {
     axum::extract::Query::<agent_core::fs::PathQ>::try_from_uri(uri).map(|q| q.0.path).unwrap_or_default()
 }
 
-/// Sends one request to the agent. TCP goes through a pooled client — which is
-/// also the native tier's path, since its endpoint is a loopback port this
-/// process serves; vsock does a fresh handshake per request.
+/// Sends one request to the agent. Only `Connector::Tcp` goes through the pooled
+/// client; `Unix` (the native shim's socket) and `Relay` (rootful podman/Docker)
+/// connect per request, and vsock keeps one idle connection per sandbox
+/// (`Keepalive`) and handshakes afresh when a call finds it busy.
 /// `pq` is the agent path, i.e. everything after `/agent` plus the query.
 async fn send(
     st: &AppState,
