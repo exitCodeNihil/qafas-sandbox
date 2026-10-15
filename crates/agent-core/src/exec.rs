@@ -504,11 +504,16 @@ pub async fn ws(ctx: Arc<Ctx>, corr: Corr, socket: WebSocket) {
 
     // Let the pumps drain what is already buffered, then stop waiting on them: a
     // grandchild holding the PTY slave open would otherwise keep them alive.
+    // Dropping a JoinHandle does not stop its task, and each pump holds a `tx`,
+    // so the writer would wait for them forever: abort them before `Exit`, which
+    // also keeps a late output frame from queueing behind it.
+    let aborts: Vec<_> = pumps.iter().map(|p| p.abort_handle()).collect();
     for p in pumps {
         if tokio::time::timeout(Duration::from_millis(200), p).await.is_err() {
             break;
         }
     }
+    aborts.iter().for_each(|a| a.abort());
     post_mortem(&ctx, &corr, &cmd, pid, code, sig.as_deref(), sigsys.load(std::sync::atomic::Ordering::Relaxed));
     let _ = tx
         .send(ExecFrame::Exit {
@@ -746,5 +751,43 @@ mod tests {
         let cmd = "(sh -c 'kill -STOP $$' & sleep 0.1) | cat";
         buffered(&ctx, Corr::default(), exec_req(cmd, 30_000)).await.expect("exec");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    /// `sleep 30 &` keeps the pipes open after the root exits. The pumps held
+    /// the writer's channel open, so the server sent `Exit` and then never
+    /// closed the socket.
+    #[tokio::test]
+    async fn the_socket_closes_after_exit_even_if_a_job_holds_the_pipes() {
+        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let app = crate::router(ctx);
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/exec/ws")).await.unwrap();
+        let start = ExecFrame::Start {
+            cmd: "sleep 30 & echo $!".into(),
+            cwd: "/tmp".into(),
+            env: BTreeMap::new(),
+            pty: None,
+            timeout_ms: None,
+        };
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(json(&start).into())).await.unwrap();
+        let (mut out, mut exited) = (String::new(), None);
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(m)) = ws.next().await {
+                let tokio_tungstenite::tungstenite::Message::Text(t) = m else { continue };
+                match serde_json::from_str::<ExecFrame>(&t).unwrap() {
+                    ExecFrame::Stdout { data } => out.push_str(&String::from_utf8_lossy(&B64.decode(data).unwrap())),
+                    ExecFrame::Exit { .. } => exited = Some(Instant::now()),
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        let pid: i32 = out.trim().parse().expect("the backgrounded pid");
+        let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        assert!(closed.is_ok(), "the socket stayed open after Exit");
+        assert!(exited.expect("an Exit frame").elapsed() < Duration::from_secs(2));
     }
 }
