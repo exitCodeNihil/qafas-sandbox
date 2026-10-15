@@ -166,15 +166,18 @@ async fn wait_child(child: &mut Child, pgid: Pid, timeout: Duration) -> (i32, Op
 }
 
 /// Reads to EOF but only keeps the first `CAP` bytes; the rest is drained so the
-/// child never blocks on a full pipe.
-async fn read_capped<R: AsyncRead + Unpin>(mut r: R) -> (Vec<u8>, bool) {
+/// child never blocks on a full pipe. Stops at `deadline` with what it has: the
+/// root exiting does not close the pipe while a background job still holds it.
+/// Returns `(bytes, truncated, deadline_hit)`.
+async fn read_capped<R: AsyncRead + Unpin>(mut r: R, deadline: tokio::time::Instant) -> (Vec<u8>, bool, bool) {
     let mut out = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     let mut truncated = false;
     loop {
-        match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
+        match tokio::time::timeout_at(deadline, r.read(&mut buf)).await {
+            Err(_) => return (out, truncated, true),
+            Ok(Ok(0) | Err(_)) => break,
+            Ok(Ok(n)) => {
                 if out.len() < CAP {
                     let take = n.min(CAP - out.len());
                     out.extend_from_slice(&buf[..take]);
@@ -185,7 +188,7 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R) -> (Vec<u8>, bool) {
             }
         }
     }
-    (out, truncated)
+    (out, truncated, false)
 }
 
 /// The cwd a request should actually run in: its own if it exists, else the
@@ -211,11 +214,23 @@ pub async fn buffered(ctx: &Arc<Ctx>, corr: Corr, req: ExecReq) -> std::io::Resu
     let pid = child.id().unwrap_or(0);
     track(ctx, pid, &corr);
 
-    let out = read_capped(child.stdout.take().unwrap());
-    let err = read_capped(child.stderr.take().unwrap());
     let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(DEFAULT_BUFFERED_MS));
-    let ((o, ot), (e, et), (code, sig, _to)) =
-        tokio::join!(out, err, wait_child(&mut child, Pid::from_raw(pid as i32), timeout));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let out = read_capped(child.stdout.take().unwrap(), deadline);
+    let err = read_capped(child.stderr.take().unwrap(), deadline);
+    let pgid = Pid::from_raw(pid as i32);
+    let ((o, ot, od), (e, et, ed), (code, sig, to)) = tokio::join!(out, err, wait_child(&mut child, pgid, timeout));
+    // The root is done but something still holds the pipes (a backgrounded job
+    // that did not redirect its output): the timeout covers them too. A root
+    // that timed out has had its group killed already.
+    let held = od || ed;
+    if held && !to {
+        // ponytail: the root is reaped, so if only a setsid'd holder is left the
+        // group may be empty and its number reusable. Microseconds, and one
+        // group per exec; a pidfd would close it.
+        let r = killpg(pgid, Signal::SIGKILL);
+        tracing::warn!(pgid = pid, ?r, "timeout: output pipes still held after the root exited; killing the group");
+    }
     post_mortem(ctx, &corr, &req.cmd, pid, code, sig.as_deref(), sniff_sigsys(&e));
     untrack(ctx, &corr, pid, code, sig.as_deref());
 
@@ -224,7 +239,7 @@ pub async fn buffered(ctx: &Arc<Ctx>, corr: Corr, req: ExecReq) -> std::io::Resu
         stdout: String::from_utf8_lossy(&o).into_owned(),
         stderr: String::from_utf8_lossy(&e).into_owned(),
         duration_ms: started.elapsed().as_millis() as u64,
-        truncated: ot || et,
+        truncated: ot || et || (held && !to),
     })
 }
 
@@ -579,12 +594,13 @@ mod tests {
     #[tokio::test]
     async fn capped_read_truncates_and_still_drains() {
         let big = vec![b'x'; CAP + 4096];
-        let (out, truncated) = read_capped(&big[..]).await;
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+        let (out, truncated, _) = read_capped(&big[..], far).await;
         assert_eq!(out.len(), CAP);
         assert!(truncated);
-        let (out, truncated) = read_capped(&b"short"[..]).await;
+        let (out, truncated, hit) = read_capped(&b"short"[..], far).await;
         assert_eq!(out, b"short");
-        assert!(!truncated);
+        assert!(!truncated && !hit);
     }
 
     #[test]
@@ -673,5 +689,49 @@ mod tests {
         .expect("exec");
         assert_eq!(r.exit, -1, "killed, so no exit code");
         assert!(r.duration_ms < 5_000);
+        assert!(!r.truncated, "a plain root timeout is not a truncated output");
+    }
+
+    fn exec_req(cmd: &str, timeout_ms: u64) -> ExecReq {
+        ExecReq { cmd: cmd.into(), cwd: "/tmp".into(), env: BTreeMap::new(), timeout_ms: Some(timeout_ms) }
+    }
+
+    fn gone(pid: i32) -> bool {
+        let p = Pid::from_raw(pid);
+        // A zombie nobody reaps (PID 1 of a bare container) is dead as well.
+        nix::sys::signal::kill(p, None).is_err()
+            || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|s| s.rsplit(')').next().is_some_and(|r| r.trim_start().starts_with('Z')))
+    }
+
+    /// The root exits at once but a background job keeps stdout open: the exec
+    /// used to wait for it forever, whatever `timeout_ms` said.
+    #[tokio::test]
+    async fn timeout_covers_pipes_held_after_the_root_exits() {
+        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let started = Instant::now();
+        let r = buffered(&ctx, Corr::default(), exec_req("sleep 30 & echo $!", 500)).await.expect("exec");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(r.truncated);
+        assert_eq!(r.exit, 0, "the root's own status, not the kill's");
+        let pid: i32 = r.stdout.trim().parse().expect("the backgrounded pid");
+        for _ in 0..20 {
+            if gone(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("sleep {pid} survived the timeout");
+    }
+
+    /// A background job that holds the pipes for less than the timeout is
+    /// still waited for, and nothing is flagged.
+    #[tokio::test]
+    async fn a_background_job_inside_the_timeout_is_still_waited_for() {
+        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let started = Instant::now();
+        let r = buffered(&ctx, Corr::default(), exec_req("sleep 1 & true", 10_000)).await.expect("exec");
+        assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
+        assert!(!r.truncated);
     }
 }
