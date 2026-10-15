@@ -316,7 +316,7 @@ impl Rules {
                 c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '\'' | '"' | '>' | '<')
             }) {
                 if w.starts_with(hh.as_str()) && !w.starts_with(loc.workspace.as_str()) {
-                    add(hit(r::WORKSPACE_ESCAPE, Severity::Low, w));
+                    add(hit(r::WORKSPACE_ESCAPE, Severity::Medium, w));
                 }
             }
         }
@@ -399,7 +399,7 @@ mod tests {
         let hits = r.scan("cat /Users/me/.ssh/id_rsa");
         assert!(hits.iter().any(|h| h.rule == r::SENSITIVE_PATH_READ && h.path == "/Users/me/.ssh"));
         let hits = r.scan("touch /Users/me/outside");
-        assert!(hits.iter().any(|h| h.rule == r::WORKSPACE_ESCAPE));
+        assert!(hits.iter().any(|h| h.rule == r::WORKSPACE_ESCAPE && h.severity == Severity::Medium));
         assert!(r.scan("ls /Users/me/repo/src").is_empty(), "the workspace itself is fine");
     }
 
