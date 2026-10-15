@@ -684,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_the_group_and_reports_it() {
-        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let ctx = test_ctx();
         let r = buffered(
             &ctx,
             Corr::default(),
@@ -695,6 +695,16 @@ mod tests {
         assert_eq!(r.exit, -1, "killed, so no exit code");
         assert!(r.duration_ms < 5_000);
         assert!(!r.truncated, "a plain root timeout is not a truncated output");
+    }
+
+    /// Every exec ends with a usage sample, which on macOS walks the scratch
+    /// directory (`$TMPDIR`, a whole user's temp files): seconds, which these
+    /// timing tests would measure. Point it at an empty one.
+    fn test_ctx() -> Arc<Ctx> {
+        let scratch = std::env::temp_dir().join("agent-core-exec-test-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::env::set_var("SBX_SCRATCH", scratch);
+        Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"))
     }
 
     fn exec_req(cmd: &str, timeout_ms: u64) -> ExecReq {
@@ -713,7 +723,7 @@ mod tests {
     /// used to wait for it forever, whatever `timeout_ms` said.
     #[tokio::test]
     async fn timeout_covers_pipes_held_after_the_root_exits() {
-        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let ctx = test_ctx();
         let started = Instant::now();
         let r = buffered(&ctx, Corr::default(), exec_req("sleep 30 & echo $!", 500)).await.expect("exec");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -733,7 +743,7 @@ mod tests {
     /// still waited for, and nothing is flagged.
     #[tokio::test]
     async fn a_background_job_inside_the_timeout_is_still_waited_for() {
-        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let ctx = test_ctx();
         let started = Instant::now();
         let r = buffered(&ctx, Corr::default(), exec_req("sleep 1 & true", 10_000)).await.expect("exec");
         assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
@@ -746,7 +756,7 @@ mod tests {
     /// subshell exits, and the sweep has to kill it or the exec never ends.
     #[tokio::test]
     async fn a_stopped_orphan_does_not_hold_the_exec_open() {
-        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let ctx = test_ctx();
         let started = Instant::now();
         let cmd = "(sh -c 'kill -STOP $$' & sleep 0.1) | cat";
         buffered(&ctx, Corr::default(), exec_req(cmd, 30_000)).await.expect("exec");
@@ -758,7 +768,7 @@ mod tests {
     /// closed the socket.
     #[tokio::test]
     async fn the_socket_closes_after_exit_even_if_a_job_holds_the_pipes() {
-        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let ctx = test_ctx();
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let app = crate::router(ctx);
