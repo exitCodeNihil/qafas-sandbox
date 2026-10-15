@@ -64,6 +64,9 @@ pub struct Live {
     /// v4. Highest multiple of `SBX_LONG_RUNNING_SECS` already alerted on, so
     /// the rule fires once per multiple rather than every 5 s.
     pub long_running_fired: std::sync::atomic::AtomicU64,
+    /// Which guest event stream is current. `transition(Start)` bumps it when it
+    /// dials a new one, which is what retires the old stream's redial loop.
+    pub events_gen: std::sync::atomic::AtomicU64,
     /// v5 §3a. The size name (or `custom`), the ceilings it resolved to and who
     /// holds them (`kernel`/`daemon`). Fixed at create: a resize is a new
     /// sandbox, so nothing here changes under a reader.
@@ -245,6 +248,7 @@ impl AppState {
             max_age_secs: rec.max_age_secs,
             env: rec.env.clone(),
             long_running_fired: Default::default(),
+            events_gen: Default::default(),
             // v5 §3a: a record from a pre-v5 daemon has no size, so it comes
             // back as the default — which is what it was actually running under.
             size: if rec.size.is_empty() { proto::sizes::DEFAULT.to_string() } else { rec.size.clone() },
@@ -640,7 +644,7 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         limits,
     };
 
-    let (sb, backend, warm) = match decision.tier {
+    let (sb, backend, warm, events) = match decision.tier {
         Isolation::Native => {
             // No pool: a native sandbox is a directory and a listener, and
             // making one costs about as much as taking one off a queue.
@@ -661,8 +665,8 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
             match native.create(spec).await {
                 Ok(sb) => {
                     st.emit(&id, &corr, EventType::SandboxReady, json!({"boot_ms": sb.boot_ms}));
-                    spawn_guest_events(st.clone(), sb.id.clone(), sb.connector.clone(), sb.agent_token.clone());
-                    (sb, native as Arc<dyn Backend>, false)
+                    let events = dial_guest_events(&sb.id, &sb.connector, sb.agent_token.as_deref()).await;
+                    (sb, native as Arc<dyn Backend>, false, events)
                 }
                 Err(e) => return create_failed(&st, &id, &corr, &template, e),
             }
@@ -684,9 +688,10 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
                 }
                 // Pull the guest's own telemetry onto our bus for as long as it
                 // lives; it cannot push to us through an internal network (D7).
-                spawn_guest_events(st.clone(), sb.id.clone(), sb.connector.clone(), sb.agent_token.clone());
+                // Dialed before the 201, so a command the client runs next is covered.
+                let events = dial_guest_events(&sb.id, &sb.connector, sb.agent_token.as_deref()).await;
                 st.metrics.pool_result(warm);
-                (sb, st.pool.backend().clone(), warm)
+                (sb, st.pool.backend().clone(), warm, events)
             }
             Err(e) => return create_failed(&st, "", &corr, &template, e),
         },
@@ -746,6 +751,7 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         op: Mutex::new(()),
         env: req.env,
         long_running_fired: Default::default(),
+        events_gen: Default::default(),
         size,
         limits,
         enforcement: backend.enforcement().to_string(),
@@ -758,6 +764,7 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         ttl_secs: req.ttl_secs.unwrap_or(st.cfg.ttl_secs),
     });
     st.live.lock().await.insert(id, live.clone());
+    spawn_guest_events(st.clone(), live.clone(), events);
     // From here the sandbox outlives this process: the table is what the next
     // start re-adopts a `stopped` or `archived` one from.
     st.persist(&live);
@@ -914,8 +921,13 @@ async fn transition(st: &AppState, l: &Arc<Live>, verb: Verb, reason: &str) -> a
                 tracing::warn!(error = %e, sandbox_id = %id, "woken guest did not take the workspace path");
             }
         }
-        // Its telemetry stream died with the old guest.
-        spawn_guest_events(st.clone(), id.clone(), l.sb.connector.clone(), l.sb.agent_token.clone());
+        // Its telemetry stream died with the old guest, unless this is a resume:
+        // that guest never went away, and its stream survived the pause.
+        if from != SandboxState::Paused {
+            l.events_gen.fetch_add(1, Ordering::Relaxed);
+            let events = dial_guest_events(&id, &l.sb.connector, l.sb.agent_token.as_deref()).await;
+            spawn_guest_events(st.clone(), l.clone(), events);
+        }
         l.long_running_fired.store(0, Ordering::Relaxed);
     }
     l.set_state(to);
@@ -1534,7 +1546,15 @@ async fn internal_events(State(st): State<AppState>, auth: Auth, Json(evs): Json
 async fn events_ws(State(st): State<AppState>, a: Auth, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |mut sock| async move {
         let mut rx = st.bus.subscribe();
-        while let Ok(ev) = rx.recv().await {
+        loop {
+            let ev = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "client event stream lagged");
+                    continue;
+                }
+                Err(_) => break,
+            };
             // A scoped token streams its own sandbox only; host-level events
             // (empty `sandbox_id`) stay with the admin.
             if !a.allows(&ev.sandbox_id) {
@@ -1548,60 +1568,102 @@ async fn events_ws(State(st): State<AppState>, a: Auth, ws: WebSocketUpgrade) ->
     })
 }
 
-/// Subscribes to a VM-tier sandbox's own `/events/ws` and republishes what it
-/// reports onto this daemon's bus, with the host id filled in.
+type GuestEvents = tokio_tungstenite::WebSocketStream<Conn>;
+
+/// One attempt at a sandbox's own `/events/ws`, bounded so a wedged guest
+/// cannot hold up the request that is waiting on it. Create and `start` await
+/// the first one before answering, so the stream is subscribed by the time the
+/// client's first command runs; a failure is only logged, the redial loop keeps
+/// trying.
+async fn dial_guest_events(id: &str, conn: &Connector, token: Option<&str>) -> Option<GuestEvents> {
+    let dial = async {
+        let io = conn.connect().await?;
+        let mut req =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request("ws://sandbox/events/ws")?;
+        if let Some(Ok(t)) = token.map(str::parse) {
+            req.headers_mut().insert(proto::HDR_AGENT_TOKEN, t);
+        }
+        anyhow::Ok(tokio_tungstenite::client_async(req, io).await?.0)
+    };
+    let r = tokio::time::timeout(std::time::Duration::from_secs(2), dial).await;
+    r.map_err(|_| anyhow::anyhow!("timed out"))
+        .and_then(|r| r)
+        .map_err(|e| tracing::debug!(sandbox_id = %id, error = %e, "no in-guest event stream"))
+        .ok()
+}
+
+/// Republishes a VM-tier sandbox's own `/events/ws` onto this daemon's bus,
+/// with the host id filled in, for as long as the sandbox runs.
 ///
 /// The guest cannot POST to us: it sits on an internal network whose only exit
 /// is the egress proxy (D7). So the direction is inverted — we pull, over the
-/// connector we already have.
-pub fn spawn_guest_events(st: AppState, id: String, conn: Connector, token: Option<String>) {
+/// connector we already have. `first` is the already-open stream from
+/// `dial_guest_events`; when a stream ends the loop redials, until the sandbox
+/// is gone, not running, or a newer loop has taken over (`events_gen`).
+pub fn spawn_guest_events(st: AppState, l: Arc<Live>, first: Option<GuestEvents>) {
+    let started_gen = l.events_gen.load(Ordering::Relaxed);
     tokio::spawn(async move {
-        let io = match conn.connect().await {
-            Ok(io) => io,
-            Err(e) => {
-                tracing::debug!(sandbox_id = %id, error = %e, "no in-guest event stream");
+        let id = l.sb.id.clone();
+        let mut stream = first;
+        loop {
+            if let Some(s) = stream.take() {
+                pump_guest_events(&st, &id, s).await;
+                tracing::debug!(sandbox_id = %id, "guest event stream ended");
+            }
+            // ponytail: fixed 1 s, no backoff — a guest that never serves the
+            // stream costs one failed dial a second until it stops; add backoff
+            // if that ever shows up in a profile.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if l.events_gen.load(Ordering::Relaxed) != started_gen || st.live_get(&id).await.is_none() {
                 return;
             }
-        };
-        let mut req = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-            "ws://sandbox/events/ws",
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(sandbox_id = %id, error = %e, "bad guest event request");
+            match l.state() {
+                // These wake through `transition(Start)`, which bumps the
+                // generation and spawns a fresh loop.
+                SandboxState::Stopped | SandboxState::Archived | SandboxState::Destroyed => return,
+                // The guest is frozen and its stream is the one a resume keeps:
+                // wait it out rather than dial a VM that cannot answer.
+                SandboxState::Paused => continue,
+                _ => {}
+            }
+            stream = dial_guest_events(&id, &l.sb.connector, l.sb.agent_token.as_deref()).await;
+            // The dial can take 2 s: a stop and start inside it hands the same
+            // address to a new loop, and this stream would double every event.
+            if l.events_gen.load(Ordering::Relaxed) != started_gen {
                 return;
             }
-        };
-        if let Some(Ok(t)) = token.as_deref().map(str::parse) {
-            req.headers_mut().insert(proto::HDR_AGENT_TOKEN, t);
         }
-        let Ok((mut stream, _)) = tokio_tungstenite::client_async(req, io).await else {
-            tracing::debug!(sandbox_id = %id, "guest does not serve /events/ws");
-            return;
+    });
+}
+
+async fn pump_guest_events(st: &AppState, id: &str, mut stream: GuestEvents) {
+    while let Some(Ok(m)) = stream.next().await {
+        let TgMsg::Text(t) = m else {
+            if matches!(m, TgMsg::Close(_)) {
+                break;
+            }
+            continue; // Ping/Pong/Binary say nothing about the sandbox
         };
-        while let Some(Ok(TgMsg::Text(t))) = stream.next().await {
-            match serde_json::from_str::<Event>(&t) {
-                Ok(mut ev) => {
-                    ev.host_id = st.cfg.host_id.clone();
-                    ev.sandbox_id = id.clone();
-                    // v5.1 §1: the guest pushes its own usage while an exec is
-                    // live. Taking it here is what makes `SandboxInfo.usage`
-                    // follow a burst instead of waiting for the 5 s pull, which
-                    // stays as the only sample an idle sandbox ever produces.
-                    if ev.r#type == EventType::SandboxUsage {
-                        if let Ok(u) = serde_json::from_value::<proto::SandboxUsage>(ev.data.clone()) {
-                            if let Some(l) = st.live_get(&id).await {
-                                *l.usage.lock().expect("usage") = Some(u);
-                            }
+        match serde_json::from_str::<Event>(&t) {
+            Ok(mut ev) => {
+                ev.host_id = st.cfg.host_id.clone();
+                ev.sandbox_id = id.to_string();
+                // v5.1 §1: the guest pushes its own usage while an exec is
+                // live. Taking it here is what makes `SandboxInfo.usage`
+                // follow a burst instead of waiting for the 5 s pull, which
+                // stays as the only sample an idle sandbox ever produces.
+                if ev.r#type == EventType::SandboxUsage {
+                    if let Ok(u) = serde_json::from_value::<proto::SandboxUsage>(ev.data.clone()) {
+                        if let Some(l) = st.live_get(id).await {
+                            *l.usage.lock().expect("usage") = Some(u);
                         }
                     }
-                    let _ = st.bus.send(ev);
                 }
-                Err(e) => tracing::debug!(error = %e, "unparsable guest event"),
+                let _ = st.bus.send(ev);
             }
+            Err(e) => tracing::debug!(error = %e, "unparsable guest event"),
         }
-        tracing::debug!(sandbox_id = %id, "guest event stream ended");
-    });
+    }
 }
 
 // ------------------------------------------------------------------ agent proxy
@@ -2497,11 +2559,137 @@ mod tests {
             usage: Default::default(),
             env: Default::default(),
             long_running_fired: Default::default(),
+            events_gen: Default::default(),
             state: std::sync::Mutex::new((SandboxState::Ready, now_ms())),
             op: Mutex::new(()),
         });
         st.live.lock().await.insert(id.to_string(), l.clone());
         l
+    }
+
+    /// The guest's event stream ending is not the end of the sandbox's reporting:
+    /// the loop redials, and stops once a newer generation owns the stream.
+    #[tokio::test]
+    async fn guest_events_redial_until_superseded() {
+        use std::sync::atomic::AtomicUsize;
+        // A guest that says one thing per connection and hangs up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let n = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                n.fetch_add(1, Ordering::Relaxed);
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else { continue };
+                let ev = Event {
+                    id: "01".into(),
+                    ts: now_rfc3339(),
+                    host_id: String::new(),
+                    sandbox_id: String::new(),
+                    pi_session: String::new(),
+                    tool_call_id: String::new(),
+                    r#type: EventType::SecurityAlert,
+                    data: json!({"rule": "t"}),
+                };
+                let _ = ws.send(TgMsg::Text(serde_json::to_string(&ev).unwrap().into())).await;
+                let _ = ws.close(None).await;
+            }
+        });
+
+        let st = state();
+        let l = live_at(&st, "sbx_redial", Connector::Tcp(addr), None, None, "").await;
+        let mut rx = st.bus.subscribe();
+        let first = dial_guest_events("sbx_redial", &l.sb.connector, None).await;
+        assert!(first.is_some());
+        spawn_guest_events(st.clone(), l.clone(), first);
+
+        // The first stream's event, then one more from the redial 1 s later.
+        for _ in 0..2 {
+            let e = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await.expect("event").unwrap();
+            assert_eq!(e.sandbox_id, "sbx_redial", "stamped with the sandbox, not the guest's guess");
+        }
+
+        // A new generation retires the loop: it may finish the dial it is in the
+        // middle of, but then the accept count stops growing.
+        l.events_gen.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let seen = accepts.load(Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert_eq!(accepts.load(Ordering::Relaxed), seen, "no redial after the generation moved on");
+    }
+
+    /// A dial that lands after a newer loop took over is dropped, not pumped:
+    /// otherwise a stop/start inside the 2 s dial delivers every event twice.
+    #[tokio::test]
+    async fn a_superseded_loops_late_dial_delivers_nothing() {
+        use std::sync::atomic::AtomicUsize;
+        // A guest that is slow to complete the handshake, then speaks.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let n = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                n.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else { continue };
+                let ev = Event {
+                    id: "01".into(),
+                    ts: now_rfc3339(),
+                    host_id: String::new(),
+                    sandbox_id: String::new(),
+                    pi_session: String::new(),
+                    tool_call_id: String::new(),
+                    r#type: EventType::SecurityAlert,
+                    data: json!({"rule": "t"}),
+                };
+                let _ = ws.send(TgMsg::Text(serde_json::to_string(&ev).unwrap().into())).await;
+                let _ = ws.close(None).await;
+            }
+        });
+
+        let st = state();
+        let l = live_at(&st, "sbx_late", Connector::Tcp(addr), None, None, "").await;
+        let mut rx = st.bus.subscribe();
+        spawn_guest_events(st.clone(), l.clone(), None);
+        // The loop's 1 s sleep ends and its dial starts; supersede it mid-dial.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(accepts.load(Ordering::Relaxed), 1, "the old loop is mid-dial");
+        l.events_gen.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        assert!(rx.try_recv().is_err(), "the stale stream was dropped, not pumped");
+    }
+
+    /// A pause does not end the loop: it neither dials nor exits while the
+    /// sandbox is frozen, and redials once it runs again (a resume spawns no
+    /// loop of its own).
+    #[tokio::test]
+    async fn guest_events_wait_out_a_pause() {
+        use std::sync::atomic::AtomicUsize;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let n = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                n.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await {
+                    let _ = ws.close(None).await;
+                }
+            }
+        });
+
+        let st = state();
+        let l = live_at(&st, "sbx_pause", Connector::Tcp(addr), None, None, "").await;
+        l.set_state(SandboxState::Paused);
+        // The first stream ended while paused: nothing to read, loop in its sleep.
+        spawn_guest_events(st.clone(), l.clone(), None);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert_eq!(accepts.load(Ordering::Relaxed), 0, "no dial while paused");
+
+        l.set_state(SandboxState::Ready);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(accepts.load(Ordering::Relaxed) >= 1, "the loop survived the pause and redialed");
     }
 
     /// N3: `egress.*` arrives from the proxy with a peer address and nothing
