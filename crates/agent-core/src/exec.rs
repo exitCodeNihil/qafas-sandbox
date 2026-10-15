@@ -734,4 +734,17 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
         assert!(!r.truncated);
     }
+
+    /// Under the seccomp filter `strace` dies of SIGSYS and its forked child,
+    /// which stopped itself to wait for the tracer, stays stopped holding the
+    /// pipes. Here the stop is by hand: the stopped `sh` is orphaned when its
+    /// subshell exits, and the sweep has to kill it or the exec never ends.
+    #[tokio::test]
+    async fn a_stopped_orphan_does_not_hold_the_exec_open() {
+        let ctx = Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"));
+        let started = Instant::now();
+        let cmd = "(sh -c 'kill -STOP $$' & sleep 0.1) | cat";
+        buffered(&ctx, Corr::default(), exec_req(cmd, 30_000)).await.expect("exec");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
 }
