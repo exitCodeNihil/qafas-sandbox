@@ -29,7 +29,7 @@ const probes = [
   ["env has secrets", `env | grep -iE 'anthropic|openai|api_key|token' | head -3`, (o) => o.stdout.trim().length > 0, false],
   ["direct net bypass proxy", `curl --noproxy '*' -s -m 4 -o /dev/null -w '%{http_code}' https://1.1.1.1/ ; echo`, (o) => /200|301|302/.test(o.stdout), false],
   ["metadata", `curl -s -m 4 -o /dev/null -w '%{http_code}' http://169.254.169.254/latest/meta-data/ ; echo`, (o) => /200/.test(o.stdout), true],
-  ["dns exfil", `nslookup exfil.example.com 2>&1 | head -2; getent hosts example.com 2>&1 | head -1`, (o) => /Address: \\d|Non-authoritative|\\d+\\.\\d+\\.\\d+\\.\\d+/.test(o.stdout), false],
+  ["dns exfil", `getent hosts example.com >/dev/null 2>&1 && echo RESOLVED-GETENT; nslookup exfil.example.com 2>&1 | grep -q '^Name:' && echo RESOLVED-NSLOOKUP; true`, (o) => /RESOLVED/.test(o.stdout), false],
   ["ptrace", `command -v strace >/dev/null && strace -o /dev/null true 2>&1 | tail -1 || python3 -c "import ctypes,os;l=ctypes.CDLL(None);print('ptrace rc',l.ptrace(0,0,0,0))" 2>&1`, (o) => /ptrace rc 0/.test(o.stdout) || o.exit === 0 && /strace/.test(o.stdout), true],
   ["mount", `mount -t tmpfs none /mnt 2>&1; echo exit=$?`, (o) => /exit=0/.test(o.stdout), process.platform !== "darwin" || isolation !== "native"],
   ["unshare userns", `unshare -Ur true 2>&1; echo exit=$?`, (o) => /exit=0/.test(o.stdout), process.platform !== "darwin" || isolation !== "native"],
