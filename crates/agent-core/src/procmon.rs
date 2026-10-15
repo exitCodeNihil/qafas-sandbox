@@ -44,6 +44,8 @@ const FORK_GRACE: Duration = Duration::from_millis(500);
 /// v5 §3a: the watchdog checks memory every sweep and the scratch directory
 /// once a second, which is this many sweeps.
 const DISK_EVERY: u64 = (1000 / SWEEP.as_millis()) as u64;
+/// How often the sweep looks for stopped orphans (about 250 ms).
+const STOPPED_EVERY: u64 = (250 / SWEEP.as_millis()) as u64;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ProcInfo {
@@ -132,6 +134,8 @@ struct Inner {
     /// Sweeps since the scratch directory was last measured — it is the only
     /// part of the watchdog that costs anything, so it runs once a second.
     disk_countdown: AtomicU64,
+    /// Sweeps since stopped orphans were last looked for.
+    stopped_countdown: AtomicU64,
     /// v5 §3a. Process groups the watchdog has already killed, so one kill
     /// raises one alert however many sweeps see the aftermath. Cleared per pgid
     /// by `unwatch`, so a recycled pid is never mistaken for an old kill.
@@ -378,6 +382,9 @@ impl Monitor {
         let roots: Vec<u32> = self.inner.watched.lock().unwrap().keys().copied().collect();
         // One kernel scan per tick for all of them, not one per group.
         let groups = sys::group_pids_all(&roots);
+        if self.inner.stopped_countdown.fetch_add(1, Ordering::Relaxed) % STOPPED_EVERY == 0 {
+            kill_stopped_orphans(&groups);
+        }
         // Where a cgroup answers `GET /usage` and holds the memory limit (every
         // Linux tier), nobody reads these per-pid numbers, so nobody pays for
         // them. Where there is none they are the only source there is, and a
@@ -503,6 +510,34 @@ impl Monitor {
     /// thing that did.
     pub fn unattributed_execs(&self) -> u64 {
         self.inner.unattributed.load(Ordering::Relaxed)
+    }
+}
+
+/// A process whose tracer or parent died while it was stopped is never resumed:
+/// `strace` killed by the seccomp filter leaves its forked child SIGSTOPped
+/// waiting for it, holding the exec's pipes. SIGKILL every stopped non-root
+/// member whose parent is not in its group. A root that is itself stopped is a
+/// client's deliberate `signal: STOP`, so that group is left alone.
+// ponytail: the ppid and state are read apart from the kill, so a pid recycled
+// in between could be hit (the scan is from the same tick, microseconds old), and a
+// process that left its group with setsid is not seen at all. Fine while the
+// target is one group per exec; a pidfd per member would close the window.
+fn kill_stopped_orphans(groups: &HashMap<u32, Vec<u32>>) {
+    for (root, pids) in groups {
+        if sys::stopped(*root).is_some_and(|(stopped, _)| stopped) {
+            continue;
+        }
+        for pid in pids.iter().filter(|p| *p != root) {
+            if let Some((true, ppid)) = sys::stopped(*pid) {
+                if !pids.contains(&ppid) {
+                    tracing::warn!(pid, ppid, "killing a stopped process whose parent is gone");
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(*pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -684,6 +719,11 @@ mod sys {
 
     pub fn pgid_of(pid: u32) -> Option<u32> {
         bsdinfo(pid).map(|i| i.pbi_pgid)
+    }
+
+    /// `(stopped, ppid)`. `pbi_status` is the kernel's `p_stat`: 4 is `SSTOP`.
+    pub fn stopped(pid: u32) -> Option<(bool, u32)> {
+        bsdinfo(pid).map(|i| (i.pbi_status == 4, i.pbi_ppid))
     }
 
     /// Wall-clock start time, used to tell a live process group from a pid that
@@ -919,18 +959,24 @@ mod sys {
 mod sys {
     use super::ProcInfo;
 
-    fn stat_fields(pid: u32) -> Option<(u32, u32)> {
+    fn stat_fields(pid: u32) -> Option<(char, u32, u32)> {
         let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // comm can contain spaces and parentheses; everything after the last ')'
         // is fixed-width.
         let rest = &s[s.rfind(')')? + 1..];
         let f: Vec<&str> = rest.split_whitespace().collect();
         // rest[0] is state, so ppid is f[1] and pgrp f[2].
-        Some((f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
+        Some((f.first()?.chars().next()?, f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
     }
 
     pub fn pgid_of(pid: u32) -> Option<u32> {
-        stat_fields(pid).map(|(_, pgrp)| pgrp)
+        stat_fields(pid).map(|(_, _, pgrp)| pgrp)
+    }
+
+    /// `(stopped, ppid)`: state `T`. A tracee left behind by a dead tracer is back
+    /// in group-stop (`T`); `t` is a live tracer's syscall-stop, not an orphan.
+    pub fn stopped(pid: u32) -> Option<(bool, u32)> {
+        stat_fields(pid).map(|(state, ppid, _)| (state == 'T', ppid))
     }
 
     /// Start time in clock ticks since boot (field 22 of `/proc/pid/stat`).
@@ -984,7 +1030,7 @@ mod sys {
     }
 
     pub fn describe(pid: u32, root_pid: u32) -> Option<ProcInfo> {
-        let (ppid, _) = stat_fields(pid)?;
+        let (_, ppid, _) = stat_fields(pid)?;
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
         let argv: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
             .unwrap_or_default()
@@ -1627,5 +1673,27 @@ mod tests {
             .find(|e| e.r#type == EventType::ProcessExit && e.data["pid"] == root)
             .unwrap_or_else(|| panic!("no process.exit for {root}: {evs:?}"));
         assert_eq!(exit.data["exit"], 7, "{}", exit.data);
+    }
+
+    /// Pins what "stopped" reads as on each OS (macOS `SSTOP` is 4, Linux `T`),
+    /// and that the parent comes back with it.
+    #[test]
+    fn stopped_reads_a_sigstop_and_a_sigcont() {
+        use nix::sys::signal::{kill, Signal};
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().expect("spawn");
+        let (pid, p) = (child.id(), nix::unistd::Pid::from_raw(child.id() as i32));
+        let until = |want: bool| {
+            (0..40).any(|_| {
+                std::thread::sleep(Duration::from_millis(25));
+                sys::stopped(pid).is_some_and(|(s, _)| s == want)
+            })
+        };
+        assert_eq!(sys::stopped(pid), Some((false, std::process::id())));
+        kill(p, Signal::SIGSTOP).unwrap();
+        assert!(until(true), "a SIGSTOPped process reads as stopped");
+        kill(p, Signal::SIGCONT).unwrap();
+        assert!(until(false), "and as running again after SIGCONT");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }
