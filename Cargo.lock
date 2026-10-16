@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "guest-agent"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "qafas"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "qafas-proto"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "qafas-sandbox"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "bytes",

@@ -7,7 +7,7 @@ Go client for [Qafas Sandbox](https://github.com/exitCodeNihil/qafas-sandbox). S
 Requires Go 1.22. The module is installed from this repository, by tag; it is not on any other registry. It is versioned with the server, so use the SDK version that matches your server:
 
 ```bash
-go get github.com/exitCodeNihil/qafas-sandbox/sdk/go@v0.3.1  # x-release-please-version
+go get github.com/exitCodeNihil/qafas-sandbox/sdk/go@v0.3.2  # x-release-please-version
 ```
 
 Each release pushes a `sdk/go/vX.Y.Z` tag, which is how Go resolves a module that lives in a subdirectory.

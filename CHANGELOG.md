@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.2](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.3.1...v0.3.2) (2026-10-16)
+
+
+### Bug Fixes
+
+* **alerts:** raise ptrace.attempt for strace, ltrace and gdb attach ([b93733f](https://github.com/exitCodeNihil/qafas-sandbox/commit/b93733f52060afdae5c6039dba4eec3eb5fe178d))
+* **docker:** start on Docker 28 when the proxy's pinned IP is refused ([fc51f25](https://github.com/exitCodeNihil/qafas-sandbox/commit/fc51f2565967298dcdb561f77757c7741273fa86))
+* **events:** keep guest alerts flowing through lag and redials ([a0ce9a9](https://github.com/exitCodeNihil/qafas-sandbox/commit/a0ce9a9736c9e9e7e7ed132ded79de904abe46f0))
+* **exec:** close the WebSocket after Exit ([00f5b45](https://github.com/exitCodeNihil/qafas-sandbox/commit/00f5b453332de16f4aa5e47128596cdb587ce598))
+* **exec:** enforce timeout_ms on output pipes, not only the root ([d8abdfb](https://github.com/exitCodeNihil/qafas-sandbox/commit/d8abdfbab10110c2383f17152a5deaaa963cf528))
+* **exec:** kill processes left stopped after their tracer died ([0032548](https://github.com/exitCodeNihil/qafas-sandbox/commit/003254884fa8e63937ee9649aa4184c29bd88ba3))
+* **native:** refuse UDP sockets in Linux native sandboxes ([7a8944c](https://github.com/exitCodeNihil/qafas-sandbox/commit/7a8944c6d36e554810eedd5b7200ff32a8ca31e6))
+* **proto:** align rule severities with the protocol ([fd10fc5](https://github.com/exitCodeNihil/qafas-sandbox/commit/fd10fc5a8c309a814a2566705cd306904076a9c1))
+* **remote:** restart a stopped microVM while the old one tears down ([7d0eae6](https://github.com/exitCodeNihil/qafas-sandbox/commit/7d0eae694a793da1f0d391fbf6acf8596264c302))
+* **remote:** wait for firecracker's sockets to accept, not to exist ([9e90b71](https://github.com/exitCodeNihil/qafas-sandbox/commit/9e90b71fffcc921cd266df17f35d74636cca9fc5))
+
 ## [0.3.1](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.3.0...v0.3.1) (2026-10-14)
 
 
