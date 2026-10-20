@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use config::Config;
 
@@ -82,21 +83,25 @@ enum Cmd {
     },
 }
 
-fn init_logging() {
+fn init_logging(to_stderr: bool) {
     // Structured JSON with the fields the runbooks grep for. `RUST_LOG=info` by
-    // default; `SBX_LOG_PRETTY=1` for a human at a terminal.
+    // default; `SBX_LOG_PRETTY=1` for a human at a terminal. The daemon logs to
+    // stdout (runbooks and e2e.yml scrape it); `doctor` logs to stderr so that
+    // `doctor --json` leaves stdout to the JSON document.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let out = if to_stderr { BoxMakeWriter::new(std::io::stderr) } else { BoxMakeWriter::new(std::io::stdout) };
+    let b = tracing_subscriber::fmt().with_env_filter(filter).with_writer(out);
     if std::env::var("SBX_LOG_PRETTY").as_deref() == Ok("1") {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        b.init();
     } else {
-        tracing_subscriber::fmt().json().flatten_event(true).with_env_filter(filter).init();
+        b.json().flatten_event(true).init();
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
     let cmd = Cli::parse().cmd.unwrap_or(Cmd::Serve);
+    init_logging(matches!(cmd, Cmd::Doctor { .. }));
     // The shim runs inside the sandbox with a curated environment and no config.
     if let Cmd::Shim { socket } = cmd {
         return shim::run(socket).await;
