@@ -590,25 +590,35 @@ pub fn sid_of(pid: u32) -> Option<u32> {
 
 impl Monitor {
     /// A `sched_process_exec`: the real program is known only now. `/proc` is
-    /// the good description and `exe_hint` (bpftrace's `args->filename`) the
-    /// fallback for a process that is already gone.
+    /// the good description; `exe_hint` (bpftrace's `args->filename`) and
+    /// `argv` (the kernel's copy from `sys_enter_execve`) stand in for a
+    /// process that is already gone — a `cat` of one small file is, by the time
+    /// its event is read on nested KVM, in about one run in six.
     ///
     /// At most one `process.start` per image per pid. A script's interpreter
     /// exec (shebang) fires a second event for the same image, and announcing a
     /// pid twice with no exit in between reads as two processes in the timeline.
-    fn note_exec(&self, pid: u32, root: u32, exe_hint: &str) {
-        let p = sys::describe(pid, root).unwrap_or_else(|| ProcInfo {
-            pid,
-            ppid: 0,
-            uid: 0,
-            exe: exe_hint.to_string(),
-            argv: vec![exe_hint.to_string()],
-            started_at: crate::now_rfc3339(),
-            rss_kb: None,
-            root_pid: root,
-            pi_session: String::new(),
-            tool_call_id: String::new(),
-        });
+    fn note_exec(&self, pid: u32, root: u32, exe_hint: &str, argv: Option<Vec<String>>) {
+        let mut p = match sys::describe(pid, root) {
+            // A zombie still has `/proc/<pid>/stat`, but no exe and no cmdline.
+            Some(p) if !p.exe.is_empty() => p,
+            _ => ProcInfo {
+                pid,
+                ppid: 0,
+                uid: 0,
+                exe: exe_hint.to_string(),
+                argv: vec![exe_hint.to_string()],
+                started_at: crate::now_rfc3339(),
+                rss_kb: None,
+                root_pid: root,
+                pi_session: String::new(),
+                tool_call_id: String::new(),
+            },
+        };
+        // `/proc` had nothing past the exe: the kernel's argv is the better record.
+        if let Some(a) = argv.filter(|a| p.argv.len() <= 1 && a.len() > p.argv.len()) {
+            p.argv = a;
+        }
         {
             let mut seen = self.inner.seen.lock().unwrap();
             if let Some((old, _)) = seen.get_mut(&pid) {
@@ -655,9 +665,33 @@ pub struct Lineage {
     /// pid → exec root, built from fork events so nothing depends on `/proc`
     /// still knowing a process that lived for a millisecond.
     of: HashMap<u32, u32>,
+    /// pid → the argv its last `execve` was called with, until its exec event.
+    argv: HashMap<u32, Vec<String>>,
 }
 
+/// How the feed's `argv` lines start (`sys_enter_execve` in `spawn_bpftrace`).
+const ARGV_LINE: &str = r#"{"t":"argv","pid":"#;
+
 impl Lineage {
+    /// The `argv` half of an exec: `{"t":"argv","pid":N,"a":"` from `printf`,
+    /// then bpftrace's `join()` of the arguments to the end of the line. Not
+    /// JSON (an argument may hold a quote), so it is taken apart here and kept
+    /// for that pid's exec event. Every other line comes back for the JSON
+    /// path, and so does an event another CPU printed between the two halves:
+    /// that argv is lost, the event is not.
+    pub fn take_argv_line<'a>(&mut self, line: &'a str) -> Option<&'a str> {
+        let Some(rest) = line.strip_prefix(ARGV_LINE) else { return Some(line) };
+        if let Some(i) = rest.find(r#"{"t":"#) {
+            return Some(&rest[i..]);
+        }
+        if let Some((pid, args)) = rest.split_once(r#","a":""#) {
+            if let Ok(pid) = pid.parse::<u32>() {
+                self.argv.insert(pid, args.split(' ').filter(|a| !a.is_empty()).map(str::to_string).collect());
+            }
+        }
+        None
+    }
+
     /// One line of the feed. Handles the lifecycle half (fork/exec/exit) and
     /// returns the exec root for anything else, so the caller can attribute a
     /// syscall event to it.
@@ -675,6 +709,7 @@ impl Lineage {
         }
         if t == "exit" {
             self.of.remove(&pid);
+            self.argv.remove(&pid);
             // `task_struct.exit_code` is wait(2)-shaped.
             let (exit, sig) = match v["st"].as_i64() {
                 Some(st) => decode_status(st as i32),
@@ -686,9 +721,10 @@ impl Lineage {
         // A fork event is the only record that outlives a process `/proc` never
         // saw; the kernel lookups are the fallback, in that order.
         let root = self.of.get(&pid).copied().or_else(|| mon.root_of(pid));
+        let argv = if t == "exec" { self.argv.remove(&pid) } else { None };
         match (t, root) {
             ("exec", Some(root)) => {
-                mon.note_exec(pid, root, v["f"].as_str().unwrap_or("?"));
+                mon.note_exec(pid, root, v["f"].as_str().unwrap_or("?"), argv);
                 None
             }
             (_, None) => {
@@ -1277,9 +1313,14 @@ mod sys {
         // One program, four feeds: exec/exit (no sampling gap), opens under the
         // credential prefixes, and every TCP connect (the proxy is the only
         // legitimate destination). Everything else stays in the /proc sweep.
+        // argv comes from `execve` itself: by the time an exec event is read,
+        // a short-lived process can be a zombie with an empty cmdline.
+        // ponytail: `join` keeps 16 arguments of 64 bytes (BPFTRACE_STRLEN), so
+        // a longer one is cut; /proc's full copy wins whenever it is still there.
         const SCRIPT: &str = r#"
 BEGIN { printf("{\"t\":\"ready\"}\n"); }
 tracepoint:sched:sched_process_fork { printf("{\"t\":\"fork\",\"pid\":%d,\"ppid\":%d}\n", args->child_pid, args->parent_pid); }
+tracepoint:syscalls:sys_enter_execve { printf("{\"t\":\"argv\",\"pid\":%d,\"a\":\"", pid); join(args->argv); }
 tracepoint:sched:sched_process_exec { printf("{\"t\":\"exec\",\"pid\":%d,\"f\":\"%s\"}\n", pid, str(args->filename)); }
 tracepoint:syscalls:sys_enter_openat
 / strncmp(str(args->filename), "/home/agent/.", 13) == 0 || strncmp(str(args->filename), "/etc/shadow", 11) == 0
@@ -1313,7 +1354,8 @@ tracepoint:syscalls:sys_enter_setns  { printf("{\"t\":\"setns\",\"pid\":%d,\"c\"
         std::thread::spawn(move || {
             let mut lineage = super::Lineage::default();
             for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let Some(line) = lineage.take_argv_line(&line) else { continue };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
                 // The BEGIN probe: the program compiled and the tracepoints are
                 // live. Only now does bpftrace own start/exit; until here the
                 // sweep announced, so nothing from the first seconds is lost.
@@ -1565,6 +1607,62 @@ mod tests {
         assert!(
             !events.lock().unwrap().iter().any(|e| e.r#type == EventType::ProcessStart),
             "and nothing is attributed to an exec it does not belong to",
+        );
+    }
+
+    /// A child that is gone by the time its exec event is read (a `cat` of
+    /// one small file, often, on nested KVM) keeps its arguments: the feed's
+    /// `argv` line carries the kernel's copy, so the canary rule still fires
+    /// on a command line `/proc` can no longer show. A zombie, which still has
+    /// a `/proc/<pid>/stat` but no exe or cmdline, counts as gone.
+    #[test]
+    fn a_child_gone_before_its_exec_is_read_keeps_its_argv() {
+        let (ev, events) = recording();
+        let mon = Monitor::new(ev, Rules::guest("/w", "/home/agent"));
+        mon.shutdown();
+        let root = std::process::id();
+        mon.watch(root, Corr::default());
+        // A pid nobody has, and on Linux (the only feed with bpftrace) a real zombie.
+        let mut child = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let gone = vec![7101];
+        #[cfg(target_os = "linux")]
+        let gone = {
+            let state = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            while !state(child.id()).rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z')) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            vec![7101, child.id()]
+        };
+        let mut feed = Lineage::default();
+        let mut replay = |s: &str| {
+            let Some(s) = feed.take_argv_line(s) else { return };
+            let v: serde_json::Value = serde_json::from_str(s).unwrap();
+            feed.on_event(&mon, v["t"].as_str().unwrap(), v["pid"].as_u64().unwrap() as u32, &v);
+        };
+        for &pid in &gone {
+            replay(&format!(r#"{{"t":"fork","pid":{pid},"ppid":{root}}}"#));
+            replay(&format!(r#"{{"t":"argv","pid":{pid},"a":"cat /home/agent/.aws/credentials"#));
+            replay(&format!(r#"{{"t":"exec","pid":{pid},"f":"/usr/bin/cat"}}"#));
+        }
+        // Another CPU's event printed between an argv line's two halves.
+        replay(&format!(r#"{{"t":"argv","pid":7102,"a":"{{"t":"fork","pid":7103,"ppid":{root}}}"#));
+        replay(r#"{"t":"exec","pid":7103,"f":"/bin/true"}"#);
+        let _ = child.wait();
+
+        let evs = events.lock().unwrap();
+        for &pid in &gone {
+            let start = evs.iter().find(|e| e.r#type == EventType::ProcessStart && e.data["pid"] == pid).unwrap();
+            assert_eq!(start.data["exe"], "/usr/bin/cat", "{pid}: the exec's own filename");
+            assert_eq!(start.data["argv"], json!(["cat", "/home/agent/.aws/credentials"]), "{pid}: the kernel's argv");
+            assert!(
+                evs.iter().any(|e| e.data["rule"] == proto::rules::CANARY_READ && e.data["pid"] == pid),
+                "{pid}: the argv rule fired"
+            );
+        }
+        assert!(
+            evs.iter().any(|e| e.r#type == EventType::ProcessStart && e.data["pid"] == 7103),
+            "the event spliced into an argv line is not lost"
         );
     }
 
