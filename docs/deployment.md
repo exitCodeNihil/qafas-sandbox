@@ -406,7 +406,7 @@ A microVM boundary is only as good as the host under it. On a worker that runs u
 Requirements on Linux:
 
 - `bwrap` (bubblewrap) on `PATH`.
-- Landlock in the kernel, ABI 2 or later. ABI 4 (kernel 6.7+) adds network rules; without it the sandbox gets a private network namespace instead.
+- Landlock in the kernel, ABI 2 or later. The sandbox always gets a private network namespace; ABI 4 (kernel 6.7+) adds a rule that lets commands connect only to the egress proxy port.
 - `qafas` running as the developer's own user, never as root. A root daemon, such as the systemd service in section 4, does not serve `native`: `qafas doctor` shows `native user` FAIL with the reason.
 
 Check the host as the user who will run `qafas`. The `bubblewrap`, `landlock`, `native user` and `bwrap sandbox` lines are the ones `native` needs.
@@ -441,11 +441,14 @@ Verify: `qafas doctor` shows `bwrap sandbox  starts as this user`.
 - `/home`, `/root` and `/run` are replaced by empty tmpfs, so the user's credentials and the podman, Docker and D-Bus sockets are not visible. The user's toolchain directories (for example `~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.pyenv`, `go/pkg/mod`) are bound back read-only.
 - Credential paths (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`) are covered, even inside the workspace.
 - Writes go only to the workspace and the sandbox's scratch directory.
-- Every command runs under Landlock (filesystem, and TCP connect only to the egress proxy port) plus the same seccomp deny-list the `vm` tier uses. Landlock governs TCP only, so seccomp also refuses IPv4 and IPv6 sockets other than TCP (UDP, raw, SCTP, MPTCP), as are TCP Fast Open sends. Landlock restricts TCP by port only, so a sandbox can still open a TCP connection to port 3128 on any address; the upgrade path is `--unshare-net` with a unix-socket relay to the proxy.
+- A network namespace of its own with only `lo`: no address outside the sandbox is reachable. The egress proxy appears inside at the address in `HTTPS_PROXY` (`127.0.0.1:<port>`), relayed through a unix socket in the sandbox's scratch directory to the sandbox's own proxy on the host. `qafas doctor`'s `bwrap sandbox` line checks that bwrap can create the namespace.
+- Every command runs under Landlock (filesystem, and TCP connect only to the egress proxy port) plus the same seccomp deny-list the `vm` tier uses. Landlock governs TCP only, so seccomp also refuses IPv4 and IPv6 sockets other than TCP (UDP, raw, SCTP, MPTCP), as are TCP Fast Open sends.
 - Private pid, uts and ipc namespaces.
 - The sandbox dies with the daemon.
 
-The adversarial escape battery (`make escape TIER=native`, 20 probes) passes on Ubuntu 24.04 arm64: every probe contained and alerted.
+Dev servers: a command may listen on any port, because only the sandbox itself can reach its namespace. The host cannot reach such a server on `localhost:PORT`, and neither can another command in the sandbox (Landlock allows connecting to the proxy port only). Reach it through a preview URL, as on the other tiers: `POST /sandboxes/{id}/preview` with `{"port": PORT}` returns a URL and a token (protocol §3a). On macOS the server listens on the host's loopback and is reachable there as well.
+
+The adversarial escape battery (`make escape TIER=native`, 21 probes) passes on Ubuntu 24.04 arm64: every probe contained and alerted.
 
 ## 6. Tokens and TLS
 
