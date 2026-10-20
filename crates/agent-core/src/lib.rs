@@ -56,6 +56,55 @@ pub fn now_rfc3339() -> String {
     rfc3339_millis(now_ms())
 }
 
+// ------------------------------------------------------------------ randomness
+
+/// Fills `buf` straight from the kernel's CRNG, on every call. No userspace
+/// generator sits in between on purpose: one Firecracker snapshot is restored
+/// into many microVMs, and a PRNG state in the guest agent's memory (what
+/// `ulid::Ulid::new()` keeps per thread) would start every clone at the same
+/// point, so event ids and canary tokens would repeat across sandboxes. The
+/// kernel pool is made to differ per clone by `POST /restored {entropy}`.
+pub fn os_random(buf: &mut [u8]) {
+    // 256 bytes per call: getentropy's limit on macOS, and getrandom(2) never
+    // returns short below that. Far more than anything here asks for.
+    for chunk in buf.chunks_mut(256) {
+        loop {
+            // SAFETY: the pointer and length describe `chunk`, which we own.
+            #[cfg(target_os = "linux")]
+            let rc = unsafe { libc::getrandom(chunk.as_mut_ptr().cast(), chunk.len(), 0) };
+            #[cfg(not(target_os = "linux"))]
+            let rc = match unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } {
+                0 => chunk.len() as isize,
+                _ => -1,
+            };
+            if rc == chunk.len() as isize {
+                break;
+            }
+            if rc >= 0 {
+                continue; // short read: draw the whole chunk again
+            }
+            let e = std::io::Error::last_os_error();
+            // No randomness means no unique ids; carrying on would be the bug this avoids.
+            assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "kernel random source failed: {e}");
+        }
+    }
+}
+
+/// Standard base64 for the guest routes that carry bytes in JSON (`POST
+/// /restored {entropy}`), so guest-agent needs no base64 of its own.
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+/// A ULID whose 80 random bits come from [`os_random`]: the one way this crate
+/// mints ids and tokens that must differ between snapshot clones.
+pub fn new_ulid() -> ulid::Ulid {
+    let mut b = [0u8; 16];
+    os_random(&mut b);
+    ulid::Ulid::from_parts(now_ms() as u64, u128::from_le_bytes(b))
+}
+
 // ------------------------------------------------------------------ kernel cmdline
 
 /// One `sbx.key=value` value, safe to put on a Linux kernel command line: the
@@ -141,7 +190,7 @@ impl Emitter {
 
     pub fn emit(&self, corr: &Corr, ty: EventType, data: Value) {
         (self.sink)(Event {
-            id: ulid::Ulid::new().to_string(),
+            id: new_ulid().to_string(),
             ts: now_rfc3339(),
             host_id: self.host_id.clone(),
             sandbox_id: self.sandbox_id.clone(),
@@ -480,6 +529,45 @@ mod tests {
         // A stray `%` that is not an escape survives verbatim.
         assert_eq!(cmdline_decode("100%"), "100%");
         assert_eq!(cmdline_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn ulids_never_repeat_and_carry_the_time() {
+        let before = now_ms() as u64;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let u = new_ulid();
+            assert!(seen.insert(u.random()), "random part repeated: {u}");
+            assert!(u.timestamp_ms() >= before && u.timestamp_ms() <= now_ms() as u64);
+        }
+    }
+
+    /// A forked child is to this process what a restored snapshot is to the
+    /// guest agent: the same memory, thread-local generator state included. Its
+    /// next id must still differ from the parent's. `ulid::Ulid::new()` fails
+    /// this (rand 0.9's thread RNG is not reseeded on fork).
+    #[test]
+    fn a_forked_copy_draws_its_own_ids() {
+        let _ = new_ulid(); // any per-thread state exists before the fork, as in a snapshot
+        let mut fds = [0; 2];
+        // SAFETY: pipe/fork/write/_exit only; the child touches no allocator or lock.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                let r = new_ulid().random().to_le_bytes();
+                libc::write(fds[1], r.as_ptr().cast(), r.len());
+                libc::_exit(0);
+            }
+            let mine = new_ulid().random();
+            let mut b = [0u8; 16];
+            assert_eq!(libc::read(fds[0], b.as_mut_ptr().cast(), b.len()), 16);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            assert_ne!(mine, u128::from_le_bytes(b), "parent and forked child drew the same id");
+        }
     }
 
     #[test]

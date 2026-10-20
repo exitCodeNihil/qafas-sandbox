@@ -491,7 +491,7 @@ pub async fn restored(
     proxy: &str,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let body = serde_json::json!({"id": id, "ip": ip, "gw": gw, "proxy": proxy, "now": now_ms});
+    let body = restored_body(id, ip, gw, proxy, now_ms);
     // 404 is a guest image without the route: the VM works, minus the three
     // things above, and saying so is better than refusing the restore.
     if guest_call(conn, token, "POST", "/restored", &body).await?.0 == 404 {
@@ -499,6 +499,19 @@ pub async fn restored(
         return Ok(());
     }
     guest_ok(conn, token, "POST", "/restored", &body).await
+}
+
+/// `entropy` is 32 fresh bytes per restore: every clone of one snapshot wakes
+/// with the same kernel CRNG state, and the guest mixes these in and reseeds,
+/// so no two clones draw the same random bytes (ids, canary tokens, anything
+/// the workload asks `getrandom(2)` for). An older guest ignores the field.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn restored_body(id: &str, ip: &str, gw: &str, proxy: &str, now_ms: i64) -> serde_json::Value {
+    use base64::Engine;
+    let mut seed = [0u8; 32];
+    agent_core::os_random(&mut seed);
+    let entropy = base64::engine::general_purpose::STANDARD.encode(seed);
+    serde_json::json!({"id": id, "ip": ip, "gw": gw, "proxy": proxy, "now": now_ms, "entropy": entropy})
 }
 
 async fn probe(conn: &Connector) -> anyhow::Result<()> {
@@ -511,5 +524,20 @@ async fn probe(conn: &Connector) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("healthz returned {:?}", String::from_utf8_lossy(&buf[..buf.len().min(40)]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Each restore carries its own 32 bytes; two restores of one snapshot
+    /// must never hand the guest the same seed.
+    #[test]
+    fn every_restore_body_has_its_own_entropy() {
+        let a = super::restored_body("sbx_1", "172.16.3.2/30", "172.16.3.1", "http://172.16.3.1:3128", 1);
+        let b = super::restored_body("sbx_1", "172.16.3.2/30", "172.16.3.1", "http://172.16.3.1:3128", 1);
+        let seed = |v: &serde_json::Value| agent_core::b64_decode(v["entropy"].as_str().unwrap()).unwrap();
+        assert_eq!(seed(&a).len(), 32);
+        assert_ne!(seed(&a), seed(&b));
+        assert_eq!((a["id"].as_str(), a["now"].as_i64()), (Some("sbx_1"), Some(1)));
     }
 }
