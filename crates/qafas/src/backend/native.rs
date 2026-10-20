@@ -249,6 +249,11 @@ impl Native {
         for (k, v) in extra.iter().filter(|(k, _)| agent_core::spawn::env_allowed(k)) {
             env.insert(k.clone(), v.clone());
         }
+        // Linux: the one port Landlock lets a command connect to. After the
+        // caller's env, so a caller cannot move it.
+        if cfg!(target_os = "linux") {
+            env.insert("SBX_PROXY_PORT".into(), proxy_port.to_string());
+        }
         Ok((profile_path, env))
     }
 
@@ -774,8 +779,9 @@ pub mod linux {
     /// Filesystem and network rules mirroring the Seatbelt profile, applied to
     /// each command between fork and exec, so everything it spawns inherits
     /// them; `Hardened` adds the seccomp deny-list the VM tier installs right
-    /// after (D8/D18).
-    pub fn confine(workspace: &str, scratch: &Path) -> Option<agent_core::spawn::Confine> {
+    /// after (D8/D18). `proxy_port` is the sandbox's own egress proxy, the one
+    /// TCP port a command may connect to (`None`: none at all).
+    pub fn confine(workspace: &str, scratch: &Path, proxy_port: Option<u16>) -> Option<agent_core::spawn::Confine> {
         use landlock::{
             Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
             RulesetStatus, ABI,
@@ -809,12 +815,11 @@ pub mod linux {
                     created = created.add_rule(PathBeneath::new(fd, access)).map_err(|e| err(e.to_string()))?;
                 }
             }
-            if net {
+            if let (true, Some(port)) = (net, proxy_port) {
                 // One reachable port. Binding is not granted at all, so nothing
                 // inside can listen.
-                created = created
-                    .add_rule(NetPort::new(proto::EGRESS_PROXY_PORT, AccessNet::ConnectTcp))
-                    .map_err(|e| err(e.to_string()))?;
+                created =
+                    created.add_rule(NetPort::new(port, AccessNet::ConnectTcp)).map_err(|e| err(e.to_string()))?;
             }
             let status = created.restrict_self().map_err(|e| err(e.to_string()))?;
             if status.ruleset == RulesetStatus::NotEnforced {
@@ -855,7 +860,7 @@ pub mod linux {
     pub fn abi() -> i32 {
         -1
     }
-    pub fn confine(_workspace: &str, _scratch: &Path) -> Option<agent_core::spawn::Confine> {
+    pub fn confine(_workspace: &str, _scratch: &Path, _proxy_port: Option<u16>) -> Option<agent_core::spawn::Confine> {
         None
     }
     pub fn bwrap_probe(_bwrap: &str) -> (bool, String) {
@@ -1022,6 +1027,42 @@ mod linux_tests {
             libc::WEXITSTATUS(status),
             0,
             "failed check (1-5 denied, 10-12 allowed, 20 fastopen, 21 send, 100 apply)"
+        );
+    }
+
+    /// The per-command Landlock rules, in a forked child (they cannot be
+    /// lifted from the test process): the sandbox's own proxy port is the one
+    /// TCP port a command reaches.
+    #[test]
+    fn commands_connect_only_to_their_own_proxy_port() {
+        if !super::linux::landlock_net_available() {
+            eprintln!("skipped: Landlock ABI {} has no network rules", super::linux::abi());
+            return;
+        }
+        let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
+        let (proxy, other) =
+            (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let (pp, op) = (port(&proxy), port(&other));
+        let confine = super::linux::confine("/nonexistent", std::path::Path::new("/nonexistent"), Some(pp)).unwrap();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let code = (|| {
+                confine().map_err(|_| 100)?;
+                std::net::TcpStream::connect(("127.0.0.1", pp)).map_err(|_| 1)?;
+                match std::net::TcpStream::connect(("127.0.0.1", op)) {
+                    Err(e) if e.raw_os_error() == Some(libc::EACCES) => Ok(()),
+                    _ => Err(2),
+                }
+            })();
+            unsafe { libc::_exit(code.err().unwrap_or(0)) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child did not exit: {status:#x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "failed check (1 proxy port refused, 2 other port reached, 100 confine)"
         );
     }
 }

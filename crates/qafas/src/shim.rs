@@ -35,8 +35,10 @@ pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
     let workspace = env("SBX_WORKSPACE", &home);
     let rules = Rules::guest(&workspace, &home);
     let scratch = socket.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let spawner =
-        Hardened { confine: crate::backend::native::linux::confine(&workspace, &scratch), ..Default::default() };
+    // Linux: this sandbox's egress proxy port, set by the daemon (unset on macOS).
+    let proxy_port = std::env::var("SBX_PROXY_PORT").ok().and_then(|p| p.parse::<u16>().ok());
+    let confine = crate::backend::native::linux::confine(&workspace, &scratch, proxy_port);
+    let spawner = Hardened { confine, ..Default::default() };
     let ctx = Ctx::new(spawner, serve::emitter(&bus, &env("SBX_HOST_ID", ""), &id), rules);
 
     // Every exec's process group goes on disk before it runs, so a daemon that
