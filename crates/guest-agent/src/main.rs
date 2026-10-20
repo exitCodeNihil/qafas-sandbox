@@ -275,6 +275,11 @@ fn run() -> anyhow::Result<()> {
     // runtime has already done all of it.
     if std::process::id() == 1 && nix::unistd::geteuid().is_root() {
         init::boot();
+    } else {
+        // The container path carries `SBX_AGENT_TOKEN`: re-exec once so it is not
+        // in the initial environment block `/proc/1/environ` shows (gVisor
+        // gives `scrub_initial_env` nothing to overwrite). Before any thread.
+        agent_core::stash_token();
     }
 
     // Build the seccomp programs once, in the parent, so `pre_exec` only has to
