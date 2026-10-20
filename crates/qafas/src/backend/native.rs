@@ -282,9 +282,10 @@ impl Native {
         for (k, v) in extra.iter().filter(|(k, _)| agent_core::spawn::env_allowed(k)) {
             env.insert(k.clone(), v.clone());
         }
-        // Linux: the one port Landlock lets a command connect to, and the
-        // daemon's network namespace, which the shim compares with its own
-        // (M46). After the caller's env, so a caller cannot set either.
+        // Linux: the proxy port the shim relays (and, if it shares the host's
+        // network namespace, the one port Landlock lets a command connect to),
+        // and the daemon's network namespace, which the shim compares with its
+        // own (M46). After the caller's env, so a caller cannot set either.
         if cfg!(target_os = "linux") {
             env.insert("SBX_PROXY_PORT".into(), proxy_port.to_string());
             env.insert("SBX_HOST_NETNS".into(), linux::netns_id().unwrap_or(0).to_string());
@@ -817,9 +818,10 @@ pub mod linux {
     /// Filesystem and network rules mirroring the Seatbelt profile, applied to
     /// each command between fork and exec, so everything it spawns inherits
     /// them; `Hardened` adds the seccomp deny-list the VM tier installs right
-    /// after (D8/D18). `proxy_port` is the sandbox's own egress proxy, the one
-    /// TCP port a command may connect to (`None`: none at all). `private_netns`
-    /// says the shim runs in its own network namespace (`--unshare-net`, M46).
+    /// after (D8/D18). `private_netns` says the shim runs in its own network
+    /// namespace (`--unshare-net`, M46); otherwise `proxy_port`, the sandbox's
+    /// own egress proxy, is the one TCP port a command may connect to (`None`:
+    /// none at all).
     pub fn confine(
         workspace: &str,
         scratch: &Path,
@@ -827,11 +829,18 @@ pub mod linux {
         private_netns: bool,
     ) -> Option<agent_core::spawn::Confine> {
         use landlock::{
-            Access, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
-            RulesetCreatedAttr, RulesetStatus, ABI,
+            Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+            RulesetStatus, ABI,
         };
         let (ws, sc) = (workspace.to_string(), scratch.display().to_string());
         let net = landlock_net_available();
+        // In a namespace of our own only `lo` exists: a command reaches its own
+        // listeners (a server and its client, tests, a browser on a dev server)
+        // and the shim's relay, nothing else, and the abstract unix namespace is
+        // per-netns too. A port rule there buys nothing, so there is none.
+        // Sharing the host's (SBX_NATIVE_PERMISSIVE, no bwrap): connect to the
+        // proxy port only, and no bind, so nothing inside can listen.
+        let net_rules = net && !private_netns;
         // Built once here, not per command; a build failure fails every command
         // rather than silently leaving UDP open.
         let socks = socket_filter().map_err(|e| e.to_string());
@@ -841,16 +850,8 @@ pub mod linux {
             // downgrades the rest on an older kernel rather than failing.
             let abi = if net { ABI::V4 } else { ABI::V2 };
             let mut rs = Ruleset::default().handle_access(AccessFs::from_all(abi)).map_err(|e| err(e.to_string()))?;
-            if net {
-                // Binding is only safe in a namespace of our own, where nothing
-                // but this sandbox and its shim (previews) can reach a listener.
-                // Sharing the host's (SBX_NATIVE_PERMISSIVE, no bwrap), bind
-                // stays handled with no rule: nothing inside can listen.
-                let access: BitFlags<AccessNet> = match private_netns {
-                    true => AccessNet::ConnectTcp.into(),
-                    false => AccessNet::from_all(abi),
-                };
-                rs = rs.handle_access(access).map_err(|e| err(e.to_string()))?;
+            if net_rules {
+                rs = rs.handle_access(AccessNet::from_all(abi)).map_err(|e| err(e.to_string()))?;
             }
             let mut created = rs.create().map_err(|e| err(e.to_string()))?;
             // Read the world, write only the sandbox's own two directories and
@@ -867,9 +868,7 @@ pub mod linux {
                     created = created.add_rule(PathBeneath::new(fd, access)).map_err(|e| err(e.to_string()))?;
                 }
             }
-            if let (true, Some(port)) = (net, proxy_port) {
-                // One reachable port: the shim's relay in a namespace of our
-                // own, the proxy itself in the host's.
+            if let (true, Some(port)) = (net_rules, proxy_port) {
                 created =
                     created.add_rule(NetPort::new(port, AccessNet::ConnectTcp)).map_err(|e| err(e.to_string()))?;
             }
@@ -1091,11 +1090,12 @@ mod linux_tests {
     }
 
     /// The per-command Landlock rules, in a forked child (they cannot be
-    /// lifted from the test process): the sandbox's own proxy port is the one
-    /// TCP port a command reaches, and it may listen only when the shim has a
-    /// network namespace of its own (M46); sharing the host's, bind is denied.
+    /// lifted from the test process). With a network namespace of its own
+    /// (M46) a command binds and connects on its own loopback freely: a server
+    /// and its client in one sandbox. Sharing the host's, the sandbox's proxy
+    /// port is the one TCP port it reaches, and it cannot listen.
     #[test]
-    fn commands_reach_only_the_proxy_port_and_listen_only_in_their_own_netns() {
+    fn a_private_netns_sandbox_uses_its_own_loopback_and_a_shared_one_only_the_proxy() {
         if !super::linux::landlock_net_available() {
             eprintln!("skipped: Landlock ABI {} has no network rules", super::linux::abi());
             return;
@@ -1104,6 +1104,7 @@ mod linux_tests {
         let (proxy, other) =
             (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
         let (pp, op) = (port(&proxy), port(&other));
+        let refused = |r: std::io::Result<()>| matches!(r, Err(e) if e.raw_os_error() == Some(libc::EACCES));
         for private in [false, true] {
             let nowhere = std::path::Path::new("/nonexistent");
             let confine = super::linux::confine("/nonexistent", nowhere, Some(pp), private).unwrap();
@@ -1112,15 +1113,18 @@ mod linux_tests {
                 let code = (|| {
                     confine().map_err(|_| 100)?;
                     std::net::TcpStream::connect(("127.0.0.1", pp)).map_err(|_| 1)?;
-                    match std::net::TcpStream::connect(("127.0.0.1", op)) {
-                        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {}
-                        _ => return Err(2),
+                    let other = std::net::TcpStream::connect(("127.0.0.1", op)).map(drop);
+                    let own = std::net::TcpListener::bind("127.0.0.1:0");
+                    if !private {
+                        return match (refused(other), refused(own.map(drop))) {
+                            (false, _) => Err(2),
+                            (_, false) => Err(3),
+                            _ => Ok(()),
+                        };
                     }
-                    match (private, std::net::TcpListener::bind("127.0.0.1:0")) {
-                        (true, Ok(_)) => Ok(()),
-                        (false, Err(e)) if e.raw_os_error() == Some(libc::EACCES) => Ok(()),
-                        _ => Err(3),
-                    }
+                    let own = own.map_err(|_| 4)?;
+                    std::net::TcpStream::connect(own.local_addr().map_err(|_| 4)?).map_err(|_| 5)?;
+                    other.map_err(|_| 6)
                 })();
                 unsafe { libc::_exit(code.err().unwrap_or(0)) };
             }
@@ -1130,7 +1134,8 @@ mod linux_tests {
             assert_eq!(
                 libc::WEXITSTATUS(status),
                 0,
-                "private netns {private}: failed check (1 proxy port refused, 2 other port reached, 3 bind, 100 confine)"
+                "private netns {private}: failed check (1 proxy port refused; shared: 2 other port reached, \
+                 3 bind allowed; private: 4 bind refused, 5 own listener refused, 6 other port refused; 100 confine)"
             );
         }
     }
