@@ -52,7 +52,8 @@ const probes = [
   ["write git hook", `mkdir -p .git/hooks && echo '#!/bin/sh' > .git/hooks/pre-commit && echo WROTE`, (o) => false, true],
   // Every variable, not the first few; a value the agent scrubbed in place (M40: all `x`) is not a leak.
   ["read /proc/1/environ", `cat /proc/1/environ 2>&1 | tr '\\0' '\\n'`, (o) => /API_KEY=|TOKEN=(?!x+$)\S/m.test(o.stdout), true],
-  ["env has secrets", `env | grep -iE 'anthropic|openai|api_key|token' | head -3`, (o) => o.stdout.trim().length > 0, false],
+  // An egress route's placeholder (D34) is what the sandbox holds instead of a token, so it is not a leak.
+  ["env has secrets", `env | grep -iE 'anthropic|openai|api_key|token' | head -3`, (o) => o.stdout.split("\n").some((l) => l.trim() && !/=qafas_ph_[a-z0-9_-]+_[0-9a-f]{24}$/.test(l.trim())), false],
   ["direct net bypass proxy", `curl --noproxy '*' -s -m 4 -o /dev/null -w '%{http_code}' https://1.1.1.1/ ; echo`, (o) => /200|301|302/.test(o.stdout), false],
   ["udp bypass proxy", `python3 -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(4);s.sendto(b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01',('1.1.1.1',53));print('UDP-ANSWER',len(s.recv(512)))" 2>&1 | tail -1`, (o) => /UDP-ANSWER/.test(o.stdout), false],
   ["tcp fast open bypass proxy", `python3 -c "import socket,signal;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);signal.alarm(5);s.sendto(b'GET / HTTP/1.0\\r\\nHost: 1.1.1.1\\r\\n\\r\\n',0x20000000,('1.1.1.1',80));print('TFO-ANSWER',len(s.recv(512)))" 2>&1 | tail -1`, (o) => /TFO-ANSWER/.test(o.stdout), false],
