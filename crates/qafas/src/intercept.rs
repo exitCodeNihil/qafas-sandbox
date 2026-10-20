@@ -47,7 +47,7 @@ use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wildmatch::WildMatch;
 
@@ -930,6 +930,7 @@ pub async fn serve(
     host: String,
     port: u16,
     ips: Vec<IpAddr>,
+    early: Vec<u8>,
 ) -> anyhow::Result<()> {
     let route = match claim {
         Claim::Tunnel(i) => i,
@@ -941,7 +942,7 @@ pub async fn serve(
         }
     };
     let addrs = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
-    tunnel(sock, peer, ctx, ic, route, host, port, addrs).await
+    tunnel(sock, early, peer, ctx, ic, route, host, port, addrs).await
 }
 
 /// 200, TLS as `host`, then one HTTP/1.1 conversation. `addrs` are the
@@ -950,6 +951,7 @@ pub async fn serve(
 #[allow(clippy::too_many_arguments)]
 pub async fn tunnel(
     mut sock: TcpStream,
+    early: Vec<u8>,
     peer: SocketAddr,
     ctx: Arc<ProxyCtx>,
     ic: Arc<Intercept>,
@@ -960,7 +962,12 @@ pub async fn tunnel(
 ) -> anyhow::Result<()> {
     let host = host_norm(&host);
     sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
-    let tls = match tokio_rustls::TlsAcceptor::from(ic.server_config(&host)?).accept(sock).await {
+    // A client may send its ClientHello right behind the CONNECT, without
+    // waiting for the 200: what the proxy read past the head is the start of
+    // the TLS stream.
+    let (rd, wr) = sock.into_split();
+    let io = tokio::io::join(std::io::Cursor::new(early).chain(rd), wr);
+    let tls = match tokio_rustls::TlsAcceptor::from(ic.server_config(&host)?).accept(io).await {
         Ok(t) => t,
         Err(e) => {
             let name = ic.routes[route].name.clone();
@@ -1623,7 +1630,7 @@ mod tests {
                 let (s, peer) = l.accept().await.unwrap();
                 let (ctx, ic) = (ctx.clone(), ic2.clone());
                 tokio::spawn(async move {
-                    let _ = tunnel(s, peer, ctx, ic, 0, HOST.into(), 443, vec![up]).await;
+                    let _ = tunnel(s, Vec::new(), peer, ctx, ic, 0, HOST.into(), 443, vec![up]).await;
                 });
             }
         });
@@ -2193,6 +2200,44 @@ mod tests {
         let r = through(ctx.clone(), &format!("GET http://{IP_HOST}/x HTTP/1.1\r\nHost: {IP_HOST}\r\n\r\n")).await;
         assert!(r.starts_with("HTTP/1.1 403"), "{r}");
         assert_eq!(reason(&seen).await, "plain http to a route host");
+    }
+
+    /// A client that sends its ClientHello in the same write as the CONNECT,
+    /// before it has the 200, still gets its handshake: the bytes the proxy
+    /// read past the head are the start of the TLS stream.
+    #[tokio::test]
+    async fn a_client_hello_sent_with_the_connect_is_not_lost() {
+        let (ctx, _) = hook_ctx("early", Some(Trust::Trusted), &[IP_HOST]);
+        let ca = ctx.intercept.as_ref().unwrap().ca_pem().to_string();
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(crate::proxy::serve(l, ctx));
+        let shook = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::{Read, Write};
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add_parsable_certificates(CertificateDer::pem_slice_iter(ca.as_bytes()).filter_map(Result::ok));
+            let cfg = rustls::ClientConfig::builder_with_provider(provider())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let name = ServerName::try_from(IP_HOST.to_string()).unwrap();
+            let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name).unwrap();
+            let mut first = format!("CONNECT {IP_HOST}:443 HTTP/1.1\r\n\r\n").into_bytes();
+            conn.write_tls(&mut first)?;
+            let mut s = std::net::TcpStream::connect(addr)?;
+            s.set_read_timeout(Some(Duration::from_secs(3)))?;
+            s.write_all(&first)?;
+            let mut head = [0u8; 39];
+            s.read_exact(&mut head)?;
+            assert!(head.starts_with(b"HTTP/1.1 200"));
+            while conn.is_handshaking() {
+                conn.complete_io(&mut s)?;
+            }
+            Ok(())
+        });
+        let r = shook.await.unwrap();
+        assert!(r.is_ok(), "the handshake did not finish: {r:?}");
     }
 
     /// For a sandbox the route does not apply to, the route host is just a

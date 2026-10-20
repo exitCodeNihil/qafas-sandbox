@@ -466,7 +466,7 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &Arc<ProxyCtx>) -> a
     // interceptor's whatever the lists say; for anyone else it is not there.
     if let Some(ic) = ctx.intercept.clone() {
         if let Some(claim) = ic.claim(ctx, peer.ip(), method == "CONNECT", &host, port, &ips).await {
-            return crate::intercept::serve(sock, peer, ctx.clone(), ic, claim, host, port, ips).await;
+            return crate::intercept::serve(sock, peer, ctx.clone(), ic, claim, host, port, ips, leftover).await;
         }
     }
 
