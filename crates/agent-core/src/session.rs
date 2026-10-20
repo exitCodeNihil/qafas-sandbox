@@ -617,6 +617,14 @@ mod tests {
     use crate::Emitter;
 
     fn ctx() -> Arc<Ctx> {
+        // The session shell is a login shell, and `Hardened` runs it as uid 1000
+        // even when the tests run as root. It reads `$HOME/.bash_profile` as that
+        // uid: the runner's HOME is `/root` (mode 0700) in a container, and bash
+        // then puts "Permission denied" on stderr, which the stderr assertions
+        // below take for the command's own. A guest's HOME is `/home/agent`, so
+        // give the tests a home every uid can read, once, before anything spawns.
+        static HOME: std::sync::Once = std::sync::Once::new();
+        HOME.call_once(|| std::env::set_var("HOME", std::env::temp_dir()));
         Ctx::new(Hardened::default(), Emitter::null(), Rules::guest("/tmp", "/tmp/nohome"))
     }
 

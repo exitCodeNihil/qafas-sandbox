@@ -1090,6 +1090,11 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let ws = std::env::temp_dir().join(format!("sbx-docker-ws-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
+        // Run as root, the temp dir is root's and the sandbox rightly refuses to be
+        // root (checked below): give the workspace the owner a user's would have.
+        if std::fs::metadata(&ws).unwrap().uid() == 0 {
+            std::os::unix::fs::chown(&ws, Some(4242), Some(4243)).unwrap();
+        }
         let w = ws.to_str().unwrap().to_string();
         let s = docker().spec(&Spec { workspace_path: w.clone(), ..spec_for() }, 41000, "s3cret");
         let hc = &s["HostConfig"];
@@ -1108,6 +1113,9 @@ mod tests {
         assert_eq!(s["User"], format!("{}:{}", m.uid(), m.gid()));
         assert!(s["Env"].as_array().unwrap().iter().any(|e| e == "SBX_AGENT_TOKEN=s3cret"));
 
+        // `/` is root's on every host this runs on, whoever runs it: never a root sandbox.
+        let rooted = docker().spec(&Spec { workspace_path: "/".into(), ..spec_for() }, 41000, "t");
+        assert_eq!(rooted["User"], "1000:1000");
         let bare = docker().spec(&Spec { workspace_path: "/home/agent".into(), ..spec_for() }, 41000, "t");
         assert_eq!(bare["User"], "1000:1000");
         assert_eq!(bare["HostConfig"]["Mounts"], json!([]));
