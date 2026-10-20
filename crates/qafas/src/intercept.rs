@@ -476,8 +476,10 @@ fn hexval(b: u8) -> Option<u8> {
 /// way the server decodes it. Refused: a backslash; an escape of a character
 /// that needs none (`%2e` is a disguised `.`); a NUL; and — after decoding
 /// every escape, so `%2F..%2F` counts — a `.` or `..` segment (also as `..;`,
-/// Tomcat's path parameter) or an empty one (`//`). What is matched is the path
-/// as sent, so an encoded slash stays one segment to the globs.
+/// Tomcat's path parameter) or an empty one (`//`). Also refused: `%25` and two
+/// hex digits (`%252e` is `%2e` to a server that decodes twice), and escapes
+/// that do not decode to valid UTF-8 (`%c0%ae`, an overlong `.`). What is
+/// matched is the path as sent, so an encoded slash stays one segment to the globs.
 fn canonical(path: &str) -> bool {
     let b = path.as_bytes();
     if !path.starts_with('/') || path.contains('\\') {
@@ -492,7 +494,9 @@ fn canonical(path: &str) -> bool {
                 return false;
             };
             let c = h * 16 + l;
-            if unreserved(c) || c == b'\\' || c == 0 {
+            let hex_at = |j: usize| b.get(j).and_then(|c| hexval(*c)).is_some();
+            let twice = c == b'%' && hex_at(i + 3) && hex_at(i + 4);
+            if unreserved(c) || c == b'\\' || c == 0 || twice {
                 return false;
             }
             decoded.push(c);
@@ -501,6 +505,9 @@ fn canonical(path: &str) -> bool {
             decoded.push(b[i]);
             i += 1;
         }
+    }
+    if std::str::from_utf8(&decoded).is_err() {
+        return false;
     }
     let segs: Vec<&[u8]> = decoded[1..].split(|c| *c == b'/').collect();
     segs.iter().enumerate().all(|(n, s)| {
@@ -1841,6 +1848,8 @@ mod tests {
             ("GET", "/org/%5c..%5cother"),
             ("GET", "/%6Frg/repo"),
             ("GET", "/org/%zz"),
+            ("GET", "/org/%252e%252e/other"),
+            ("GET", "/org/%c0%ae%c0%ae/other"),
         ];
         for (m, p) in refused {
             assert_eq!(call(&mut c, req(m, p)).await.0, StatusCode::FORBIDDEN, "{m} {p}");
@@ -1883,13 +1892,29 @@ mod tests {
 
     #[test]
     fn canonical_paths() {
-        let ok =
-            ["/", "/org/", "/org/repo", "/a/b.c/d", "/projects/group%2Fproject", "/x%20y", "/.well-known/x", "/a/..b"];
+        let ok = [
+            "/",
+            "/org/",
+            "/org/repo",
+            "/a/b.c/d",
+            "/projects/group%2Fproject",
+            "/x%20y",
+            "/.well-known/x",
+            "/a/..b",
+            "/price/%E2%82%AC",
+            "/100%25",
+            "/100%25x",
+        ];
         for p in ok {
             assert!(canonical(p), "{p}");
         }
         for p in ["", "org", "/a/../b", "/a/./b", "/a/..", "/a//b", "/%2e", "/a\\b", "/a%5Cb", "/a%00", "/a%2", "/..;x"]
         {
+            assert!(!canonical(p), "{p}");
+        }
+        // Decoded twice, `%252e%252e` is `..`; `%c0%ae` is an overlong `.`; a
+        // lone continuation byte or a cut sequence decodes to nothing valid.
+        for p in ["/org/%252e%252e/x", "/org/%252F", "/a%25%32%65", "/org/%c0%ae%c0%ae/x", "/a%80", "/a%E2%82"] {
             assert!(!canonical(p), "{p}");
         }
     }
