@@ -228,14 +228,37 @@ fn read_secret(reference: &str) -> Result<Secret, String> {
     Ok(Secret(v.to_string()))
 }
 
+/// Two hosts, one from each route, that one connection could match, when the
+/// routes also share a port and a trust. The first route binding a host wins,
+/// so the later one's rules and secret would silently never apply. Each glob
+/// is tested as a string against the other, both ways.
+fn overlap(a: &EgressRoute, b: &EgressRoute) -> Option<(String, String)> {
+    if !a.ports.iter().any(|p| b.ports.contains(p)) || !a.trust.iter().any(|t| b.trust.contains(t)) {
+        return None;
+    }
+    a.hosts.iter().map(|h| host_norm(h)).find_map(|x| {
+        b.hosts
+            .iter()
+            .map(|h| host_norm(h))
+            .find(|y| WildMatch::new(&x).matches(y) || WildMatch::new(y).matches(&x))
+            .map(|y| (x.clone(), y))
+    })
+}
+
 /// Checks every route and reads every secret. The first problem is an error
 /// that names the route and, for a secret, its reference: never its value.
 pub fn resolve_routes(p: &EgressPolicy) -> anyhow::Result<Vec<RouteDef>> {
     let (mut names, mut envs) = (HashSet::new(), HashMap::new());
     let mut out = Vec::new();
-    for r in &p.routes {
+    for (n, r) in p.routes.iter().enumerate() {
         let fail = |why: String| anyhow::anyhow!("egress route {:?}: {why}", r.name);
         validate(r, &mut names, &mut envs).map_err(fail)?;
+        if let Some((e, (x, y))) = p.routes[..n].iter().find_map(|e| overlap(e, r).map(|o| (e, o))) {
+            return Err(fail(format!(
+                "host {y:?} overlaps route {:?}'s host {x:?} on a port and a trust both list; make the hosts disjoint",
+                e.name
+            )));
+        }
         let secret = r.secret.as_deref().map(read_secret).transpose().map_err(fail)?;
         out.push(RouteDef { spec: EgressRoute { secret: None, ..r.clone() }, secret });
     }
@@ -2060,6 +2083,40 @@ mod tests {
         assert!(defs[0].spec.secret.is_none(), "the reference is not kept");
         assert!(resolve_routes(&policy(json!([r(json!({"secret": "env://PATH"}))]))).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two routes one connection could match, on a port and a trust both list,
+    /// are refused, naming both: the first would win and the other's rules
+    /// would never apply. Disjoint hosts, ports or trust still load.
+    #[test]
+    fn overlapping_routes_are_refused_and_named() {
+        let r = |name: &str, hosts: serde_json::Value, extra: serde_json::Value| {
+            let mut v = json!({"name": name, "hosts": hosts, "rules": [{"paths": ["/acme/*"]}]});
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            v
+        };
+        let none = json!({});
+        for (a, b) in [
+            (json!(["*.example.com"]), json!(["api.example.com"])),
+            (json!(["api.example.com"]), json!(["*.example.com"])),
+            (json!(["api.example.com"]), json!(["API.example.com."])),
+            (json!(["x.test", "*.b.example.com"]), json!(["*.a.b.example.com"])),
+        ] {
+            let p = policy(json!([r("broad", a.clone(), none.clone()), r("strict", b.clone(), none.clone())]));
+            let e = format!("{:#}", resolve_routes(&p).err().unwrap_or_else(|| panic!("accepted {a} then {b}")));
+            assert!(e.contains("\"strict\"") && e.contains("\"broad\"") && e.contains("overlaps"), "{e}");
+        }
+        for (a, b, extra) in [
+            (json!(["*.example.com"]), json!(["example.com"]), none.clone()),
+            (json!(["api.example.com"]), json!(["www.example.com"]), none.clone()),
+            (json!(["*.example.com"]), json!(["api.example.com"]), json!({"ports": [8443]})),
+            (json!(["api.example.com"]), json!(["api.example.com"]), json!({"trust": ["untrusted"]})),
+        ] {
+            let p = policy(json!([r("one", a.clone(), none.clone()), r("two", b.clone(), extra.clone())]));
+            assert!(resolve_routes(&p).is_ok(), "{a} {b} {extra}: {:#}", resolve_routes(&p).err().unwrap());
+        }
     }
 
     #[test]
