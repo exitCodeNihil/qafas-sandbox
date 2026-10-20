@@ -1810,10 +1810,58 @@ mod tests {
 
     // ---------------------------------------------------------------- TLS
 
+    #[derive(Debug)]
+    struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AnyCert {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            m: &[u8],
+            c: &CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
     #[tokio::test]
     async fn an_sni_for_another_host_is_refused() {
         let h = harness("sni", vec![def(github(), SECRET)]).await;
-        assert!(open(&h, "evil.example.test").await.is_err());
+        // A client that would take any certificate at all: what refuses the
+        // handshake can only be the proxy.
+        let mut s = TcpStream::connect(h.proxy).await.unwrap();
+        let mut head = [0u8; 39];
+        s.read_exact(&mut head).await.unwrap();
+        let p = provider();
+        let cfg = rustls::ClientConfig::builder_with_provider(p.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCert(p)))
+            .with_no_client_auth();
+        let name = ServerName::try_from("evil.example.test".to_string()).unwrap();
+        assert!(tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.is_err());
         let evs = events(&h, 1).await;
         assert!(evs[0].1["reason"].as_str().unwrap().starts_with("tls handshake failed"), "{evs:?}");
         assert!(open(&h, "API.EXAMPLE.TEST").await.is_ok(), "names compare without case");
