@@ -37,6 +37,8 @@ services:
       SBX_CA_FILE: ${SBX_CA_FILE:-}
       # The OCI runtime the sandboxes run under, for example runsc (gVisor); empty = the engine's default.
       SBX_VM_RUNTIME: ${SBX_VM_RUNTIME:-}
+      # Extra CA certificates (a file mounted into the container) the egress proxy trusts upstream, for route hosts on an internal CA.
+      SBX_EGRESS_CA_FILE: ${SBX_EGRESS_CA_FILE:-}
     volumes:
       # The host's container runtime runs the sandboxes: Docker's socket by default.
       - ${CONTAINER_SOCK:-/var/run/docker.sock}:/run/qafas/runtime.sock
