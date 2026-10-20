@@ -1453,12 +1453,14 @@ async fn preview_proxy(State(st): State<AppState>, req: Request) -> Response {
         Err(r) => return r,
     };
     st.touch(&id).await;
-    // A native sandbox's server listens on the host's loopback and its shim is not
-    // allowed to dial loopback (policy/seatbelt.sb.tmpl), so qafas, which is
-    // outside the sandbox, connects to the port itself.
+    // A macOS native sandbox's server listens on the host's loopback and its shim
+    // is not allowed to dial loopback (policy/seatbelt.sb.tmpl), so qafas, which
+    // is outside the sandbox, connects to the port itself. On Linux the server
+    // listens in the sandbox's own network namespace (M46), where only the shim's
+    // `/proxy/{port}` reaches it, as on the other tiers.
     // The direct hop is to the dev server, not to the guest, so it carries no
     // agent token — and `strip_client_auth` below would drop it anyway.
-    let (conn, token, agent_path) = if matches!(conn, Connector::Unix(_)) {
+    let (conn, token, agent_path) = if cfg!(target_os = "macos") && matches!(conn, Connector::Unix(_)) {
         (Connector::Tcp(std::net::SocketAddr::from(([127, 0, 0, 1], port))), None, rest.to_string())
     } else {
         (conn, token, format!("proxy/{port}/{rest}"))
