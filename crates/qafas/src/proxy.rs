@@ -421,7 +421,7 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow
         }
     };
 
-    let mut up = TcpStream::connect(&ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect::<Vec<_>>()[..]).await?;
+    let Some(mut up) = upstream(&mut sock, peer, ctx, &host, port, &ips).await else { return Ok(()) };
     let _ = up.set_nodelay(true);
 
     if method == "CONNECT" {
@@ -450,6 +450,28 @@ async fn verdict(ctx: &ProxyCtx, peer: IpAddr, host: &str, ips: &[IpAddr]) -> Re
         },
         v => v,
     }
+}
+
+/// The upstream socket, or `None` once the client has its 502 and the stream
+/// its `egress.deny`: an approved name whose addresses do not answer is still
+/// a connection that did not happen, and the operator should see it.
+async fn upstream(
+    sock: &mut TcpStream,
+    peer: SocketAddr,
+    ctx: &ProxyCtx,
+    host: &str,
+    port: u16,
+    ips: &[IpAddr],
+) -> Option<TcpStream> {
+    let e = match TcpStream::connect(&ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect::<Vec<_>>()[..]).await {
+        Ok(up) => return Some(up),
+        Err(e) => e,
+    };
+    tracing::info!(host, port, error = %e, "upstream connect failed");
+    let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+    let data = json!({"host": host, "port": port, "bytes": 0, "reason": "upstream connect failed"});
+    emit(ctx, peer, EventType::EgressDeny, data).await;
+    None
 }
 
 /// Events carry the peer address; qafas turns it into a `sandbox_id`, since
@@ -657,6 +679,36 @@ mod tests {
         let reason = |peer: &str| got.iter().find(|d| d["peer"] == peer).map(|d| d["reason"].clone());
         assert_eq!(reason("127.0.0.2"), Some(json!("address 203.0.113.7 in deny_cidrs_extra")), "{got:?}");
         assert_eq!(reason("127.0.0.3"), Some(json!(NOT_LISTED)), "{got:?}");
+    }
+
+    /// An approved name whose address does not answer is a connection that did
+    /// not happen: the client gets a 502 and the stream an `egress.deny`.
+    #[tokio::test]
+    async fn a_failed_upstream_connect_is_a_deny_with_its_reason() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let got: Arc<std::sync::Mutex<Vec<(EventType, serde_json::Value)>>> = Default::default();
+        let mut ctx = ProxyCtx::new(policy(), "h".into(), "t".into());
+        let g = got.clone();
+        ctx.emit = Some(Arc::new(move |ty, data| g.lock().unwrap().push((ty, data))));
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (mut sock, peer) = l.accept().await.unwrap();
+        let ips = ["127.0.0.1".parse().unwrap()];
+        assert!(upstream(&mut sock, peer, &ctx, "mirror.example", closed, &ips).await.is_none());
+
+        let got = got.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, EventType::EgressDeny);
+        assert_eq!(got[0].1["reason"], "upstream connect failed");
+        assert_eq!(
+            (got[0].1["host"].as_str(), got[0].1["port"].as_u64()),
+            (Some("mirror.example"), Some(closed.into()))
+        );
+        drop(sock);
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 502"), "{reply:?}");
     }
 
     #[test]
