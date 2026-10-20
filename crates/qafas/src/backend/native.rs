@@ -333,6 +333,83 @@ impl Native {
         Ok((profile_path, env))
     }
 
+    /// Everything a native sandbox owns, undone: its proxy task and shim (if
+    /// registered), whatever still runs in its process groups, the scratch dir
+    /// with the canaries in it, and its cgroup. Idempotent, so `create` can run
+    /// it for a sandbox that got only part of the way.
+    async fn teardown(&self, id: &str) {
+        if let Some(live) = self.reg.lock().await.remove(id) {
+            live.proxy.abort();
+            live.kill_shim();
+        }
+        let scratch = self.scratch_of(id);
+        kill_recorded_groups(&scratch);
+        let _ = std::fs::remove_dir_all(&scratch);
+        linux::cgroup_remove(id);
+    }
+
+    /// `create` without the cleanup on failure. `proxy_abort` receives the
+    /// proxy task's abort handle the moment the task exists, so the caller can
+    /// stop it when a later step fails.
+    async fn create_in(
+        &self,
+        spec: Spec,
+        proxy_abort: &mut Option<tokio::task::AbortHandle>,
+    ) -> anyhow::Result<Sandbox> {
+        let started = std::time::Instant::now();
+        let created_at = agent_core::now_rfc3339();
+        let scratch = self.scratch_of(&spec.id);
+        make_scratch(&scratch)?;
+
+        let bus = self.bus.clone();
+        let ev = Emitter::new(
+            self.cfg.host_id.clone(),
+            spec.id.clone(),
+            Arc::new(move |e: Event| {
+                let _ = bus.send(e);
+            }),
+        );
+        let (proxy_port, proxy) =
+            self.start_proxy(&spec.id, &scratch, &spec.egress_allow, spec.pi_session.clone(), ev.clone()).await?;
+        *proxy_abort = Some(proxy.abort_handle());
+        let (profile, env) = self.prepare(&spec.id, &scratch, &spec.workspace_path, proxy_port, &spec.env)?;
+        let pgid = self.spawn_shim(&scratch, &spec.workspace_path, &profile, &env, &spec.limits).await?;
+        let connector = Connector::Unix(scratch.join("agent.sock"));
+
+        self.reg.lock().await.insert(
+            spec.id.clone(),
+            Arc::new(Live {
+                connector: connector.clone(),
+                ev,
+                pgid: pgid.into(),
+                proxy,
+                scratch,
+                workspace: spec.workspace_path.clone(),
+                profile,
+                env,
+                limits: std::sync::Mutex::new(spec.limits),
+            }),
+        );
+        self.enforce(&spec.id, pgid, &spec.limits).await?;
+
+        Ok(Sandbox {
+            id: spec.id,
+            template: spec.template,
+            workspace_path: spec.workspace_path,
+            connector,
+            // The shim's socket is in a `0700` scratch dir, so reachability
+            // is the boundary (docs/security.md M39): no token needed.
+            agent_token: None,
+            // Native sandboxes reach the proxy over loopback, so the proxy
+            // sees 127.0.0.1 for all of them and cannot attribute by peer.
+            // `sblog` and the exec layer attribute instead.
+            peer_ip: None,
+            created_at,
+            ready_at: Some(agent_core::now_rfc3339()),
+            boot_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
     /// Spawns `qafas shim` under the OS sandbox and waits for its socket.
     /// Returns the shim's pgid.
     async fn spawn_shim(
@@ -467,79 +544,31 @@ impl Backend for Native {
 
     fn create(&self, spec: Spec) -> BoxFut<'_, anyhow::Result<Sandbox>> {
         Box::pin(async move {
-            let started = std::time::Instant::now();
-            let created_at = agent_core::now_rfc3339();
-            let scratch = self.scratch_of(&spec.id);
-            make_scratch(&scratch)?;
-
-            let bus = self.bus.clone();
-            let ev = Emitter::new(
-                self.cfg.host_id.clone(),
-                spec.id.clone(),
-                Arc::new(move |e: Event| {
-                    let _ = bus.send(e);
-                }),
-            );
-            let (proxy_port, proxy) =
-                self.start_proxy(&spec.id, &scratch, &spec.egress_allow, spec.pi_session.clone(), ev.clone()).await?;
-            let (profile, env) = self.prepare(&spec.id, &scratch, &spec.workspace_path, proxy_port, &spec.env)?;
-            let pgid = match self.spawn_shim(&scratch, &spec.workspace_path, &profile, &env, &spec.limits).await {
-                Ok(p) => p,
+            let id = spec.id.clone();
+            let mut proxy = None;
+            match self.create_in(spec, &mut proxy).await {
+                Ok(sb) => Ok(sb),
                 Err(e) => {
-                    proxy.abort();
-                    return Err(e);
+                    // Nobody holds a `Sandbox` to destroy, so whatever got as far as
+                    // existing goes here: the proxy task (not registered yet if the
+                    // failure came before the shim), the shim and its groups, and the
+                    // scratch dir with its dead `proxy.sock`, canary home and profile
+                    // (bwrap refusing `--unshare-net` left all of it until the next
+                    // start's sweep).
+                    if let Some(p) = proxy {
+                        p.abort();
+                    }
+                    self.teardown(&id).await;
+                    Err(e)
                 }
-            };
-            let connector = Connector::Unix(scratch.join("agent.sock"));
-
-            self.reg.lock().await.insert(
-                spec.id.clone(),
-                Arc::new(Live {
-                    connector: connector.clone(),
-                    ev,
-                    pgid: pgid.into(),
-                    proxy,
-                    scratch,
-                    workspace: spec.workspace_path.clone(),
-                    profile,
-                    env,
-                    limits: std::sync::Mutex::new(spec.limits),
-                }),
-            );
-            self.enforce(&spec.id, pgid, &spec.limits).await?;
-
-            Ok(Sandbox {
-                id: spec.id,
-                template: spec.template,
-                workspace_path: spec.workspace_path,
-                connector,
-                // The shim's socket is in a `0700` scratch dir, so reachability
-                // is the boundary (docs/security.md M39): no token needed.
-                agent_token: None,
-                // Native sandboxes reach the proxy over loopback, so the proxy
-                // sees 127.0.0.1 for all of them and cannot attribute by peer.
-                // `sblog` and the exec layer attribute instead.
-                peer_ip: None,
-                created_at,
-                ready_at: Some(agent_core::now_rfc3339()),
-                boot_ms: started.elapsed().as_millis() as u64,
-            })
+            }
         })
     }
 
     fn destroy(&self, sb: &Sandbox) -> BoxFut<'_, anyhow::Result<()>> {
         let id = sb.id.clone();
         Box::pin(async move {
-            if let Some(live) = self.reg.lock().await.remove(&id) {
-                live.proxy.abort();
-                live.kill_shim();
-            }
-            // Whatever is still running in this sandbox's process groups dies
-            // with it; the scratch dir goes with the canaries in it.
-            let scratch = self.scratch_of(&id);
-            kill_recorded_groups(&scratch);
-            let _ = std::fs::remove_dir_all(&scratch);
-            linux::cgroup_remove(&id);
+            self.teardown(&id).await;
             Ok(())
         })
     }
@@ -727,17 +756,30 @@ pub mod linux {
                 let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
                 let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
                     .is_ok_and(|s| s.trim() == "1");
-                match restricted {
-                    true => (
-                        false,
-                        format!(
-                            "{err}: AppArmor restricts unprivileged user namespaces; allow bwrap (docs/deployment.md)"
-                        ),
-                    ),
-                    false => (false, err),
-                }
+                (false, bwrap_hint(&err, restricted))
             }
             Err(e) => (false, e.to_string()),
+        }
+    }
+
+    /// What `bwrap_probe` (and so `qafas doctor`) says about a failed start.
+    /// ENOSPC is the kernel's per-user cap on namespaces: `--unshare-net` fails
+    /// when `user.max_net_namespaces` is 0 (some hardened hosts set it), which has
+    /// nothing to do with AppArmor or with disk space. bubblewrap 0.9 words it
+    /// "nesting depth or /proc/sys/user/max_*_namespaces exceeded (ENOSPC)"
+    /// (measured, Ubuntu 24.04), older ones print strerror, "No space left on
+    /// device". Any other error on a host that restricts unprivileged user
+    /// namespaces is the Ubuntu 24.04 AppArmor case (EACCES, EPERM).
+    pub(super) fn bwrap_hint(err: &str, apparmor_restricts_userns: bool) -> String {
+        if err.contains("ENOSPC") || err.contains("No space left on device") {
+            return format!(
+                "{err}: the kernel's namespace limit is exhausted or 0; check `sysctl user.max_net_namespaces` \
+                 (and user.max_user_namespaces), and raise it to enable the native tier"
+            );
+        }
+        match apparmor_restricts_userns {
+            true => format!("{err}: AppArmor restricts unprivileged user namespaces; allow bwrap (docs/deployment.md)"),
+            false => err.to_string(),
         }
     }
 
@@ -1028,6 +1070,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// bwrap refusing to start (here: the `home` the sandbox would build is a
+    /// file, which stops `prepare` the way a missing `--unshare-net` stops the
+    /// shim) answers the create with an error, and the sandbox it never became
+    /// must not leave its scratch dir behind: `proxy.sock`, the canary home and
+    /// the profile sat there until the next daemon start.
+    #[tokio::test]
+    async fn a_failed_create_leaves_no_scratch_directory_and_no_registration() {
+        let root = std::env::temp_dir().join(format!("sbx-failed-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let tmpl = root.join("profile.sb");
+        std::fs::write(&tmpl, "(version 1)").unwrap();
+        let mut cfg = crate::config::Config::resolve(crate::config::FileConfig::default());
+        cfg.scratch_dir = root.display().to_string();
+        cfg.seatbelt_profile = tmpl.display().to_string();
+        let limits = cfg.default_limits();
+        let n = Native::new(Arc::new(cfg), crate::events::bus()).unwrap();
+        // `prepare` makes `<scratch>/home/.ssh`: a file in the way fails it.
+        let scratch = root.join("sbx-failing");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("home"), "in the way").unwrap();
+
+        let spec = Spec {
+            id: "failing".into(),
+            template: String::new(),
+            workspace_path: root.display().to_string(),
+            egress_allow: vec![],
+            image: String::new(),
+            snapshot: None,
+            env: Default::default(),
+            pi_session: String::new(),
+            limits,
+        };
+        let e = n.create(spec).await.unwrap_err();
+        assert!(!e.to_string().is_empty());
+        assert!(!scratch.exists(), "the scratch dir of a sandbox that never came up is removed");
+        assert!(n.reg.lock().await.is_empty(), "and nothing is registered for it");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Out of descriptors, a client that left before it was accepted, a signal:
     /// all of them are about this moment. Only a listener that is closed or not
     /// a listener is finished.
@@ -1252,6 +1334,32 @@ mod linux_tests {
                  3 bind allowed; private: 4 bind refused, 5 own listener refused, 6 other port refused; 100 confine)"
             );
         }
+    }
+
+    /// `qafas doctor` prints this for a bwrap that will not start. A host with
+    /// `user.max_net_namespaces=0` fails `--unshare-net` with ENOSPC, which used
+    /// to read as a full disk (or, on Ubuntu 24.04, as the AppArmor case).
+    #[test]
+    fn the_bwrap_hint_names_the_namespace_limit_for_enospc_and_apparmor_for_eperm() {
+        use super::linux::bwrap_hint;
+        // bubblewrap 0.9.0 on Ubuntu 24.04, as printed with user.max_net_namespaces=0, and the
+        // strerror wording of older versions.
+        for enospc in [
+            "bwrap: Creating new namespace failed: nesting depth or /proc/sys/user/max_*_namespaces exceeded (ENOSPC)",
+            "bwrap: Creating new namespace failed: No space left on device",
+        ] {
+            for restricted in [false, true] {
+                let h = bwrap_hint(enospc, restricted);
+                assert!(h.starts_with(enospc), "the error stays in front: {h}");
+                assert!(h.contains("user.max_net_namespaces"), "{h}");
+                assert!(!h.contains("AppArmor"), "ENOSPC is not the AppArmor case: {h}");
+            }
+        }
+        let eperm = "bwrap: setting up uid map: Permission denied";
+        let h = bwrap_hint(eperm, true);
+        assert!(h.contains("AppArmor") && h.contains("docs/deployment.md"), "{h}");
+        assert!(!h.contains("max_net_namespaces"), "{h}");
+        assert_eq!(bwrap_hint(eperm, false), eperm, "no AppArmor restriction: nothing to add");
     }
 
     /// M46: a connection on `proxy.sock` reaches the proxy's TCP port, and the
