@@ -1127,10 +1127,10 @@ impl Conn {
         // ponytail: identity costs the bandwidth the client meant to save, and
         // an upstream that compresses anyway is refused. Upgrade: decode,
         // scrub, re-encode.
-        let encoded = parts
-            .headers
-            .get(header::CONTENT_ENCODING)
-            .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
+        // Every value counts, and a transfer coding hides the bytes as well as
+        // a content coding does: hyper undoes `chunked` and nothing else.
+        let encoded = tokens(&parts.headers, header::CONTENT_ENCODING).iter().any(|t| t != "identity")
+            || tokens(&parts.headers, header::TRANSFER_ENCODING).iter().any(|t| t != "chunked");
         if r.secret.is_some() && encoded {
             self.deny(data, started, "encoded response cannot be scrubbed").await;
             return text(StatusCode::BAD_GATEWAY, "upstream unavailable");
@@ -1502,6 +1502,20 @@ mod tests {
                 r.headers_mut().insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
                 r
             }
+            // `?ce=a&ce=b` sends one Content-Encoding line per value, `?te=x`
+            // a Transfer-Encoding (hyper appends `chunked`).
+            "/coded" => {
+                let q = req.uri().query().unwrap_or("").to_string();
+                let mut r = Response::new(full(dump));
+                for (k, v) in q.split('&').filter_map(|kv| kv.split_once('=')) {
+                    let v = HeaderValue::from_str(&v.replace("%20", " ")).unwrap();
+                    match k {
+                        "ce" => r.headers_mut().append(header::CONTENT_ENCODING, v),
+                        _ => r.headers_mut().append(header::TRANSFER_ENCODING, v),
+                    };
+                }
+                r
+            }
             "/ws" => {
                 let up = hyper::upgrade::on(&mut req);
                 tokio::spawn(async move {
@@ -1828,6 +1842,20 @@ mod tests {
             (evs[0].0, evs[0].1["reason"].as_str()),
             (EventType::EgressDeny, Some("encoded response cannot be scrubbed"))
         );
+    }
+
+    /// Every Content-Encoding value is read, not the first, and a transfer
+    /// coding other than `chunked` is refused the same way.
+    #[tokio::test]
+    async fn every_coding_of_a_response_is_checked() {
+        let h = harness("codings", vec![def(github(), SECRET)]).await;
+        let mut c = open(&h, HOST).await.unwrap();
+        for q in ["ce=identity&ce=gzip", "ce=identity,%20gzip", "te=gzip", "te=gzip,%20chunked"] {
+            assert_eq!(call(&mut c, req("GET", &format!("/coded?{q}"))).await.0, StatusCode::BAD_GATEWAY, "{q}");
+        }
+        for q in ["ce=identity", "ce=identity&ce=IDENTITY", "te=chunked"] {
+            assert_eq!(call(&mut c, req("GET", &format!("/coded?{q}"))).await.0, 200, "{q}");
+        }
     }
 
     #[tokio::test]
