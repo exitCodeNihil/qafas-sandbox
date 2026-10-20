@@ -9,6 +9,7 @@
 //!   tmp/           scratch
 //!   pgid           process groups this sandbox has spawned, for restart safety
 //!   agent.sock     the shim's listener
+//!   proxy.sock     Linux: the daemon's end of the shim's egress proxy relay
 //! ```
 //!
 //! The agent process is `qafas shim`, spawned once per sandbox *inside* the
@@ -134,6 +135,19 @@ fn make_scratch(scratch: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(scratch.join("tmp"))
 }
 
+/// M46, the daemon's end of the shim's relay: every connection on
+/// `proxy.sock` is bridged to this sandbox's egress proxy on `127.0.0.1:port`.
+async fn bridge_to(l: tokio::net::UnixListener, port: u16) -> std::io::Result<()> {
+    loop {
+        let (mut from, _) = l.accept().await?;
+        tokio::spawn(async move {
+            let Ok(mut to) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return };
+            let _ = to.set_nodelay(true);
+            let _ = tokio::io::copy_bidirectional(&mut from, &mut to).await;
+        });
+    }
+}
+
 impl Native {
     /// The fake HOME: canaries, plus read-only links to the host toolchain
     /// directories the profile allows reading. Links rather than copies, because
@@ -165,12 +179,26 @@ impl Native {
     async fn start_proxy(
         &self,
         id: &str,
+        scratch: &Path,
         extra: &[String],
         pi_session: String,
         ev: Emitter,
     ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let port = listener.local_addr()?.port();
+        // M46, Linux: the sandbox has a network namespace of its own, so this
+        // loopback is out of its reach. Its shim relays the proxy port to
+        // `proxy.sock` (in the `0700` scratch dir, like `agent.sock`) and the
+        // bridge brings it back here. Same task as the proxy: it outlives
+        // `stop` and dies on `destroy`.
+        let bridge = match cfg!(target_os = "linux") {
+            true => {
+                let sock = scratch.join("proxy.sock");
+                let _ = std::fs::remove_file(&sock);
+                Some(tokio::net::UnixListener::bind(&sock)?)
+            }
+            false => None,
+        };
         let policy = crate::proxy::Policy::load(&self.cfg.policy).with_extra(extra);
         let mut ctx = crate::proxy::ProxyCtx::new(policy, self.cfg.host_id.clone(), self.cfg.token.clone());
         // Events go straight onto the bus already carrying the sandbox id, and
@@ -181,7 +209,12 @@ impl Native {
         }));
         let id = id.to_string();
         let task = tokio::spawn(async move {
-            if let Err(e) = crate::proxy::serve(listener, Arc::new(ctx)).await {
+            let serve = crate::proxy::serve(listener, Arc::new(ctx));
+            let r = match bridge {
+                Some(b) => tokio::select! { r = serve => r, r = bridge_to(b, port) => r.map_err(Into::into) },
+                None => serve.await,
+            };
+            if let Err(e) = r {
                 tracing::warn!(error = %e, %id, "per-sandbox egress proxy stopped");
             }
         });
@@ -249,10 +282,12 @@ impl Native {
         for (k, v) in extra.iter().filter(|(k, _)| agent_core::spawn::env_allowed(k)) {
             env.insert(k.clone(), v.clone());
         }
-        // Linux: the one port Landlock lets a command connect to. After the
-        // caller's env, so a caller cannot move it.
+        // Linux: the one port Landlock lets a command connect to, and the
+        // daemon's network namespace, which the shim compares with its own
+        // (M46). After the caller's env, so a caller cannot set either.
         if cfg!(target_os = "linux") {
             env.insert("SBX_PROXY_PORT".into(), proxy_port.to_string());
+            env.insert("SBX_HOST_NETNS".into(), linux::netns_id().unwrap_or(0).to_string());
         }
         Ok((profile_path, env))
     }
@@ -405,7 +440,7 @@ impl Backend for Native {
                 }),
             );
             let (proxy_port, proxy) =
-                self.start_proxy(&spec.id, &spec.egress_allow, spec.pi_session.clone(), ev.clone()).await?;
+                self.start_proxy(&spec.id, &scratch, &spec.egress_allow, spec.pi_session.clone(), ev.clone()).await?;
             let (profile, env) = self.prepare(&spec.id, &scratch, &spec.workspace_path, proxy_port, &spec.env)?;
             let pgid = match self.spawn_shim(&scratch, &spec.workspace_path, &profile, &env, &spec.limits).await {
                 Ok(p) => p,
@@ -644,7 +679,8 @@ pub mod linux {
     /// and later refuse unless an AppArmor profile allows `bwrap`.
     pub fn bwrap_probe(bwrap: &str) -> (bool, String) {
         let args = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--unshare-pid", "--unshare-uts"];
-        match std::process::Command::new(bwrap).args(args).args(["--unshare-ipc", "--", "/bin/true"]).output() {
+        let more = ["--unshare-ipc", "--unshare-net", "--", "/bin/true"];
+        match std::process::Command::new(bwrap).args(args).args(more).output() {
             Ok(o) if o.status.success() => (true, "starts as this user".into()),
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -669,9 +705,10 @@ pub mod linux {
     /// D-Bus sockets) replaced by empty tmpfs; the daemon user's toolchains and
     /// this binary read-only again; the workspace and the scratch dir writable;
     /// the credential paths covered even inside the workspace; private
-    /// pid/uts/ipc namespaces; and the process dies with the daemon. The network
-    /// namespace stays shared so the egress proxy on loopback stays reachable;
-    /// Landlock closes the rest of the network.
+    /// pid/uts/ipc/net namespaces; and the process dies with the daemon. M46:
+    /// the network namespace has only `lo`, so no address outside the sandbox
+    /// is reachable at all (Landlock restricts TCP by port, never by address);
+    /// the shim relays the egress proxy port back in over `proxy.sock`.
     pub fn bwrap_prefix(workspace: &str, scratch: &Path, disk_mib: u64) -> Vec<String> {
         let Some(bw) = bwrap() else { return Vec::new() };
         let real_home = std::env::var("HOME").unwrap_or_default();
@@ -700,19 +737,20 @@ pub mod linux {
                 Err(_) => {}
             }
         }
-        for a in ["--unshare-pid", "--unshare-uts", "--unshare-ipc", "--die-with-parent", "--new-session"] {
+        for a in
+            ["--unshare-pid", "--unshare-uts", "--unshare-ipc", "--unshare-net", "--die-with-parent", "--new-session"]
+        {
             v.push(a.into());
-        }
-        // If Landlock cannot restrict the network on this kernel, take the whole
-        // namespace away instead and log the downgrade (PLAN §5 risks). The
-        // sandbox then has no network at all, not even the proxy, which is why
-        // `doctor` prints which of the two a host is using.
-        if !landlock_net_available() {
-            tracing::warn!(abi = abi(), "Landlock network rules unavailable; using --unshare-net");
-            v.push("--unshare-net".into());
         }
         v.push("--".into());
         v
+    }
+
+    /// The network namespace this process is in: the inode of
+    /// `/proc/self/ns/net`, unique per namespace on the running kernel.
+    pub fn netns_id() -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self/ns/net").ok().map(|m| m.ino())
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -780,11 +818,17 @@ pub mod linux {
     /// each command between fork and exec, so everything it spawns inherits
     /// them; `Hardened` adds the seccomp deny-list the VM tier installs right
     /// after (D8/D18). `proxy_port` is the sandbox's own egress proxy, the one
-    /// TCP port a command may connect to (`None`: none at all).
-    pub fn confine(workspace: &str, scratch: &Path, proxy_port: Option<u16>) -> Option<agent_core::spawn::Confine> {
+    /// TCP port a command may connect to (`None`: none at all). `private_netns`
+    /// says the shim runs in its own network namespace (`--unshare-net`, M46).
+    pub fn confine(
+        workspace: &str,
+        scratch: &Path,
+        proxy_port: Option<u16>,
+        private_netns: bool,
+    ) -> Option<agent_core::spawn::Confine> {
         use landlock::{
-            Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-            RulesetStatus, ABI,
+            Access, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
+            RulesetCreatedAttr, RulesetStatus, ABI,
         };
         let (ws, sc) = (workspace.to_string(), scratch.display().to_string());
         let net = landlock_net_available();
@@ -798,7 +842,15 @@ pub mod linux {
             let abi = if net { ABI::V4 } else { ABI::V2 };
             let mut rs = Ruleset::default().handle_access(AccessFs::from_all(abi)).map_err(|e| err(e.to_string()))?;
             if net {
-                rs = rs.handle_access(AccessNet::from_all(abi)).map_err(|e| err(e.to_string()))?;
+                // Binding is only safe in a namespace of our own, where nothing
+                // but this sandbox and its shim (previews) can reach a listener.
+                // Sharing the host's (SBX_NATIVE_PERMISSIVE, no bwrap), bind
+                // stays handled with no rule: nothing inside can listen.
+                let access: BitFlags<AccessNet> = match private_netns {
+                    true => AccessNet::ConnectTcp.into(),
+                    false => AccessNet::from_all(abi),
+                };
+                rs = rs.handle_access(access).map_err(|e| err(e.to_string()))?;
             }
             let mut created = rs.create().map_err(|e| err(e.to_string()))?;
             // Read the world, write only the sandbox's own two directories and
@@ -816,8 +868,8 @@ pub mod linux {
                 }
             }
             if let (true, Some(port)) = (net, proxy_port) {
-                // One reachable port. Binding is not granted at all, so nothing
-                // inside can listen.
+                // One reachable port: the shim's relay in a namespace of our
+                // own, the proxy itself in the host's.
                 created =
                     created.add_rule(NetPort::new(port, AccessNet::ConnectTcp)).map_err(|e| err(e.to_string()))?;
             }
@@ -860,7 +912,15 @@ pub mod linux {
     pub fn abi() -> i32 {
         -1
     }
-    pub fn confine(_workspace: &str, _scratch: &Path, _proxy_port: Option<u16>) -> Option<agent_core::spawn::Confine> {
+    pub fn confine(
+        _workspace: &str,
+        _scratch: &Path,
+        _proxy_port: Option<u16>,
+        _private_netns: bool,
+    ) -> Option<agent_core::spawn::Confine> {
+        None
+    }
+    pub fn netns_id() -> Option<u64> {
         None
     }
     pub fn bwrap_probe(_bwrap: &str) -> (bool, String) {
@@ -941,8 +1001,8 @@ mod tests {
     }
 }
 
-/// Linux only: the forked child below is the one place the socket filter is
-/// proven to return EPERM, so it can't run on macOS.
+/// Linux only: the forked children below are where the socket filter and the
+/// Landlock network rules are proven, so they can't run on macOS.
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::linux::socket_filter;
@@ -1032,9 +1092,10 @@ mod linux_tests {
 
     /// The per-command Landlock rules, in a forked child (they cannot be
     /// lifted from the test process): the sandbox's own proxy port is the one
-    /// TCP port a command reaches.
+    /// TCP port a command reaches, and it may listen only when the shim has a
+    /// network namespace of its own (M46); sharing the host's, bind is denied.
     #[test]
-    fn commands_connect_only_to_their_own_proxy_port() {
+    fn commands_reach_only_the_proxy_port_and_listen_only_in_their_own_netns() {
         if !super::linux::landlock_net_available() {
             eprintln!("skipped: Landlock ABI {} has no network rules", super::linux::abi());
             return;
@@ -1043,26 +1104,65 @@ mod linux_tests {
         let (proxy, other) =
             (std::net::TcpListener::bind("127.0.0.1:0").unwrap(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
         let (pp, op) = (port(&proxy), port(&other));
-        let confine = super::linux::confine("/nonexistent", std::path::Path::new("/nonexistent"), Some(pp)).unwrap();
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            let code = (|| {
-                confine().map_err(|_| 100)?;
-                std::net::TcpStream::connect(("127.0.0.1", pp)).map_err(|_| 1)?;
-                match std::net::TcpStream::connect(("127.0.0.1", op)) {
-                    Err(e) if e.raw_os_error() == Some(libc::EACCES) => Ok(()),
-                    _ => Err(2),
-                }
-            })();
-            unsafe { libc::_exit(code.err().unwrap_or(0)) };
+        for private in [false, true] {
+            let nowhere = std::path::Path::new("/nonexistent");
+            let confine = super::linux::confine("/nonexistent", nowhere, Some(pp), private).unwrap();
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                let code = (|| {
+                    confine().map_err(|_| 100)?;
+                    std::net::TcpStream::connect(("127.0.0.1", pp)).map_err(|_| 1)?;
+                    match std::net::TcpStream::connect(("127.0.0.1", op)) {
+                        Err(e) if e.raw_os_error() == Some(libc::EACCES) => {}
+                        _ => return Err(2),
+                    }
+                    match (private, std::net::TcpListener::bind("127.0.0.1:0")) {
+                        (true, Ok(_)) => Ok(()),
+                        (false, Err(e)) if e.raw_os_error() == Some(libc::EACCES) => Ok(()),
+                        _ => Err(3),
+                    }
+                })();
+                unsafe { libc::_exit(code.err().unwrap_or(0)) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status), "child did not exit: {status:#x}");
+            assert_eq!(
+                libc::WEXITSTATUS(status),
+                0,
+                "private netns {private}: failed check (1 proxy port refused, 2 other port reached, 3 bind, 100 confine)"
+            );
         }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(libc::WIFEXITED(status), "child did not exit: {status:#x}");
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "failed check (1 proxy port refused, 2 other port reached, 100 confine)"
-        );
+    }
+
+    /// M46: a connection on `proxy.sock` reaches the proxy's TCP port, and the
+    /// answer comes back the same way.
+    #[tokio::test]
+    async fn the_bridge_carries_proxy_sock_to_the_proxy_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::path::PathBuf::from(format!("/tmp/sbx-bridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("proxy.sock");
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        tokio::spawn(super::bridge_to(tokio::net::UnixListener::bind(&sock).unwrap(), port));
+
+        let exchange = async {
+            let mut shim = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            shim.write_all(b"CONNECT").await.unwrap();
+            let (mut far, _) = proxy.accept().await.unwrap();
+            let mut got = [0u8; 7];
+            far.read_exact(&mut got).await.unwrap();
+            far.write_all(b"200").await.unwrap();
+            let mut back = [0u8; 3];
+            shim.read_exact(&mut back).await.unwrap();
+            (got, back)
+        };
+        let (got, back) = tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+            .await
+            .expect("nothing came through the bridge within 5 s");
+        assert_eq!((&got, &back), (b"CONNECT", b"200"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
