@@ -131,6 +131,19 @@ fn is_env_name(s: &str) -> bool {
     c.next().is_some_and(|f| f == '_' || f.is_ascii_alphabetic()) && c.all(|x| x == '_' || x.is_ascii_alphanumeric())
 }
 
+/// A host a route may bind: a name, an address, or `*.` followed by at least
+/// two literal labels (`*.example.com`). Refused: `*.com`, `*github.com`,
+/// `git*.com`, `*.*`, any `?`: each covers names nobody listed.
+fn host_glob_ok(h: &str) -> bool {
+    let h = host_norm(h);
+    if h.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let rest = h.strip_prefix("*.").unwrap_or(&h);
+    let labels: Vec<&str> = rest.split('.').collect();
+    !rest.contains(['*', '?']) && labels.iter().all(|l| !l.is_empty()) && (rest.len() == h.len() || labels.len() >= 2)
+}
+
 /// Everything about a route that does not need its secret. The message never
 /// carries a value, only names and references.
 fn validate(r: &EgressRoute, names: &mut HashSet<String>, envs: &mut HashMap<String, String>) -> Result<(), String> {
@@ -145,8 +158,11 @@ fn validate(r: &EgressRoute, names: &mut HashSet<String>, envs: &mut HashMap<Str
     if r.hosts.is_empty() {
         return Err("hosts is empty".into());
     }
-    if let Some(h) = r.hosts.iter().find(|h| h.trim_matches(['*', '.', '?']).is_empty()) {
-        return Err(format!("host {h:?} matches every host; name the hosts"));
+    if let Some(h) = r.hosts.iter().find(|h| !host_glob_ok(h)) {
+        return Err(format!(
+            "host {h:?} is too broad: name the host, or make the wildcard the whole leftmost label \
+             with at least two labels after it (*.example.com)"
+        ));
     }
     if r.ports.is_empty() || r.ports.contains(&0) {
         return Err("ports must list at least one port, none of them 0".into());
@@ -2056,7 +2072,14 @@ mod tests {
         };
         for (routes, why) in [
             (json!([r(json!({})), r(json!({}))]), "duplicate route name"),
-            (json!([r(json!({"hosts": ["*"]}))]), "matches every host"),
+            (json!([r(json!({"hosts": ["*"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["*.com"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["github.com", "*github.com"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["git*.com"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["*.*"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["*.*.example.com"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["api?.example.com"]}))]), "too broad"),
+            (json!([r(json!({"hosts": ["api..example.com"]}))]), "too broad"),
             (json!([r(json!({"env": null}))]), "secret needs env"),
             (json!([r(json!({"env": "PATH"}))]), "is not a name"),
             (json!([r(json!({"env": "LD_PRELOAD"}))]), "is not a name"),
@@ -2082,6 +2105,9 @@ mod tests {
         assert_eq!(defs[0].secret.as_ref().unwrap().expose(), SECRET, "read once, trimmed");
         assert!(defs[0].spec.secret.is_none(), "the reference is not kept");
         assert!(resolve_routes(&policy(json!([r(json!({"secret": "env://PATH"}))]))).is_ok());
+        for hosts in [json!(["*.github.com", "github.com"]), json!(["203.0.113.10"]), json!(["2001:db8::1"])] {
+            assert!(resolve_routes(&policy(json!([r(json!({"hosts": hosts}))]))).is_ok(), "{hosts}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
