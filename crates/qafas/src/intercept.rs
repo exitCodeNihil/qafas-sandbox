@@ -86,6 +86,11 @@ const HOP: [&str; 9] = [
     "upgrade",
 ];
 
+/// Headers some servers and frameworks take as the method or the path. The
+/// rules see only the request line, so a route with rules does not send them.
+const OVERRIDES: [&str; 5] =
+    ["x-http-method-override", "x-http-method", "x-method-override", "x-original-url", "x-rewrite-url"];
+
 const SECRET_MIN: usize = 8;
 const LEAF_TTL: Duration = Duration::from_secs(12 * 3600);
 const LEAF_CACHE: usize = 256;
@@ -1148,8 +1153,12 @@ impl Conn {
             if HOP.contains(&n) || listed.iter().any(|l| l == n) || n == "host" || (framed && n == "content-length") {
                 continue;
             }
-            // The scrubber needs plain bytes back.
-            if n == "accept-encoding" && r.secret.is_some() {
+            // The scrubber needs plain bytes back, and whole ones: a range of a
+            // reflected secret is a piece no needle matches.
+            if r.secret.is_some() && matches!(n, "accept-encoding" | "range" | "if-range") {
+                continue;
+            }
+            if !r.rules.is_empty() && OVERRIDES.contains(&n) {
                 continue;
             }
             h.append(name.clone(), value.clone());
@@ -1842,6 +1851,34 @@ mod tests {
         assert_eq!(denies.len(), refused.len());
         assert!(denies.iter().all(|(_, d)| d["reason"] == "l7 rule" && d["method"].is_string() && d["route"] == "gh"));
         assert_eq!((denies[0].1["method"].as_str(), denies[0].1["path"].as_str()), (Some("POST"), Some("/org/repo")));
+    }
+
+    /// The rules see the request line, so on a route with rules nothing that
+    /// restates the method or the path goes out; on a route with a secret a
+    /// response is never partial, so the scrubber always sees whole copies.
+    #[tokio::test]
+    async fn headers_that_restate_the_request_or_ask_for_a_part_do_not_go_out() {
+        let mut r = github();
+        r["rules"] = json!([{"methods": ["GET"], "paths": ["/echo"]}]);
+        let h = harness("override", vec![def(r, SECRET)]).await;
+        let mut c = open(&h, HOST).await.unwrap();
+        let mut q =
+            req("GET", "/echo").header("range", "bytes=0-3").header("if-range", "\"x\"").header("accept", "*/*");
+        for n in OVERRIDES {
+            q = q.header(n, "/admin");
+        }
+        assert_eq!(call(&mut c, q).await.0, 200);
+        for n in OVERRIDES.iter().chain(&["range", "if-range"]) {
+            assert!(upstream_saw(&h, 0, n).is_empty(), "{n} went out");
+        }
+        assert_eq!(upstream_saw(&h, 0, "accept"), ["*/*"], "everything else does");
+
+        // No rules: nothing for an override to get around. A secret: no ranges.
+        let h = harness("override2", vec![def(github(), SECRET)]).await;
+        let mut c = open(&h, HOST).await.unwrap();
+        call(&mut c, req("GET", "/echo").header("range", "bytes=0-3").header("x-http-method-override", "PUT")).await;
+        assert_eq!(upstream_saw(&h, 0, "x-http-method-override"), ["PUT"]);
+        assert!(upstream_saw(&h, 0, "range").is_empty());
     }
 
     #[test]
