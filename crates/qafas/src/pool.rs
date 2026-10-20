@@ -264,6 +264,7 @@ impl Pool {
             // A warm sandbox is created before any session claims it.
             pi_session: String::new(),
             limits,
+            trust: Default::default(),
         };
         let id = spec.id.clone();
         let ev = |ty, data| new_event(&self.host_id, &id, &Corr::default(), ty, data);

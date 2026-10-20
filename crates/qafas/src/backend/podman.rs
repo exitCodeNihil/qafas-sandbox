@@ -316,13 +316,22 @@ impl Podman {
         if let Some(net) = subnet {
             command.extend(["--relay".into(), format!("0.0.0.0:{RELAY_PORT}"), "--relay-net".into(), net.into()]);
         }
-        let env = json!({
+        let mut env = json!({
             "SBX_POLICY_JSON": policy,
             "SBX_SINK_CA": sink_ca,
             "SBX_TOKEN": self.cfg.token,
             "SBX_HOST_ID": self.cfg.host_id,
             "RUST_LOG": std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         });
+        // D34: the routes with their secrets read, the egress CA and its key, and
+        // the extra upstream CA, as one value. ponytail: an environment variable is
+        // visible to whoever can inspect this container — the host operator, who
+        // holds the secrets anyway; no sandbox can (the proxy is another container,
+        // reached only on its port). Upgrade: a tmpfs secret mount, if the engine's
+        // API ever becomes reachable by someone who is not the operator.
+        if let Some(ic) = crate::intercept::installed() {
+            env["SBX_ROUTES_JSON"] = json!(ic.container_json());
+        }
         // The image ENTRYPOINT is guest-agent, so the proxy has to override it.
         let entrypoint = ["/usr/local/bin/qafas"];
         if self.is_docker() {
@@ -1249,6 +1258,7 @@ mod tests {
             env: Default::default(),
             pi_session: String::new(),
             limits: proto::sizes::default_table()["mini"],
+            trust: Default::default(),
         }
     }
 
