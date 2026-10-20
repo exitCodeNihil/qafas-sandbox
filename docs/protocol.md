@@ -9,7 +9,7 @@ Data path: `pi extension → qafas → guest-agent`. The Go control plane is nev
 - v1 was frozen at Gate A (2026-09-08).
 - **v2 additions** (marked v2) were frozen 2026-09-08 for phase 2.
 - **v5 additions** (sizes, limits, usage; marked v5, §3a "v5 sizes and limits") were frozen 2026-09-15.
-- **v5.4 additions** (marked v5.4): `routes` in the egress policy file (§6: credential injection and per-request rules, D34), the `via`/`duration_ms`/`route`/`method`/`path`/`injected` fields on `egress.*` events, `egress_allow` honoured on every tier (the proxy container asks `GET /internal/egress/peer`), the IPv4-inside-IPv6 address rule (§6), and `POST /ca` on the guest agent. All additive.
+- **v5.4 additions** (marked v5.4): `routes` in the egress policy file (§6: credential injection and per-request rules, D34), the `via`/`duration_ms`/`route`/`method`/`path`/`injected` fields on `egress.*` events, `egress_allow` honoured on every tier (the proxy container asks `GET /internal/egress/peer`), the IPv4-inside-IPv6 address rule (§6), `POST /ca` on the guest agent, `entropy` on `POST /restored`, and the `503` a `remote` guest's `/healthz` answers until its kernel feed is live (§2, §3a). All additive.
 - A tag such as v2, v4c, v5.1, v5.3 or v5.4 marks the version that added a row, field or rule. The v3 material is §3a, §4a and §4b.
 - v1 bodies stay valid: every v2–v5 field has a default.
 
