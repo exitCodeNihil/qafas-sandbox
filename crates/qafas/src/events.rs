@@ -54,6 +54,65 @@ pub fn new_event(host_id: &str, sandbox_id: &str, corr: &Corr, ty: EventType, da
     }
 }
 
+// ------------------------------------------------------------------ tool calls
+
+/// The last `CALLS_KEPT` tool calls forwarded to each sandbox, with the unix
+/// millis each was first seen: what an `egress.*` event is attributed to, since
+/// a proxy sees a connection and not the request that caused it. Process-wide
+/// and keyed by sandbox id because the native tier builds its proxy inside the
+/// backend, before `api` has a `Live` for the sandbox; the id is what both sides
+/// hold. `api` writes it on every forward and clears it on every destroy, so it
+/// is as big as the live table.
+///
+/// ponytail: concurrent calls on one sandbox are all attributed to the newest,
+/// and a background process's traffic to whichever call ran last; a tunnel older
+/// than every retained call goes to the oldest retained. Upgrade path: socket
+/// to pid in the guest, which already maps every pid to its tool call.
+static CALLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Calls>>> =
+    std::sync::LazyLock::new(Default::default);
+
+const CALLS_KEPT: usize = 16;
+
+type Calls = std::collections::VecDeque<(String, i64)>;
+
+fn push_call(calls: &mut Calls, tool_call_id: &str, ms: i64) {
+    // A call's later requests (its fs reads, its next exec) are still that
+    // call: it keeps the time it started at and its place in the history.
+    if calls.back().is_some_and(|(id, _)| id == tool_call_id) {
+        return;
+    }
+    calls.push_back((tool_call_id.to_string(), ms));
+    if calls.len() > CALLS_KEPT {
+        calls.pop_front();
+    }
+}
+
+/// The newest call seen at or before `at`, else the oldest kept.
+fn pick_call(calls: &Calls, at: i64) -> String {
+    calls.iter().rev().find(|(_, ms)| *ms <= at).or(calls.front()).map(|(id, _)| id.clone()).unwrap_or_default()
+}
+
+pub fn note_call(sandbox_id: &str, corr: &Corr) {
+    if !corr.tool_call_id.is_empty() {
+        let mut all = CALLS.lock().expect("calls");
+        push_call(all.entry(sandbox_id.to_string()).or_default(), &corr.tool_call_id, now_ms());
+    }
+}
+
+/// The tool call an `egress.*` event belongs to. A tunnel's `egress.allow` is
+/// sent when it closes (and from the proxy container, over the network), so it
+/// is matched to the call that was current when it *opened*: now minus its
+/// `duration_ms`, an interval, so no clock but ours is involved. A deny is sent
+/// as it happens and carries none. Empty when no call has reached the sandbox.
+pub fn egress_call(sandbox_id: &str, data: &serde_json::Value) -> String {
+    let at = now_ms() - data.get("duration_ms").and_then(|d| d.as_i64()).unwrap_or(0);
+    CALLS.lock().expect("calls").get(sandbox_id).map(|c| pick_call(c, at)).unwrap_or_default()
+}
+
+pub fn forget_call(sandbox_id: &str) {
+    CALLS.lock().expect("calls").remove(sandbox_id);
+}
+
 async fn send_json(http: &HttpClient, method: &str, url: &str, token: &str, body: Vec<u8>) -> anyhow::Result<u16> {
     let req = hyper::Request::builder()
         .method(method)
@@ -450,6 +509,37 @@ mod tests {
         );
         assert!(!spool.exists(), "and nothing is left holding it");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What was seen on the Mac vm tier: call A's curl ends, call B starts, and
+    /// only then does A's `egress.allow` (sent at tunnel close) arrive. It
+    /// belongs to A, because the tunnel opened while A was the newest call.
+    #[test]
+    fn a_tunnel_belongs_to_the_call_that_was_current_when_it_opened() {
+        let mut c = Calls::new();
+        push_call(&mut c, "tc-a", 1_000);
+        push_call(&mut c, "tc-a", 1_200); // A's next request: still A, from 1_000
+        push_call(&mut c, "tc-b", 1_907);
+        // Arrives at 1_963 after a 500 ms tunnel: opened at 1_463.
+        assert_eq!(pick_call(&c, 1_963 - 500), "tc-a");
+        assert_eq!(pick_call(&c, 1_963), "tc-b", "a deny, sent as it happens, is the newest's");
+        assert_eq!(pick_call(&c, 1_000), "tc-a", "at the very millisecond A was seen");
+        assert_eq!(pick_call(&Calls::new(), 5), "", "nothing ran there");
+    }
+
+    /// The history is bounded, so a tunnel that opened before every call still
+    /// kept goes to the oldest one kept: never to nobody, never to the newest.
+    #[test]
+    fn a_tunnel_older_than_the_history_goes_to_the_oldest_kept_call() {
+        let mut c = Calls::new();
+        for i in 0..(CALLS_KEPT as i64 + 4) {
+            push_call(&mut c, &format!("tc-{i}"), 1_000 + i * 10);
+        }
+        assert_eq!(c.len(), CALLS_KEPT, "bounded");
+        assert_eq!(pick_call(&c, 0), "tc-4", "the first four were dropped; the oldest kept is tc-4");
+        assert_eq!(pick_call(&c, 1_000 + 45), "tc-4");
+        assert_eq!(pick_call(&c, 1_000 + 55), "tc-5");
+        assert_eq!(pick_call(&c, i64::MAX), format!("tc-{}", CALLS_KEPT + 3));
     }
 
     #[test]
