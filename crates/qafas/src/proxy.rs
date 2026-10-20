@@ -10,8 +10,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use futures_util::future::BoxFuture;
+use http_body_util::{BodyExt, Full};
 use proto::{EgressPolicy, EventType};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,6 +25,9 @@ const MAX_HEADERS: usize = 64 * 1024;
 
 pub struct Policy {
     allow: Vec<WildMatch>,
+    /// One sandbox's own `egress_allow` (D22), kept apart from the host file's
+    /// so `egress.allow` can say which list let a name through.
+    extra: Vec<WildMatch>,
     deny_extra: Vec<(IpAddr, u8)>,
     /// Host-file only (`allow_private_cidrs`): internal mirrors an allowed name
     /// may resolve into. Never filled from a create request.
@@ -102,7 +107,7 @@ impl Policy {
     /// request. They come from harness configuration, never from the model
     /// (D22), and they never widen the private-address deny list.
     pub fn with_extra(mut self, globs: &[String]) -> Self {
-        self.allow.extend(globs.iter().map(|g| WildMatch::new(g)));
+        self.extra.extend(globs.iter().map(|g| WildMatch::new(g)));
         self
     }
 
@@ -120,17 +125,30 @@ impl Policy {
     pub fn from_policy(p: &EgressPolicy) -> Self {
         Self {
             allow: p.allow.iter().map(|g| WildMatch::new(g)).collect(),
+            extra: Vec::new(),
             deny_extra: p.deny_cidrs_extra.iter().filter_map(|s| parse_cidr(s)).collect(),
             allow_private: p.allow_private_cidrs.iter().filter_map(|s| parse_cidr(s)).collect(),
         }
     }
 
-    /// `Ok(())` or `Err(reason)`. Reason lands in the `egress.deny` event.
-    pub fn decide(&self, host: &str, ips: &[IpAddr]) -> Result<(), String> {
+    /// `Ok(via)` or `Err(reason)`. Reason lands in the `egress.deny` event,
+    /// `via` in the `egress.allow` one: `baseline` when the host file's list
+    /// matched, `sandbox` when only the sandbox's own `egress_allow` did.
+    pub fn decide(&self, host: &str, ips: &[IpAddr]) -> Result<&'static str, String> {
+        self.decide_with(host, ips, &[])
+    }
+
+    /// The same, plus the `egress_allow` the shared proxy looked up for its
+    /// peer (`PeerInfo`). Names only: the address rules below are the same.
+    pub fn decide_with(&self, host: &str, ips: &[IpAddr], peer: &[String]) -> Result<&'static str, String> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
-        if !self.allow.iter().any(|g| g.matches(&host)) {
-            return Err("host not in allowlist".into());
-        }
+        let via = if self.allow.iter().any(|g| g.matches(&host)) {
+            "baseline"
+        } else if self.extra.iter().any(|g| g.matches(&host)) || peer.iter().any(|g| WildMatch::new(g).matches(&host)) {
+            "sandbox"
+        } else {
+            return Err(NOT_LISTED.into());
+        };
         if ips.is_empty() {
             return Err("dns resolution failed".into());
         }
@@ -143,9 +161,13 @@ impl Policy {
                 return Err(format!("address {ip} in deny_cidrs_extra"));
             }
         }
-        Ok(())
+        Ok(via)
     }
 }
+
+/// The deny reason for a name no list has: the only one a sandbox's own
+/// `egress_allow` can still turn around.
+pub const NOT_LISTED: &str = "host not in allowlist";
 
 // ------------------------------------------------------------------ server
 
@@ -153,8 +175,30 @@ impl Policy {
 /// its own container: straight onto the bus, already attributed.
 pub type Emit = Arc<dyn Fn(EventType, serde_json::Value) + Send + Sync>;
 
+/// What the daemon's live table holds for the sandbox behind one peer address.
+/// The vm and remote proxies serve every sandbox on the host, so this is how
+/// they learn one sandbox's own allowlist (D22) — and its trust.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerInfo {
+    /// `egress_allow` from the create request: names on top of the host file's.
+    pub egress_allow: Vec<String>,
+    pub trust: proto::Trust,
+}
+
+/// `peer address -> PeerInfo`, `None` for an address no running sandbox has.
+/// The daemon answers from its live table (`AppState::peer_lookup`); the proxy
+/// container asks it over the event sink's channel (`http_peer`).
+pub type PeerLookup = Arc<dyn Fn(IpAddr) -> BoxFuture<'static, Option<PeerInfo>> + Send + Sync>;
+
+/// How long a connection waits on the daemon's answer before it is decided
+/// on the host file alone. Loopback or the container bridge: milliseconds.
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct ProxyCtx {
     pub policy: Policy,
+    /// The shared proxies' (vm, remote) per-peer lookup. `None` on the native
+    /// tier, whose proxy belongs to one sandbox and has its globs in `policy`.
+    pub peer: Option<PeerLookup>,
     /// URL to POST events to (the container case), or `None`.
     pub sink: Option<String>,
     /// In-process callback (the native and firecracker cases).
@@ -166,10 +210,39 @@ pub struct ProxyCtx {
 
 impl ProxyCtx {
     pub fn new(policy: Policy, host_id: String, token: String) -> Self {
-        Self { policy, sink: None, emit: None, token, host_id, http: http_client() }
+        Self { policy, peer: None, sink: None, emit: None, token, host_id, http: http_client() }
+    }
+
+    /// The sandbox behind `ip`, asked of the daemon. Only the shared proxies
+    /// have someone to ask.
+    pub async fn peer_info(&self, ip: IpAddr) -> Option<PeerInfo> {
+        let look = self.peer.as_ref()?;
+        tokio::time::timeout(PEER_TIMEOUT, look(ip.to_canonical())).await.ok()?
     }
 }
 
+/// The proxy container's lookup: `GET /internal/egress/peer?ip=` on the daemon
+/// that receives its events, with the same token and TLS pin as the sink.
+pub fn http_peer(sink: &str, http: HttpClient, token: String) -> Option<PeerLookup> {
+    let base = sink.strip_suffix("/internal/events")?.to_string();
+    Some(Arc::new(move |ip| {
+        let (http, token, url) = (http.clone(), token.clone(), format!("{base}/internal/egress/peer?ip={ip}"));
+        Box::pin(async move {
+            let req = hyper::Request::get(url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Full::new(Bytes::new()))
+                .ok()?;
+            let resp = http.request(req).await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            serde_json::from_slice(&resp.into_body().collect().await.ok()?.to_bytes()).ok()
+        })
+    }))
+}
+
+/// `peer`: the daemon's own lookup when the proxy runs in its process (the
+/// remote tier); `None` derives the HTTP one from `sink` (the container).
 pub async fn run(
     listen: SocketAddr,
     policy: &str,
@@ -177,12 +250,14 @@ pub async fn run(
     sink_ca: Option<Vec<u8>>,
     token: String,
     host_id: String,
+    peer: Option<PeerLookup>,
 ) -> anyhow::Result<()> {
     let mut ctx = ProxyCtx::new(Policy::load(policy), host_id, token);
-    ctx.sink = sink;
     if let Some(pem) = sink_ca {
         ctx.http = crate::events::http_client_with(crate::tls::pinned_config(&pem)?);
     }
+    ctx.peer = peer.or_else(|| http_peer(sink.as_deref()?, ctx.http.clone(), ctx.token.clone()));
+    ctx.sink = sink;
     let l = TcpListener::bind(listen).await?;
     tracing::info!(%listen, policy, "egress proxy listening");
     serve(l, Arc::new(ctx)).await
@@ -333,14 +408,18 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow
         }
     };
 
-    if let Err(reason) = ctx.policy.decide(&host, &ips) {
-        sock.write_all(
-            b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nblocked by egress policy",
-        )
-        .await?;
-        emit(ctx, peer, EventType::EgressDeny, json!({"host": host, "port": port, "bytes": 0, "reason": reason})).await;
-        return Ok(());
-    }
+    let via = match verdict(ctx, peer.ip(), &host, &ips).await {
+        Ok(via) => via,
+        Err(reason) => {
+            sock.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nblocked by egress policy",
+            )
+            .await?;
+            emit(ctx, peer, EventType::EgressDeny, json!({"host": host, "port": port, "bytes": 0, "reason": reason}))
+                .await;
+            return Ok(());
+        }
+    };
 
     let mut up = TcpStream::connect(&ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect::<Vec<_>>()[..]).await?;
     let _ = up.set_nodelay(true);
@@ -353,14 +432,30 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow
     }
 
     let (a, b) = tokio::io::copy_bidirectional(&mut sock, &mut up).await.unwrap_or((0, 0));
-    emit(ctx, peer, EventType::EgressAllow, json!({"host": host, "port": port, "bytes": a + b})).await;
+    emit(ctx, peer, EventType::EgressAllow, json!({"host": host, "port": port, "bytes": a + b, "via": via})).await;
     Ok(())
+}
+
+/// The host file first; the peer's own `egress_allow` only when that said no
+/// to the name — one call to the daemon, and never for an address rule.
+///
+/// ponytail: no cache, so a sandbox that keeps trying names nobody listed
+/// costs one local round trip per attempt. Upgrade path: a short per-IP cache
+/// that `destroy` invalidates, if the daemon ever shows up in a profile.
+async fn verdict(ctx: &ProxyCtx, peer: IpAddr, host: &str, ips: &[IpAddr]) -> Result<&'static str, String> {
+    match ctx.policy.decide(host, ips) {
+        Err(r) if r == NOT_LISTED => match ctx.peer_info(peer).await {
+            Some(p) => ctx.policy.decide_with(host, ips, &p.egress_allow),
+            None => Err(r),
+        },
+        v => v,
+    }
 }
 
 /// Events carry the peer address; qafas turns it into a `sandbox_id`, since
 /// only it knows which container has which IP.
 async fn emit(ctx: &ProxyCtx, peer: SocketAddr, ty: EventType, mut data: serde_json::Value) {
-    data["peer"] = json!(peer.ip().to_string());
+    data["peer"] = json!(peer.ip().to_canonical().to_string());
     if let Some(f) = &ctx.emit {
         f(ty, data);
         return;
@@ -477,10 +572,91 @@ mod tests {
     fn per_sandbox_allow_widens_names_but_not_addresses() {
         let p = policy().with_extra(&["internal.example.com".into()]);
         let public: IpAddr = "140.82.121.4".parse().unwrap();
-        assert!(p.decide("internal.example.com", &[public]).is_ok());
+        assert_eq!(p.decide("internal.example.com", &[public]), Ok("sandbox"), "the allow says which list");
+        assert_eq!(p.decide("github.com", &[public]), Ok("baseline"));
         assert!(p.decide("other.example.com", &[public]).is_err());
         // The private-range rule is not something a harness can opt out of.
         assert!(p.decide("internal.example.com", &["10.0.0.1".parse().unwrap()]).is_err());
+    }
+
+    /// E1: the shared proxy (vm, remote) asks the daemon about its peer only
+    /// when the host file said no to the name, and a sandbox's own names open
+    /// for that sandbox's address alone — never for a neighbour, never for an
+    /// address nobody has, never past the address rules.
+    #[tokio::test]
+    async fn a_sandboxs_own_names_open_for_its_address_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let (a, neighbour, nobody, public) = (ip("10.89.0.2"), ip("10.89.0.3"), ip("10.89.0.9"), ip("140.82.121.4"));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut ctx = ProxyCtx::new(policy(), "h".into(), "t".into());
+        let n = asked.clone();
+        ctx.peer = Some(Arc::new(move |peer| {
+            n.fetch_add(1, Ordering::SeqCst);
+            let info = |allow: &[&str]| PeerInfo {
+                egress_allow: allow.iter().map(|g| g.to_string()).collect(),
+                trust: proto::Trust::Untrusted,
+            };
+            let found = match peer.to_string().as_str() {
+                "10.89.0.2" => Some(info(&["only-a.example", "*.a.example"])),
+                "10.89.0.3" => Some(info(&[])),
+                _ => None,
+            };
+            Box::pin(async move { found })
+        }));
+
+        assert_eq!(verdict(&ctx, a, "only-a.example", &[public]).await, Ok("sandbox"));
+        assert_eq!(verdict(&ctx, a, "x.a.example", &[public]).await, Ok("sandbox"), "globs, as in the host file");
+        assert_eq!(verdict(&ctx, neighbour, "only-a.example", &[public]).await, Err(NOT_LISTED.into()));
+        // An address no sandbox has changes nothing: the host file's answer stands.
+        for host in ["only-a.example", "github.com", "example.com"] {
+            assert_eq!(verdict(&ctx, nobody, host, &[public]).await, ctx.policy.decide(host, &[public]), "{host}");
+        }
+        // A per-sandbox name cannot open a private address, nor an extra-denied one.
+        let private = verdict(&ctx, a, "only-a.example", &[ip("10.0.0.1")]).await.unwrap_err();
+        assert!(private.contains("non-public"), "{private}");
+        assert!(verdict(&ctx, a, "only-a.example", &[ip("203.0.113.7")]).await.is_err());
+        // An IPv4 peer seen through a dual-stack socket is the same sandbox.
+        assert_eq!(verdict(&ctx, ip("::ffff:10.89.0.2"), "only-a.example", &[public]).await, Ok("sandbox"));
+
+        // The daemon is asked only after the host file said no to the name.
+        let before = asked.load(Ordering::SeqCst);
+        assert_eq!(verdict(&ctx, a, "github.com", &[public]).await, Ok("baseline"));
+        assert!(verdict(&ctx, a, "github.com", &[ip("10.0.0.1")]).await.is_err());
+        assert_eq!(asked.load(Ordering::SeqCst), before, "a listed name or an address deny asks nobody");
+    }
+
+    /// The same through the listener: two sandboxes on one proxy, told apart by
+    /// the address they connect from. A's own name gets past the name check (to
+    /// an address rule, so the test needs no network); B's does not.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn one_proxy_tells_two_sandboxes_apart_by_address() {
+        let got: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let mut ctx = ProxyCtx::new(policy(), "h".into(), "t".into());
+        let g = got.clone();
+        ctx.emit = Some(Arc::new(move |_, data| g.lock().unwrap().push(data)));
+        ctx.peer = Some(Arc::new(|peer| {
+            let allow = if peer.to_string() == "127.0.0.2" { vec!["203.0.113.7".to_string()] } else { vec![] };
+            Box::pin(async move { Some(PeerInfo { egress_allow: allow, trust: proto::Trust::Trusted }) })
+        }));
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(serve(l, Arc::new(ctx)));
+        for from in ["127.0.0.2", "127.0.0.3"] {
+            let s = tokio::net::TcpSocket::new_v4().unwrap();
+            s.bind(format!("{from}:0").parse().unwrap()).unwrap();
+            let mut c = s.connect(addr).await.unwrap();
+            c.write_all(b"CONNECT 203.0.113.7:443 HTTP/1.1\r\nHost: 203.0.113.7:443\r\n\r\n").await.unwrap();
+            let mut reply = String::new();
+            c.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.starts_with("HTTP/1.1 403"), "{reply:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = got.lock().unwrap().clone();
+        let reason = |peer: &str| got.iter().find(|d| d["peer"] == peer).map(|d| d["reason"].clone());
+        assert_eq!(reason("127.0.0.2"), Some(json!("address 203.0.113.7 in deny_cidrs_extra")), "{got:?}");
+        assert_eq!(reason("127.0.0.3"), Some(json!(NOT_LISTED)), "{got:?}");
     }
 
     #[test]
