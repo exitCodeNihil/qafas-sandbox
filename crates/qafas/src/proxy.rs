@@ -488,6 +488,9 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &Arc<ProxyCtx>) -> a
 
     if method == "CONNECT" {
         sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+        // Whatever the client sent right behind the CONNECT headers (an eager TLS hello)
+        // belongs to the tunnel.
+        up.write_all(&leftover).await?;
     } else {
         up.write_all(origin_head(method, &path, lines).as_bytes()).await?;
         up.write_all(&leftover).await?;
