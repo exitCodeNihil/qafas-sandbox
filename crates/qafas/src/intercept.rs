@@ -1082,7 +1082,10 @@ impl Conn {
         }
         let from_client = upgrade.then(|| hyper::upgrade::on(&mut req));
         let (mut head, body) = req.into_parts();
-        let injected = self.rewrite(&mut head, upgrade);
+        let Some(injected) = self.rewrite(&mut head, upgrade) else {
+            self.deny(data, started, "bad request target").await;
+            return text(StatusCode::BAD_REQUEST, "bad request target");
+        };
         if injected {
             data["injected"] = json!([r.name]);
         }
@@ -1157,8 +1160,10 @@ impl Conn {
     }
 
     /// The upstream head: this hop's headers gone, the target in origin form,
-    /// the placeholder swapped, `inject` applied. True when the secret is in it.
-    fn rewrite(&self, head: &mut hyper::http::request::Parts, upgrade: bool) -> bool {
+    /// the placeholder swapped, `inject` applied. True when the secret is in it;
+    /// `None` when the target has no origin form (it would not be the request
+    /// the rules were checked on).
+    fn rewrite(&self, head: &mut hyper::http::request::Parts, upgrade: bool) -> Option<bool> {
         let r = self.route();
         let listed: Vec<String> = head
             .headers
@@ -1234,10 +1239,10 @@ impl Conn {
             Some(q) => format!("{}?{q}", head.uri.path()),
             None => head.uri.path().to_string(),
         };
-        head.uri = target.parse().unwrap_or_else(|_| hyper::Uri::from_static("/"));
+        head.uri = target.parse().ok()?;
         head.version = hyper::Version::HTTP_11;
         head.headers = h;
-        injected
+        Some(injected)
     }
 
     /// One TLS connection to the approved addresses, verified as the host.
@@ -1851,6 +1856,40 @@ mod tests {
             (evs[0].0, evs[0].1["reason"].as_str()),
             (EventType::EgressDeny, Some("encoded response cannot be scrubbed"))
         );
+    }
+
+    /// One request as raw bytes over the tunnel's TLS, for targets no client
+    /// library would build. Read until the proxy closes.
+    async fn raw(h: &H, request: &str) -> String {
+        let mut s = TcpStream::connect(h.proxy).await.unwrap();
+        let mut head = [0u8; 39];
+        s.read_exact(&mut head).await.unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add_parsable_certificates(CertificateDer::pem_slice_iter(h.ic.ca_pem().as_bytes()).filter_map(Result::ok));
+        let cfg = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(HOST.to_string()).unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, s).await.unwrap();
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A target with no origin form (here the authority form, outside a
+    /// CONNECT) is refused, not sent on as some other request such as `/`.
+    #[tokio::test]
+    async fn a_target_with_no_origin_form_is_refused() {
+        let h = harness("target", vec![def(github(), SECRET)]).await;
+        let r = raw(&h, &format!("GET {HOST}:443 HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(h.got.lock().unwrap().is_empty(), "nothing reached the upstream");
+        let evs = events(&h, 1).await;
+        assert_eq!((evs[0].0, evs[0].1["reason"].as_str()), (EventType::EgressDeny, Some("bad request target")));
     }
 
     /// A reason phrase is not a header, so the header scrubber never sees it:
