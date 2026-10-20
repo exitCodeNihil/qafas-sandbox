@@ -296,6 +296,42 @@ fn read_policy(cfg: &Config) -> EgressPolicy {
         .unwrap_or_default()
 }
 
+/// The `file://` secrets of the host file's routes, as absolute paths.
+fn secret_files(p: &EgressPolicy) -> Vec<(String, String)> {
+    p.routes
+        .iter()
+        .filter_map(|r| Some((r.name.clone(), r.secret.as_deref()?.strip_prefix("file://")?.to_string())))
+        .filter(|(_, f)| f.starts_with('/'))
+        .collect()
+}
+
+/// What a native sandbox, which runs as the daemon's own user, must never
+/// read: the state directory (the egress CA key, the live table, snapshots)
+/// and every route's `file://` secret. Read once, at the start, like the routes.
+pub fn hidden_paths(cfg: &Config) -> Vec<String> {
+    let mut v = vec![cfg.state_dir.clone()];
+    v.extend(secret_files(&read_policy(cfg)).into_iter().map(|(_, f)| f));
+    v
+}
+
+/// `doctor`'s warnings for the native tier: a secret under `/etc`, which every
+/// native sandbox can read around. The file itself is hidden (`hidden_paths`);
+/// a copy next to it (an editor's backup, a rotated file) would not be.
+fn native_warnings(p: &EgressPolicy, tiers: &[String]) -> Vec<String> {
+    if !tiers.iter().any(|t| t == "native") {
+        return Vec::new();
+    }
+    secret_files(p)
+        .into_iter()
+        .filter(|(_, f)| f.starts_with("/etc/") || f.starts_with("/private/etc/"))
+        .map(|(n, _)| {
+            format!(
+                "WARN route {n:?}: secret under /etc, which native sandboxes can read; keep it in the state directory"
+            )
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------------ the CA
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -721,7 +757,12 @@ pub fn doctor(cfg: &Config) -> Option<(bool, String)> {
         Ok(pem) => format!("CA {}", crate::tls::fingerprint(&pem).unwrap_or_else(|_| "unreadable".into())),
         Err(_) => format!("CA made at first serve in {}", dir.display()),
     };
-    Some((true, format!("{} ({}), {ca}, secrets resolved", names.len(), names.join(", "))))
+    let mut detail = format!("{} ({}), {ca}, secrets resolved", names.len(), names.join(", "));
+    for w in native_warnings(&policy, &cfg.tiers) {
+        detail.push_str("; ");
+        detail.push_str(&w);
+    }
+    Some((true, detail))
 }
 
 /// The system roots plus the operator's internal CAs.
@@ -2490,6 +2531,31 @@ mod tests {
         for no in ["env://", "file://", "QAFAS_GH", "f.token", "\"secret\""] {
             assert!(!out.contains(no), "{no} in {out}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The native tier's extra deny list: the state directory and each route's
+    /// `file://` secret, never an `env://` one; and `doctor` warns about a
+    /// secret under `/etc` when the native tier is on.
+    #[test]
+    fn native_sandboxes_are_kept_from_the_state_dir_and_the_secret_files() {
+        let dir = tmp("hidden");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("egress.json");
+        let p = json!({"routes": [
+            {"name": "gh", "hosts": ["github.com"], "secret": "env://QAFAS_GH", "env": "GH_TOKEN"},
+            {"name": "f", "hosts": ["f.example"], "secret": "file:///etc/qafas/f.token", "env": "F_TOKEN"},
+            {"name": "g", "hosts": ["g.example"], "secret": "file:///srv/keys/g.token", "env": "G_TOKEN"}]});
+        std::fs::write(&file, p.to_string()).unwrap();
+        let mut cfg = Config::resolve(crate::config::FileConfig::default());
+        (cfg.policy, cfg.state_dir) = (file.display().to_string(), "/srv/qafas-state".into());
+        assert_eq!(hidden_paths(&cfg), ["/srv/qafas-state", "/etc/qafas/f.token", "/srv/keys/g.token"]);
+
+        let policy: EgressPolicy = serde_json::from_value(p).unwrap();
+        let w = native_warnings(&policy, &["vm".into(), "native".into()]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("WARN route \"f\"") && w[0].contains("/etc"), "{w:?}");
+        assert!(native_warnings(&policy, &["vm".into()]).is_empty(), "no native tier, nothing to warn about");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
