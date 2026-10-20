@@ -515,10 +515,32 @@ fn host_cgroup_dir(jail_id: &str) -> PathBuf {
     PathBuf::from("/sys/fs/cgroup/firecracker").join(jail_id)
 }
 
-/// `rmdir` of a dead VM's jailer cgroup. Empty once the VM is gone, so this is
-/// a no-op error for a live one and the fix for a dir-per-VM leak otherwise.
+/// `rmdir` of a dead VM's jailer cgroup, off the request path. `kill_vm` returns
+/// when the process no longer matches `pgrep`, but the kernel is still tearing it
+/// down (unmapping its guest memory, reaping it) and `rmdir` answers EBUSY until
+/// the cgroup is empty, so a single attempt right after it leaves one empty dir
+/// per destroy behind.
+///
+/// ponytail: ~2 s of polling every 50 ms, one fire-and-forget task per destroy;
+/// a VM that takes longer leaves its (empty) cgroup for the next startup sweep,
+/// which is also what a daemon that exits inside the window gets. Upgrade: wait
+/// on the cgroup's `cgroup.events` (`populated 0`) instead of polling.
 fn remove_host_cgroup(jail_id: &str) {
-    let _ = std::fs::remove_dir(host_cgroup_dir(jail_id));
+    tokio::spawn(remove_dir_within(host_cgroup_dir(jail_id), Duration::from_secs(2)));
+}
+
+/// `rmdir` `dir`, again every 50 ms while it fails, until it is gone (a dir that
+/// was never there counts) or `within` has passed. Whether it is gone.
+async fn remove_dir_within(dir: PathBuf, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        match std::fs::remove_dir(&dir) {
+            Ok(()) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) if Instant::now() >= deadline => return false,
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
 }
 
 fn tap_name(slot: u32) -> String {
@@ -864,6 +886,43 @@ mod tests {
         wait_for(&path, Duration::from_millis(100)).await.unwrap();
         unsafe { libc::close(fd) };
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The cgroup of a VM that is still tearing down refuses `rmdir`; here a file
+    /// in a temp dir stands in for the processes that make it busy. The removal
+    /// has to succeed once that clears, and give up (leaving the dir) at the deadline.
+    #[tokio::test]
+    async fn a_busy_cgroup_is_removed_once_it_empties_and_given_up_at_the_deadline() {
+        let root = std::env::temp_dir().join(format!("sbx-cg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Busy for 150 ms, then empty: removed after that, well before the deadline.
+        let (cg, member) = (root.join("sbx-busy"), root.join("sbx-busy/cgroup.procs"));
+        std::fs::create_dir(&cg).unwrap();
+        std::fs::write(&member, "1\n").unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            std::fs::remove_file(member).unwrap();
+        });
+        let t = Instant::now();
+        assert!(remove_dir_within(cg.clone(), Duration::from_secs(5)).await);
+        assert!(!cg.exists());
+        assert!(t.elapsed() >= Duration::from_millis(150), "it cannot have succeeded while busy");
+        assert!(t.elapsed() < Duration::from_secs(3), "and it stops as soon as it can");
+
+        // Busy for good: gives up at the deadline, not before and not long after.
+        let stuck = root.join("sbx-stuck");
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("cgroup.procs"), "1\n").unwrap();
+        let t = Instant::now();
+        assert!(!remove_dir_within(stuck.clone(), Duration::from_millis(200)).await);
+        assert!(t.elapsed() >= Duration::from_millis(200) && t.elapsed() < Duration::from_secs(2));
+        assert!(stuck.exists());
+
+        // Never there (a VM that never got its cgroup): nothing to wait for.
+        assert!(remove_dir_within(root.join("sbx-none"), Duration::from_secs(5)).await);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Liveness without forking `pgrep`. A pid that is not this jail's VM any
