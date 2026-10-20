@@ -35,6 +35,8 @@ services:
       # What the control plane and clients dial; empty on one machine.
       SBX_PUBLIC_URL: ${SBX_PUBLIC_URL:-}
       SBX_CA_FILE: ${SBX_CA_FILE:-}
+      # The OCI runtime the sandboxes run under, for example runsc (gVisor); empty = the engine's default.
+      SBX_VM_RUNTIME: ${SBX_VM_RUNTIME:-}
     volumes:
       # The host's container runtime runs the sandboxes: Docker's socket by default.
       - ${CONTAINER_SOCK:-/var/run/docker.sock}:/run/qafas/runtime.sock
