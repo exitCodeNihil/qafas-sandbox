@@ -111,9 +111,11 @@ Qafas is its own repository and product. The dashboard's React/astryx scaffold w
 
 
 ## D16 — Three tiers, native first (2026-09-08)
-Local agents from Anthropic and OpenAI use the OS process sandbox (Seatbelt; Landlock/seccomp/bwrap), not containers. We add a `native` tier as the default for trusted workspaces, keep `vm` (podman-in-VM) as the strong local tier and `remote` (Firecracker) for anything untrusted or multi-tenant. Selection is a fixed table (`crates/qafas/src/policy.rs`).
+Local agents from Anthropic and OpenAI use the OS process sandbox (Seatbelt; Landlock/seccomp/bwrap), not containers. We add a `native` tier as the default for trusted workspaces, keep `vm` (containers) as the strong local tier and `remote` (Firecracker) for hostile or multi-tenant workloads. Selection is a fixed table (`crates/qafas/src/policy.rs`).
 
 Revisit if Apple ships a fast VM restore.
+
+Clarified 2026-10-20, what `vm` isolates: the boundary is a VM only where the container engine is itself one, which is macOS (the podman machine). On Linux `vm` is a container on the host's kernel, so code you merely do not trust, run by one team, can go there, but hostile code from several tenants belongs on `remote`. Placement is unchanged (`untrusted` goes to `vm`, then `remote`; a host that can serve both serves only `remote`, D25). `SBX_VM_RUNTIME` lets an operator put a sandboxing OCI runtime (gVisor, Kata) under the vm tier's sandbox containers, never the egress proxy; it is checked against the engine at start and `serve` refuses a name the engine lacks. gVisor is not yet fit for `trust: untrusted` (security.md, Known gaps).
 
 
 ## D17 — One agent-core crate serves both the guest and the native tier

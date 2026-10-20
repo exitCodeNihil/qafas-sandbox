@@ -12,6 +12,20 @@ Last reviewed 2026-10-14, after the escape battery (`tests/escape.mjs`, 20 probe
 
 What stands between a sandboxed process and the host, per tier.
 
+**What each tier isolates, plainly.**
+
+| Tier and host | Between a sandbox and the host | Shared with other sandboxes |
+|---|---|---|
+| `native` (macOS, Linux) | an OS policy (Seatbelt; Landlock, seccomp, bwrap) on the host's own kernel; never for `trust: untrusted` | the host kernel and user |
+| `vm`, macOS | a VM: the container engine is the podman machine, so a kernel exploit from a sandbox lands in that VM, not on the Mac | the VM's kernel |
+| `vm`, Linux, default runtime (`runc`, `crun`) | a container: namespaces, seccomp, no capabilities, read-only root, the internal network. **The kernel is the host's**, so a kernel exploit from a sandbox is a host compromise | the host kernel |
+| `vm`, Linux, `SBX_VM_RUNTIME` = a sandboxing runtime (gVisor `runsc`, Kata) | a user-space kernel (gVisor) or a VM per sandbox (Kata) in front of the host kernel; see the gVisor gaps under Known gaps | gVisor: the host kernel, reached only through the sentry's narrow syscall surface; Kata: nothing |
+| `remote` (Linux, KVM) | a Firecracker microVM with its own kernel, under the jailer (M30) | nothing: one microVM per sandbox |
+
+Hostile code from several tenants belongs on `remote`. Placement (`policy.rs`) is unchanged by any of this: it never sends `untrusted` to `native`, prefers `vm` and then `remote` for it, and a host that can serve both serves only `remote` (D25).
+
+**`vm` sandbox runtime (`SBX_VM_RUNTIME`, `vm_runtime`).** The OCI runtime the vm tier's *sandbox* containers run under, in libpod's `oci_runtime` or Docker's `HostConfig.Runtime`; empty is the engine's default. The egress proxy container always keeps the default. `qafas doctor` prints a `vm runtime` line (engine, runtime, "shared host kernel" or "sandboxed (gVisor/Kata)", and on macOS that the engine is a VM) and fails when the engine does not have the name; `qafas serve` refuses to start then, rather than run under the default. Neither engine lists what it can start: Docker is checked against `/info` `Runtimes`, and podman by creating (never starting) a probe container with the runtime and reading back which one it recorded, because podman applies `oci_runtime` only from 6.0 (5.6.2 verified live, 5.8 and 6.0 read from source; 5.x ignores it without an error, so on older podman the check fails and the runtime is set as the engine default in `containers.conf` instead). Status: **in place** (tests: runtime in the libpod and Docker sandbox specs, absent when empty, absent from the proxy spec; the probe against fake podman 5 and 6 and Docker engines; the classification). Live: Docker 29.1.3 with gVisor release-20261012.0 (systrap) on Ubuntu 24.04 aarch64, and the Mac podman machine (5.6.2) for the refusal. Where: `crates/qafas/src/backend/podman.rs` `libpod_spec`, `docker_spec`, `runtime_status`; `crates/qafas/src/doctor.rs`.
+
 | # | Control | Status | Where |
 |---|---|---|---|
 | M1 | VM boundary for remote/multi-tenant | planned (Gate E) | firecracker backend + jailer |
@@ -122,4 +136,5 @@ Stated plainly:
 - The workspace is live on both local tiers, so sandboxed code can write files the host later executes (M11 detects the common paths, does not prevent).
 - No TLS termination so no credential injection.
 - The native tier shares the host kernel (Seatbelt and Landlock are policy boundaries, not virtualisation boundaries — that is why untrusted workspaces never get it).
-- The podman backend shares one VM kernel across concurrent local sandboxes.
+- The `vm` tier's sandboxes share one kernel, and whose it is depends on the host. On macOS it is the podman machine VM's: a VM boundary from the Mac, none between concurrent sandboxes. On Linux it is the host's own kernel (a container boundary, not a VM) unless `SBX_VM_RUNTIME` names gVisor or Kata. Hostile code from several tenants belongs on the `remote` tier.
+- **`vm` under gVisor (`SBX_VM_RUNTIME=runsc`) is not yet fit for `trust: untrusted`.** The escape battery on Docker 29.1.3, gVisor release-20261012.0 (systrap), Ubuntu 24.04 aarch64 (2026-10-20): 17 of 20 probes contained and every probe that must alert did (the seccomp deny-list kills with SIGSYS and raises `seccomp.violation`; the `/proc` sweep reports processes with their argv, with some duplicate entries for one exec; egress through the proxy and the workspace mount work). Two probes failed, and the last one had no sandbox left to run in (rerun alone: contained), while the same battery on `runc` passes 20 of 20. (1) **`/proc/1/environ` exposes `SBX_AGENT_TOKEN`:** gVisor reports `env_start`/`env_end` as 0 in `/proc/self/stat`, so the guest agent's in-place scrub (`agent_core::scrub_initial_env`) does nothing; the template scan grades `base` F (`pid1_environ`) and a `trust: untrusted` create answers `409`. The token guards the agent port against peers, and the sandboxed code shares the agent's uid, so it gains no new capability, but the control is not met. (2) **`kill -9 1` from inside ends the sandbox:** the guest agent is PID 1 and gVisor lets a sandboxed process kill it (a kernel pid namespace drops that signal), so a command can terminate its own sandbox; it is a denial of service against itself, not an escape. Not covered: the browser, stop/start, `docker update` limits under load (accepted, enforcement not measured), Kata.
