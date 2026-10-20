@@ -70,8 +70,10 @@ pub async fn run_checks(cfg: &Config) -> Vec<Check> {
             "landlock",
             abi >= 2,
             match abi {
-                a if a >= 4 => format!("ABI v{a}: filesystem and network rules"),
-                a if a >= 2 => format!("ABI v{a}: filesystem only, network falls back to --unshare-net"),
+                // The network namespace (bwrap --unshare-net) confines the network on
+                // both; Landlock ABI 4 adds the one-port connect rule on top.
+                a if a >= 4 => format!("ABI v{a}: filesystem and network rules, own network namespace"),
+                a if a >= 2 => format!("ABI v{a}: filesystem only; network confined by its own network namespace"),
                 _ => "unsupported kernel".into(),
             },
         ));
