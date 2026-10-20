@@ -8,7 +8,7 @@ Needs Rust 1.89.
 
 ```toml
 [dependencies]
-qafas-sandbox = "0.3.2"  # x-release-please-version
+qafas-sandbox = "0.4.0"  # x-release-please-version
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

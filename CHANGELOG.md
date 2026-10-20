@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.4.0](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.3.2...v0.4.0) (2026-10-20)
+
+
+### Features
+
+* **agent:** POST /ca and Chromium trust for the egress CA ([41ad09a](https://github.com/exitCodeNihil/qafas-sandbox/commit/41ad09aec59e043ed713c86ee76e7fd97e90a33e))
+* **egress:** terminate TLS for route hosts, swap credentials, L7 rules ([0c339ef](https://github.com/exitCodeNihil/qafas-sandbox/commit/0c339efaa25c6357815fba307bc42482e2057a67))
+* **proto:** add egress routes for credential injection and L7 rules ([8a1d547](https://github.com/exitCodeNihil/qafas-sandbox/commit/8a1d547024117d7feac9c75e110d664fd09f81d1))
+* **vm:** choose the OCI runtime for vm sandboxes ([b9a622d](https://github.com/exitCodeNihil/qafas-sandbox/commit/b9a622d5bc578096e81e3011a82112c2bdbeddd2))
+
+
+### Bug Fixes
+
+* **doctor:** keep log lines out of doctor --json stdout ([0dd8fa2](https://github.com/exitCodeNihil/qafas-sandbox/commit/0dd8fa29db6582684b9cf3bf472281968877b3d2))
+* **egress:** allow a route host wildcard only as a whole leftmost label ([21a2ec9](https://github.com/exitCodeNihil/qafas-sandbox/commit/21a2ec9545e2190255eee02eedfd2a0d7a21010c))
+* **egress:** answer 400 for a target with no origin form, not send / ([e3ec009](https://github.com/exitCodeNihil/qafas-sandbox/commit/e3ec0093c80acc716c56a8d41b824beee58a1efb))
+* **egress:** attribute egress events to the tool call ([fa8d954](https://github.com/exitCodeNihil/qafas-sandbox/commit/fa8d954dea09e443cbe139f88beadc204aff690a))
+* **egress:** drop method overrides on rule routes, ranges on secret ones ([e8e5265](https://github.com/exitCodeNihil/qafas-sandbox/commit/e8e5265e82891a5fdd65c9aa4e98fc23e0ced466))
+* **egress:** emit egress.deny when the upstream connect fails ([63eb1c6](https://github.com/exitCodeNihil/qafas-sandbox/commit/63eb1c664c50e9649d82a3220f9f461fcdfc9861))
+* **egress:** honour egress_allow on the vm and remote tiers ([4139323](https://github.com/exitCodeNihil/qafas-sandbox/commit/41393238ef86ec4813a79847f1f8562b95e4d98f))
+* **egress:** keep the egress proxy serving through accept errors ([29768cb](https://github.com/exitCodeNihil/qafas-sandbox/commit/29768cb5a606de898fc96d0f494d4a7e4acca8b0))
+* **egress:** keep TLS bytes sent right behind a CONNECT to a route host ([c7a3c87](https://github.com/exitCodeNihil/qafas-sandbox/commit/c7a3c878862552d8c05c13f0c98358a2fdfe33fc))
+* **egress:** pass bytes sent behind CONNECT into the blind tunnel ([e852df6](https://github.com/exitCodeNihil/qafas-sandbox/commit/e852df6ac37e4c3b159b071828c63ec89fa266b0))
+* **egress:** read every content and transfer coding before scrubbing ([f5c3bc2](https://github.com/exitCodeNihil/qafas-sandbox/commit/f5c3bc26cecf079a4c08beef7076436eff572302))
+* **egress:** refuse a route host when the peer lookup fails ([305aeea](https://github.com/exitCodeNihil/qafas-sandbox/commit/305aeea04224615e12dea2bc2d505626e899c0e8))
+* **egress:** refuse double-encoded and non-UTF-8 paths on rule routes ([92cd5a1](https://github.com/exitCodeNihil/qafas-sandbox/commit/92cd5a17f9e901216e3de7d5b22e4b374ebfe579))
+* **egress:** refuse IPv4 hidden in NAT64, 6to4 and Teredo addresses ([3a04da4](https://github.com/exitCodeNihil/qafas-sandbox/commit/3a04da403f640866cd908f440e64353dbaf64d62))
+* **egress:** refuse routes whose hosts, ports and trust overlap ([7f27f83](https://github.com/exitCodeNihil/qafas-sandbox/commit/7f27f831e223e749bcb97b5e87e0339ca91c4142))
+* **egress:** relay only a websocket upgrade on a route tunnel ([c34137e](https://github.com/exitCodeNihil/qafas-sandbox/commit/c34137ea9acd0f5d9af90569d1e6e5eca682a2a1))
+* **egress:** send the canonical reason phrase, never the upstream's ([dc92732](https://github.com/exitCodeNihil/qafas-sandbox/commit/dc927329ae42473c1b54d7ef7dc3335acae8eb3d))
+* **guest:** drain the log queue before the agent exits ([4b6648f](https://github.com/exitCodeNihil/qafas-sandbox/commit/4b6648fc9668621ea0107021050b4f5aa7b445e8))
+* **guest:** keep a stalled console from blocking the agent ([11ac15e](https://github.com/exitCodeNihil/qafas-sandbox/commit/11ac15eb4fd6cadb4cc5587f5c3b0e4f7109aa39))
+* **guest:** keep the agent token out of /proc/1/environ on gVisor ([9de25f5](https://github.com/exitCodeNihil/qafas-sandbox/commit/9de25f565c272e65df203db0868695d87b121e2c))
+* **native:** hide the daemon's state directory from native sandboxes ([200f7ea](https://github.com/exitCodeNihil/qafas-sandbox/commit/200f7ea52be265a6e2e99358c7a5a40a1325d6fe))
+* **native:** hide the state dir and route secret files from sandboxes ([d5c933a](https://github.com/exitCodeNihil/qafas-sandbox/commit/d5c933aee40d7223e842f0fc8de016112a49fc2f))
+* **native:** keep the proxy bridge and relay up through accept errors ([ddc6fae](https://github.com/exitCodeNihil/qafas-sandbox/commit/ddc6fae792638590bab5b1e538c408685f60d587))
+* **native:** let a private-netns sandbox use its own loopback ([a01b0c2](https://github.com/exitCodeNihil/qafas-sandbox/commit/a01b0c219da439f08efd21e81494128e7a0dc056))
+* **native:** let Linux native commands reach their own egress proxy ([794aebd](https://github.com/exitCodeNihil/qafas-sandbox/commit/794aebdb1ca76218e6e964d3750496225ad15310))
+* **native:** remove a failed create's scratch and name the ns limit ([b737289](https://github.com/exitCodeNihil/qafas-sandbox/commit/b73728976660dbde7317ee09eba3684f1ab77497))
+* **native:** run Linux native sandboxes in a private network namespace ([e74c353](https://github.com/exitCodeNihil/qafas-sandbox/commit/e74c353b780dd5e3827f683837c13013ad0254eb))
+* **preview:** decode the percent-encoded colon in a query token ([f8fcee3](https://github.com/exitCodeNihil/qafas-sandbox/commit/f8fcee3a4734385cd14f8c71ca71c085f64fcb2c))
+* **preview:** reach Linux native dev servers through the shim ([cef1d27](https://github.com/exitCodeNihil/qafas-sandbox/commit/cef1d279878064b36992c1a2a552aeb003785c5a))
+* **remote:** give every snapshot clone its own randomness ([98fc031](https://github.com/exitCodeNihil/qafas-sandbox/commit/98fc03118fb4d10d9c1c55bfb791c3a3fbe79fa1))
+* **remote:** keep the argv of processes that exit before /proc is read ([7c07537](https://github.com/exitCodeNihil/qafas-sandbox/commit/7c07537c1fc3068783f3edde71f4c7522af398d9))
+* **remote:** post /restored once per restore ([45c92fa](https://github.com/exitCodeNihil/qafas-sandbox/commit/45c92fad7edd752cd02fa5f597955be2d969ddef))
+* **remote:** remove leftover cgroups at sweep and on failed create ([db40a64](https://github.com/exitCodeNihil/qafas-sandbox/commit/db40a6420c9a91e01db6a94f13caefc6778fc0aa))
+* **remote:** remove the firecracker cgroup once the VM is gone ([e65c8d2](https://github.com/exitCodeNihil/qafas-sandbox/commit/e65c8d22a7f4fe330d97819e7c77ef4b0752df22))
+* **remote:** report a microVM ready only once bpftrace is attached ([fbd1b32](https://github.com/exitCodeNihil/qafas-sandbox/commit/fbd1b32a839e2556edd3e0bd36d5eb0d4d9a7e6c))
+* **shutdown:** stop waiting for a booting guest and bound the exit ([91d2eb0](https://github.com/exitCodeNihil/qafas-sandbox/commit/91d2eb0f1191e4351727152b6c2261d3672bb3db))
+
 ## [0.3.2](https://github.com/exitCodeNihil/qafas-sandbox/compare/v0.3.1...v0.3.2) (2026-10-16)
 
 
