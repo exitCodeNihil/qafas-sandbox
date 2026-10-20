@@ -1096,6 +1096,9 @@ impl Conn {
                 return text(StatusCode::BAD_GATEWAY, "upstream unavailable");
             }
         };
+        // hyper keeps a non-canonical reason phrase and would send it on as it
+        // came, past the header scrubber: the client gets the canonical one.
+        resp.extensions_mut().remove::<hyper::ext::ReasonPhrase>();
 
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS && !only_websocket(resp.headers()) {
             self.deny(data, started, "upstream switched to a protocol other than websocket").await;
@@ -1497,6 +1500,12 @@ mod tests {
                 r.headers_mut().insert(header::LOCATION, HeaderValue::from_str(&loc).unwrap());
                 r
             }
+            "/reason" => {
+                let auth = String::from_utf8_lossy(req.headers()[header::AUTHORIZATION].as_bytes()).into_owned();
+                let mut r = Response::new(full(String::new()));
+                r.extensions_mut().insert(hyper::ext::ReasonPhrase::try_from(format!("OK {auth}")).unwrap());
+                r
+            }
             "/gzip" => {
                 let mut r = Response::new(full(dump));
                 r.headers_mut().insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
@@ -1842,6 +1851,21 @@ mod tests {
             (evs[0].0, evs[0].1["reason"].as_str()),
             (EventType::EgressDeny, Some("encoded response cannot be scrubbed"))
         );
+    }
+
+    /// A reason phrase is not a header, so the header scrubber never sees it:
+    /// the client gets the canonical one, whatever the upstream wrote.
+    #[tokio::test]
+    async fn a_secret_in_the_reason_phrase_does_not_come_back() {
+        let h = harness("reason", vec![def(github(), SECRET)]).await;
+        let ph = h.ic.routes[0].placeholder.clone().unwrap();
+        let mut c = open(&h, HOST).await.unwrap();
+        let q = req("GET", "/reason").header("authorization", format!("Bearer {ph}")).body(Full::new(Bytes::new()));
+        let resp = c.send_request(q.unwrap()).await.unwrap();
+        assert_eq!(upstream_saw(&h, 0, "authorization"), [format!("Bearer {SECRET}")], "the upstream had it");
+        assert_eq!(resp.status(), 200);
+        let phrase = resp.extensions().get::<hyper::ext::ReasonPhrase>().map(|p| p.as_bytes().to_vec());
+        assert!(phrase.is_none(), "{:?}", phrase.as_deref().map(String::from_utf8_lossy));
     }
 
     /// Every Content-Encoding value is read, not the first, and a transfer
