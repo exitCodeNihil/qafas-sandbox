@@ -17,14 +17,10 @@ fn profile_dir() -> std::path::PathBuf {
     std::path::Path::new(&crate::limits::scratch_dir()).join("chrome")
 }
 
-fn spawn_chromium(ctx: &Ctx) -> std::io::Result<()> {
-    let profile = profile_dir();
-    // A leftover DevToolsActivePort would otherwise be read as this launch's.
-    let _ = std::fs::remove_dir_all(&profile);
-    // The Spawner decides the confinement: `pre_exec` hardening without seccomp
-    // in a VM (D8), the OS sandbox wrapper on the native tier.
-    let mut c = ctx.spawner.helper("chrome-headless-shell");
-    c.args([
+/// Chromium's command line. Never `--single-process`, never a blanket
+/// `--ignore-certificate-errors`.
+fn chromium_args(ctx: &Ctx, profile: &std::path::Path) -> Vec<String> {
+    let mut a: Vec<String> = [
         "--headless",
         // 0: the kernel picks, Chromium writes it to DevToolsActivePort. No
         // port to collide over and no bind/launch race to lose.
@@ -33,16 +29,37 @@ fn spawn_chromium(ctx: &Ctx) -> std::io::Result<()> {
         "--disable-gpu",
         "--disable-dev-shm-usage",
         "--no-first-run",
-    ]);
-    c.arg(format!("--user-data-dir={}", profile.display()));
+    ]
+    .map(String::from)
+    .into();
+    a.push(format!("--user-data-dir={}", profile.display()));
     if let Ok(p) = std::env::var("HTTP_PROXY") {
-        c.arg(format!("--proxy-server={p}"));
+        a.push(format!("--proxy-server={p}"));
+    }
+    // D34: the egress proxy's CA, by its key's hash, for route hosts. Chromium
+    // reads no CA file; this trusts exactly certificates chained to that key.
+    // The sandbox's env (`PUT /workspace`) on the vm and remote tiers, the
+    // shim's own on the native one.
+    let spki = ctx.env.read().unwrap().get("SBX_CA_SPKI").cloned().or_else(|| std::env::var("SBX_CA_SPKI").ok());
+    if let Some(s) = spki.filter(|s| !s.is_empty()) {
+        a.push(format!("--ignore-certificate-errors-spki-list={s}"));
     }
     // The container/VM is already the boundary, and the container denies user
     // namespaces, so Chromium's own userns sandbox cannot start (D12).
     if std::env::var("SBX_CHROME_NO_SANDBOX").as_deref() == Ok("1") {
-        c.arg("--no-sandbox");
+        a.push("--no-sandbox".into());
     }
+    a
+}
+
+fn spawn_chromium(ctx: &Ctx) -> std::io::Result<()> {
+    let profile = profile_dir();
+    // A leftover DevToolsActivePort would otherwise be read as this launch's.
+    let _ = std::fs::remove_dir_all(&profile);
+    // The Spawner decides the confinement: `pre_exec` hardening without seccomp
+    // in a VM (D8), the OS sandbox wrapper on the native tier.
+    let mut c = ctx.spawner.helper("chrome-headless-shell");
+    c.args(chromium_args(ctx, &profile));
     c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let child = c.spawn()?;
     tracing::info!(pid = child.id(), "chromium launched");
@@ -102,4 +119,27 @@ pub async fn cdp(ctx: Arc<Ctx>, socket: WebSocket) {
     };
     // Same shuttling as a preview upgrade, one hop further in.
     crate::proxy::relay(socket, upstream).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D34: with the sandbox's `SBX_CA_SPKI` set, Chromium trusts that key and
+    /// nothing wider; without it, the command line is what it was.
+    #[test]
+    fn the_egress_ca_is_trusted_by_its_key_and_nothing_wider() {
+        let ctx = Ctx::new(
+            crate::spawn::Hardened::default(),
+            crate::Emitter::null(),
+            crate::rules::Rules::guest("/tmp", "/tmp/nohome"),
+        );
+        let p = std::path::Path::new("/tmp/chrome");
+        let before = chromium_args(&ctx, p);
+        assert!(!before.iter().any(|a| a.contains("ignore-certificate-errors")), "{before:?}");
+        ctx.env.write().unwrap().insert("SBX_CA_SPKI".into(), "q1w2e3r4t5y6u7i8o9p0==".into());
+        let after = chromium_args(&ctx, p);
+        assert!(after.contains(&"--ignore-certificate-errors-spki-list=q1w2e3r4t5y6u7i8o9p0==".to_string()));
+        assert!(!after.iter().any(|a| a == "--ignore-certificate-errors" || a == "--single-process"), "{after:?}");
+    }
 }

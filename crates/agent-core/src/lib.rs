@@ -7,6 +7,7 @@
 //! above that is identical, which is why the harness cannot tell tiers apart.
 
 pub mod browser;
+pub mod ca;
 pub mod exec;
 pub mod fs;
 pub mod limits;
@@ -556,6 +557,8 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
         .route("/fs/mkdir", post(mkdir))
         .route("/fs/tar", get(fs::tar_get).put(fs::tar_put).layer(DefaultBodyLimit::max(max_upload_bytes())))
         .route("/workspace", put(set_workspace))
+        // v5.4 (D34): the egress proxy's CA, for the sandbox's TLS clients.
+        .route("/ca", post(ca::handler))
         .route("/processes", get(processes))
         // v5 sizes and limits (protocol §3a).
         .route("/limits", put(set_limits))
