@@ -37,9 +37,17 @@ fn chromium_args(ctx: &Ctx, profile: &std::path::Path) -> Vec<String> {
         a.push(format!("--proxy-server={p}"));
     }
     // D34: the egress proxy's CA, by its key's hash, for route hosts. Chromium
-    // reads no CA file; this trusts exactly certificates chained to that key.
-    // The sandbox's env (`PUT /workspace`) on the vm and remote tiers, the
-    // shim's own on the native one.
+    // reads no CA file. The sandbox's env (`PUT /workspace`) on the vm and
+    // remote tiers, the shim's own on the native one.
+    // ponytail: Chromium matches the hash against every certificate a server
+    // presents, not only the issuer of its leaf (checked 2026-10-20 with
+    // chrome-headless-shell 151 and Chrome 155: a self-signed leaf with the CA
+    // certificate appended loads). So this browser accepts any server that
+    // sends the CA certificate along, which the sandbox can already read.
+    // Upgrade: `libnss3-tools` in the image and `certutil -A -t C,,` into
+    // `$HOME/.pki/nssdb` at launch on Linux, so the CA is a root and the leaf
+    // must chain to it; the macOS native tier has no equivalent short of the
+    // user's keychain.
     let spki = ctx.env.read().unwrap().get("SBX_CA_SPKI").cloned().or_else(|| std::env::var("SBX_CA_SPKI").ok());
     if let Some(s) = spki.filter(|s| !s.is_empty()) {
         a.push(format!("--ignore-certificate-errors-spki-list={s}"));
