@@ -135,11 +135,51 @@ fn make_scratch(scratch: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(scratch.join("tmp"))
 }
 
+/// Whether an `accept` error means the listener itself is finished: its
+/// descriptor is closed or is not a listening socket. Anything else (EMFILE and
+/// ENFILE when descriptors run out, ECONNABORTED when a client left before it
+/// was accepted, EINTR, EAGAIN, ENOBUFS, ENOMEM) says something about this
+/// moment, not about the listener, and the next `accept` can succeed.
+pub(crate) fn listener_is_gone(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EFAULT))
+}
+
+/// One `accept` result in a loop that must keep serving: the connection, or
+/// `None` after a warning and a short pause (so a descriptor shortage is not a
+/// busy loop that fills the log), and `Err` only when `listener_is_gone`. With a
+/// bare `?` the first EMFILE ended the loop, and for the per-sandbox bridge that
+/// stopped the sandbox's whole egress proxy until it was recreated.
+///
+/// ponytail: a flat 100 ms pause and no rate limit on the warning, so a long
+/// shortage logs ten lines a second. Upgrade: back off exponentially, as hyper's
+/// own accept loop does.
+pub(crate) async fn survive_accept<T>(r: std::io::Result<T>, what: &str) -> std::io::Result<Option<T>> {
+    match r {
+        Ok(c) => Ok(Some(c)),
+        Err(e) if listener_is_gone(&e) => Err(e),
+        Err(e) => {
+            tracing::warn!(error = %e, what, "accept failed; still serving");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(None)
+        }
+    }
+}
+
 /// M46, the daemon's end of the shim's relay: every connection on
 /// `proxy.sock` is bridged to this sandbox's egress proxy on `127.0.0.1:port`.
 async fn bridge_to(l: tokio::net::UnixListener, port: u16) -> std::io::Result<()> {
+    bridge_accepting(|| l.accept(), port).await
+}
+
+/// `bridge_to` over any source of accepted streams, so the loop's reaction to a
+/// failing `accept` can be tested without making the kernel fail one.
+async fn bridge_accepting<F, Fut, A>(mut accept: F, port: u16) -> std::io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<(tokio::net::UnixStream, A)>>,
+{
     loop {
-        let (mut from, _) = l.accept().await?;
+        let Some((mut from, _)) = survive_accept(accept().await, "proxy.sock bridge").await? else { continue };
         tokio::spawn(async move {
             let Ok(mut to) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return };
             let _ = to.set_nodelay(true);
@@ -986,6 +1026,80 @@ mod tests {
         assert_eq!(last.split(' ').nth(1).and_then(|s| s.parse::<u64>().ok()), agent_core::procmon::start_secs(me),);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Out of descriptors, a client that left before it was accepted, a signal:
+    /// all of them are about this moment. Only a listener that is closed or not
+    /// a listener is finished.
+    #[test]
+    fn only_a_dead_listener_ends_an_accept_loop() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EINTR, libc::EAGAIN, libc::ENOBUFS] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(!listener_is_gone(&e), "{e} is transient");
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(listener_is_gone(&e), "{e} means there is no listener");
+        }
+        assert!(!listener_is_gone(&std::io::Error::other("no errno")));
+    }
+
+    #[tokio::test]
+    async fn a_transient_accept_error_costs_a_pause_not_the_loop() {
+        let t = std::time::Instant::now();
+        assert_eq!(survive_accept(Ok(7), "t").await.unwrap(), Some(7));
+        assert!(t.elapsed() < std::time::Duration::from_millis(50), "a connection costs nothing");
+
+        let t = std::time::Instant::now();
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert_eq!(survive_accept::<u8>(Err(emfile), "t").await.unwrap(), None);
+        assert!(t.elapsed() >= std::time::Duration::from_millis(90), "a pause, so a shortage is not a busy loop");
+
+        let gone = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert!(survive_accept::<u8>(Err(gone), "t").await.is_err());
+    }
+
+    /// The per-sandbox bridge shares a `select!` with the egress proxy: when it
+    /// returned on the first EMFILE, that sandbox lost its proxy for good. Here
+    /// the accept fails twice and then delivers a connection, which must still
+    /// reach the proxy port.
+    #[tokio::test]
+    async fn the_bridge_keeps_serving_after_accept_fails() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let (mut shim, daemon_end) = tokio::net::UnixStream::pair().unwrap();
+        let mut script: std::collections::VecDeque<std::io::Result<tokio::net::UnixStream>> = [
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            Err(std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            Ok(daemon_end),
+        ]
+        .into();
+        let accept = move || {
+            let next = script.pop_front();
+            async move {
+                match next {
+                    Some(r) => r.map(|s| (s, ())),
+                    None => std::future::pending().await,
+                }
+            }
+        };
+        let bridge = tokio::spawn(super::bridge_accepting(accept, port));
+
+        let exchange = async {
+            shim.write_all(b"CONNECT").await.unwrap();
+            let (mut far, _) = proxy.accept().await.unwrap();
+            let mut got = [0u8; 7];
+            far.read_exact(&mut got).await.unwrap();
+            got
+        };
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+            .await
+            .expect("the bridge stopped serving after a failed accept");
+        assert_eq!(&got, b"CONNECT");
+        assert!(!bridge.is_finished(), "and it is still looping");
+        bridge.abort();
     }
 
     #[test]
