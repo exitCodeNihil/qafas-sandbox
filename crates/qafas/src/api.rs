@@ -61,6 +61,11 @@ pub struct Live {
     pub max_age_secs: Option<u64>,
     /// v4. `POST /sandboxes {env}`, kept so a wake can hand it to the guest again.
     pub env: BTreeMap<String, String>,
+    /// v2 `egress_allow` and `trust` from the create request. The shared egress
+    /// proxies (vm, remote) read them per peer address (`peer_lookup`): this
+    /// entry, not the pool's, is what a warm sandbox handed out is held to.
+    pub egress_allow: Vec<String>,
+    pub trust: proto::Trust,
     /// v4. Highest multiple of `SBX_LONG_RUNNING_SECS` already alerted on, so
     /// the rule fires once per multiple rather than every 5 s.
     pub long_running_fired: std::sync::atomic::AtomicU64,
@@ -247,6 +252,8 @@ impl AppState {
             auto_delete_secs: rec.auto_delete_secs,
             max_age_secs: rec.max_age_secs,
             env: rec.env.clone(),
+            egress_allow: rec.egress_allow.clone(),
+            trust: rec.trust,
             long_running_fired: Default::default(),
             events_gen: Default::default(),
             // v5 §3a: a record from a pre-v5 daemon has no size, so it comes
@@ -278,6 +285,19 @@ impl AppState {
         if let Some(l) = self.live.lock().await.get(id) {
             l.last_activity.store(now_ms(), Ordering::Relaxed);
         }
+    }
+
+    /// The shared proxies' view of one peer address (`proxy::PeerLookup`). A
+    /// stopped container's address can already be a new one's, so only a
+    /// running sandbox answers for it. Linux only outside the tests: the remote
+    /// tier's in-process proxy is its one caller.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn peer_lookup(&self) -> crate::proxy::PeerLookup {
+        let live = self.live.clone();
+        Arc::new(move |ip| {
+            let live = live.clone();
+            Box::pin(async move { peer_of(&*live.lock().await, ip) })
+        })
     }
 }
 
@@ -376,6 +396,7 @@ pub fn router(state: AppState) -> Router {
         .route("/preview/{id}/{port}/{*rest}", any(preview_proxy))
         .route("/events/ws", get(events_ws))
         .route("/internal/events", post(internal_events))
+        .route("/internal/egress/peer", get(internal_peer))
         .fallback(|| async { (StatusCode::NOT_FOUND, "no such route") })
         .with_state(state)
 }
@@ -750,6 +771,8 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         state: std::sync::Mutex::new((SandboxState::Ready, now_ms())),
         op: Mutex::new(()),
         env: req.env,
+        egress_allow: req.egress_allow,
+        trust: req.trust,
         long_running_fired: Default::default(),
         events_gen: Default::default(),
         size,
@@ -1543,6 +1566,30 @@ async fn internal_events(State(st): State<AppState>, auth: Auth, Json(evs): Json
         let _ = st.bus.send(ev);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// The running sandbox at `ip`, as the shared egress proxies need it.
+fn peer_of(live: &HashMap<String, Arc<Live>>, ip: std::net::IpAddr) -> Option<crate::proxy::PeerInfo> {
+    live.values()
+        .find(|l| l.sb.peer_ip == Some(ip) && l.running())
+        .map(|l| crate::proxy::PeerInfo { egress_allow: l.egress_allow.clone(), trust: l.trust })
+}
+
+/// `GET /internal/egress/peer?ip=`: the proxy container's half of
+/// `peer_lookup`, on the same admin token as `/internal/events`. 404 for an
+/// address no running sandbox has.
+async fn internal_peer(State(st): State<AppState>, auth: Auth, uri: Uri) -> Response {
+    if !auth.admin {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let ip = uri.query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("ip=")).and_then(|v| v.parse().ok());
+    let Some(ip) = ip else {
+        return (StatusCode::BAD_REQUEST, "ip= must be an address").into_response();
+    };
+    match peer_of(&*st.live.lock().await, ip) {
+        Some(p) => Json(p).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn events_ws(State(st): State<AppState>, a: Auth, ws: WebSocketUpgrade) -> Response {
@@ -2564,6 +2611,8 @@ mod tests {
             enforcement: "kernel".into(),
             usage: Default::default(),
             env: Default::default(),
+            egress_allow: Vec::new(),
+            trust: proto::Trust::Trusted,
             long_running_fired: Default::default(),
             events_gen: Default::default(),
             state: std::sync::Mutex::new((SandboxState::Ready, now_ms())),
@@ -2725,6 +2774,52 @@ mod tests {
         let unknown = rx.try_recv().expect("an unknown peer still reaches the bus");
         assert_eq!(unknown.sandbox_id, "");
         assert_eq!(unknown.pi_session, "");
+    }
+
+    /// E1: the shared proxies learn a sandbox's own names from the live table —
+    /// in process on the remote tier, over `/internal/egress/peer` from the
+    /// proxy container — and only for a running sandbox, only with the admin
+    /// token. A re-adopted record keeps them.
+    #[tokio::test]
+    async fn the_shared_proxies_learn_a_sandboxs_names_from_the_daemon() {
+        let st = state_with("api-peer", Caps::default(), Arc::new(Parkable));
+        let base = live_for(&st, "sbx_pa").await;
+        let rec = crate::livetable::LiveRecord {
+            egress_allow: vec!["only-a.example".into()],
+            trust: proto::Trust::Untrusted,
+            peer_ip: "10.89.0.2".parse().ok(),
+            ..crate::livetable::LiveRecord::from(&*base)
+        };
+        assert!(st.adopt(&rec, st.pool.backend().clone()).await);
+        let again = crate::livetable::LiveRecord::from(&*st.live_get("sbx_pa").await.unwrap());
+        assert_eq!((&again.egress_allow, again.trust), (&rec.egress_allow, rec.trust), "the next write keeps them");
+        live_at(&st, "sbx_pb", Connector::Tcp("127.0.0.1:1".parse().unwrap()), None, Some("10.89.0.3"), "").await;
+        let want = |allow: &[&str], trust| {
+            Some(crate::proxy::PeerInfo { egress_allow: allow.iter().map(|s| s.to_string()).collect(), trust })
+        };
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+
+        let direct = st.peer_lookup();
+        assert_eq!(direct(ip("10.89.0.2")).await, want(&["only-a.example"], proto::Trust::Untrusted));
+        assert_eq!(direct(ip("10.89.0.3")).await, want(&[], proto::Trust::Trusted));
+        assert_eq!(direct(ip("10.89.0.9")).await, None);
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink = format!("http://{}/internal/events", l.local_addr().unwrap());
+        let app = router(st.clone());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let http = |tok: &str| crate::proxy::http_peer(&sink, crate::events::http_client(), tok.into()).unwrap();
+        let admin = http(&st.cfg.token);
+        assert_eq!(admin(ip("10.89.0.2")).await, want(&["only-a.example"], proto::Trust::Untrusted));
+        assert_eq!(admin(ip("10.89.0.9")).await, None, "an address nobody has");
+        let scoped = hmac_token::mint(&st.cfg.token, "sbx_pa", (now_ms() / 1000) as u64 + 60);
+        assert_eq!(http(&scoped)(ip("10.89.0.2")).await, None, "a sandbox's own token cannot ask");
+        assert_eq!(http("nope")(ip("10.89.0.2")).await, None);
+
+        // A stopped container's address may already be someone else's.
+        st.live_get("sbx_pa").await.unwrap().set_state(SandboxState::Stopped);
+        assert_eq!(admin(ip("10.89.0.2")).await, None);
+        let _ = std::fs::remove_dir_all(&st.cfg.state_dir);
     }
 
     /// v4d: the flag that resurrects a sandbox is never inferred from one.

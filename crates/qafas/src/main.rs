@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
             }
             // The daemon's own certificate, when its API (and so the sink) is TLS.
             let sink_ca = std::env::var("SBX_SINK_CA").ok().filter(|p| !p.is_empty()).map(String::into_bytes);
-            proxy::run(listen, &cfg.policy, sink, sink_ca, cfg.token.clone(), cfg.host_id.clone()).await
+            proxy::run(listen, &cfg.policy, sink, sink_ca, cfg.token.clone(), cfg.host_id.clone(), None).await
         }
         Cmd::Doctor { json } => doctor::run(cfg, json).await,
         Cmd::Shim { .. } => unreachable!("handled above"),
@@ -295,9 +295,11 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
         let (policy, token, host_id) = (cfg.policy.clone(), cfg.token.clone(), cfg.host_id.clone());
         let sink = format!("{}://127.0.0.1:{}/internal/events", cfg.scheme(), cfg.listen.port());
         let sink_ca = tls.as_ref().map(|t| t.cert_pem.clone());
+        // Per-sandbox `egress_allow` straight from the live table: same process.
+        let peer = Some(state.peer_lookup());
         tokio::spawn(async move {
             let listen = SocketAddr::from(([0, 0, 0, 0], proto::EGRESS_PROXY_PORT));
-            if let Err(e) = proxy::run(listen, &policy, Some(sink), sink_ca, token, host_id).await {
+            if let Err(e) = proxy::run(listen, &policy, Some(sink), sink_ca, token, host_id, peer).await {
                 tracing::error!(error = %e, "in-process egress proxy died");
             }
         });

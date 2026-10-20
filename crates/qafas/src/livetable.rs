@@ -65,6 +65,17 @@ pub struct LiveRecord {
     pub size: String,
     #[serde(default)]
     pub limits: Option<proto::SandboxLimits>,
+    /// What the shared egress proxies hold a re-adopted sandbox to. A record
+    /// written before they were kept comes back with no extra names and as
+    /// untrusted: fail closed, until the sandbox is recreated.
+    #[serde(default)]
+    pub egress_allow: Vec<String>,
+    #[serde(default = "untrusted")]
+    pub trust: proto::Trust,
+}
+
+fn untrusted() -> proto::Trust {
+    proto::Trust::Untrusted
 }
 
 impl From<&Live> for LiveRecord {
@@ -95,6 +106,8 @@ impl From<&Live> for LiveRecord {
             resume_on_start: false,
             size: l.size.clone(),
             limits: Some(l.limits),
+            egress_allow: l.egress_allow.clone(),
+            trust: l.trust,
         }
     }
 }
@@ -242,6 +255,8 @@ mod tests {
             resume_on_start: false,
             size: "mini".into(),
             limits: Some(proto::sizes::default_table()["mini"]),
+            egress_allow: vec!["example.org".into()],
+            trust: proto::Trust::Trusted,
         }
     }
 
@@ -266,6 +281,8 @@ mod tests {
         assert_eq!(got.peer_ip, "172.16.9.2".parse().ok(), "the slot comes back with the record");
         assert_eq!(got.ttl_secs, 900);
         assert!(got.resume_on_start, "the park flag survives, so the next start restores it");
+        assert_eq!(got.egress_allow, ["example.org"], "the shared proxies hold it to the same names");
+        assert_eq!(got.trust, proto::Trust::Trusted);
         // A record written before v4d has no such field and reads as "not parked".
         let old = serde_json::json!({"id":"x","name":"x","template":"base","isolation":"remote",
             "backend":"firecracker","workspace_path":"/w","created_ms":1,
@@ -274,6 +291,9 @@ mod tests {
             "max_age_secs":null,"ttl_secs":900,"last_activity_ms":3,"peer_ip":null});
         let old: LiveRecord = serde_json::from_value(old).expect("a v4c record still parses");
         assert!(!old.resume_on_start);
+        // ...and, from before the egress fields, with no extra names and untrusted.
+        assert!(old.egress_allow.is_empty());
+        assert_eq!(old.trust, proto::Trust::Untrusted, "fail closed, never trusted by default");
 
         forget(&c, "sbx_a1").unwrap();
         assert!(load_all(&c).is_empty());
