@@ -402,6 +402,80 @@ pub fn agent_token() -> Option<String> {
     t
 }
 
+/// Env var that carries the token memfd's number across the re-exec. Named
+/// without `AGENT_TOKEN` on purpose: it stays in the new initial block, and a
+/// probe that greps `/proc/1/environ` for the token's name must find nothing.
+#[cfg(target_os = "linux")]
+const TOKEN_FD_ENV: &str = "SBX_BOOT_FD";
+
+/// Keeps the token out of the kernel's initial environment block without
+/// reading `/proc/self/stat`. `scrub_initial_env` cannot do that on gVisor,
+/// which reports `env_start`/`env_end` as 0, so any process of the sandbox (same
+/// uid) could read the token from `/proc/1/environ`. Instead: the first pass
+/// writes the token to a memfd that survives `execve`, drops the variable and
+/// re-executes this binary (same pid); the second pass reads the memfd, closes
+/// it and puts the token back for `agent_token`. Nothing the agent spawns
+/// exists before the second pass ends, so no child ever inherits the fd.
+///
+/// Container path only (a microVM's PID 1 has no token), called first thing in
+/// `main` while the process is single-threaded. Any failure logs and continues
+/// with the variable in place, where `scrub_initial_env` is the fallback.
+///
+/// ponytail: the memfd is not sealed and its number is trusted as the one the
+/// first pass left; ceiling: the sandbox is still empty at that moment and
+/// nothing else sets the variable. Upgrade path: also check
+/// `/proc/self/fd/<n>` names a memfd before reading it.
+#[cfg(target_os = "linux")]
+pub fn stash_token() {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::process::CommandExt;
+
+    if let Some(fd) = std::env::var(TOKEN_FD_ENV).ok().and_then(|v| v.parse::<i32>().ok()) {
+        std::env::remove_var(TOKEN_FD_ENV);
+        // SAFETY: the fd is the memfd the first pass left open for us; the File
+        // owns it from here and closes it when it drops.
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut t = String::new();
+        // The offset is shared with the first pass's open file description.
+        match f.seek(SeekFrom::Start(0)).and_then(|_| f.read_to_string(&mut t)) {
+            Ok(_) if !t.is_empty() => std::env::set_var("SBX_AGENT_TOKEN", t),
+            r => tracing::warn!(?r, "agent token memfd unreadable: the agent port is left unguarded"),
+        }
+        return;
+    }
+
+    let Some(token) = std::env::var("SBX_AGENT_TOKEN").ok().filter(|s| !s.is_empty()) else { return };
+    // Flags 0: no MFD_CLOEXEC, the fd has to cross the execve below.
+    let fd = unsafe { libc::memfd_create(c"sbx".as_ptr(), 0) };
+    if fd < 0 {
+        tracing::warn!(err = %std::io::Error::last_os_error(), "memfd_create failed: agent token stays in the environment");
+        return;
+    }
+    // SAFETY: a fresh fd we own; closed on drop if the exec below fails.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    if let Err(e) = f.write_all_at(token.as_bytes(), 0) {
+        tracing::warn!(err = %e, "writing the agent token memfd failed: token stays in the environment");
+        return;
+    }
+    std::env::set_var(TOKEN_FD_ENV, fd.to_string());
+    std::env::remove_var("SBX_AGENT_TOKEN");
+    // `current_exe` rather than `/proc/self/exe` as the path: the kernel names
+    // the process after the file it is given, and `exe` would replace `guest-agent`.
+    let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
+    let mut argv = std::env::args_os();
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(a0) = argv.next() {
+        cmd.arg0(a0);
+    }
+    let err = cmd.args(argv).exec();
+    // Still here: the exec failed. Put everything back and carry on as before.
+    tracing::warn!(%err, "re-exec failed: agent token stays in the environment");
+    std::env::remove_var(TOKEN_FD_ENV);
+    std::env::set_var("SBX_AGENT_TOKEN", token);
+}
+
 /// `unsetenv` drops the pointer but leaves the bytes where the kernel placed
 /// them at exec, and `/proc/<pid>/environ` reads exactly that range. On the
 /// podman tier the agent and the sandboxed processes share a uid, so that file
