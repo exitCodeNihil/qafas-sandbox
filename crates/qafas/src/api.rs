@@ -2016,6 +2016,9 @@ async fn park(st: &AppState, l: &Arc<Live>) -> anyhow::Result<()> {
 
 /// Parks what can come back and destroys the rest. Called on shutdown.
 pub async fn shutdown(st: &AppState) {
+    // Before the parks, which can take a while: a create waiting on its guest
+    // must not outlast the stop (systemd gives it 60 s, a cold boot takes 83).
+    st.pool.close().await;
     let all: Vec<Arc<Live>> = st.live.lock().await.drain().map(|(_, v)| v).collect();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(PARK_BUDGET_SECS);
     let jobs = all.into_iter().map(|l| async move {
@@ -2758,6 +2761,50 @@ mod tests {
         assert!(parked.resume_on_start, "and the next start restores it");
         assert_eq!(keep.state(), SandboxState::Stopped);
         assert!(!table.contains_key("sbx_eph"), "an ephemeral sandbox is destroyed, not parked");
+        let _ = std::fs::remove_dir_all(&st.cfg.state_dir);
+    }
+
+    /// The backend hears about the shutdown before the first park, not after the
+    /// last: a boot waiting on its guest would otherwise sit through every
+    /// snapshot write.
+    #[tokio::test]
+    async fn shutdown_tells_the_backend_before_it_parks_anything() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0 = nothing yet; 1 = told; 2 = a stop ran after being told; 3 = a stop ran too early.
+        struct Order(AtomicU8, Parkable);
+        impl crate::backend::Backend for Order {
+            fn name(&self) -> &'static str {
+                "firecracker"
+            }
+            fn create(&self, s: Spec) -> crate::backend::BoxFut<'_, anyhow::Result<Sandbox>> {
+                self.1.create(s)
+            }
+            fn destroy(&self, s: &Sandbox) -> crate::backend::BoxFut<'_, anyhow::Result<()>> {
+                self.1.destroy(s)
+            }
+            fn adopt(&self, rec: &crate::livetable::LiveRecord) -> Option<Sandbox> {
+                self.1.adopt(rec)
+            }
+            fn supports_lifecycle(&self, v: Verb) -> bool {
+                self.1.supports_lifecycle(v)
+            }
+            fn stop(&self, s: &Sandbox) -> crate::backend::BoxFut<'_, anyhow::Result<()>> {
+                let told = self.0.load(Ordering::SeqCst) == 1;
+                self.0.store(if told { 2 } else { 3 }, Ordering::SeqCst);
+                self.1.stop(s)
+            }
+            fn begin_shutdown(&self) {
+                self.0.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).ok();
+            }
+        }
+        let order = Arc::new(Order(AtomicU8::new(0), Parkable));
+        let st = state_with("api-told", Caps::default(), order.clone());
+        let _ = std::fs::remove_dir_all(crate::livetable::dir(&st.cfg));
+        let l = live_for(&st, "sbx_told").await;
+        st.persist(&l);
+        shutdown(&st).await;
+        assert_eq!(l.state(), SandboxState::Stopped, "it was parked");
+        assert_eq!(order.0.load(Ordering::SeqCst), 2, "and the backend had been told before the park ran");
         let _ = std::fs::remove_dir_all(&st.cfg.state_dir);
     }
 

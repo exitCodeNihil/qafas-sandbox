@@ -312,12 +312,13 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
                 let (handle, state) = (handle.clone(), state.clone());
                 async move {
                     terminate().await;
+                    let since = std::time::Instant::now();
                     tracing::info!("shutting down; parking or destroying sandboxes");
                     api::shutdown(&state).await;
                     // The flusher posts once a second: give the park/destroy
                     // events one tick to reach the control plane before exit.
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                    handle.graceful_shutdown(Some(std::time::Duration::from_secs(2)));
+                    handle.graceful_shutdown(Some(connection_grace(since.elapsed())));
                 }
             });
             // With connect info: `/metrics` is open to a loopback peer only (§3 v4).
@@ -336,19 +337,64 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(cfg.listen).await?.tap_io(|tcp| {
                 let _ = tcp.set_nodelay(true);
             });
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            let (grace_tx, grace_rx) = tokio::sync::oneshot::channel();
+            let serve = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async move {
                     terminate().await;
+                    let since = std::time::Instant::now();
                     tracing::info!("shutting down; parking or destroying sandboxes");
                     api::shutdown(&state).await;
                     // The flusher posts once a second: give the park/destroy
                     // events one tick to reach the control plane before exit.
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                })
-                .await?;
+                    let _ = grace_tx.send(connection_grace(since.elapsed()));
+                });
+            until_drained(std::future::IntoFuture::into_future(serve), grace_rx).await?;
         }
     }
     Ok(())
+}
+
+/// The longest the daemon takes to exit after SIGTERM, whatever is still
+/// connected: an event stream or a long exec never ends by itself, and
+/// systemd's `TimeoutStopSec` is 60. Sandbox parking has its own budget
+/// (`api::PARK_BUDGET_SECS`, protocol §3a) and is not cut by this; what this
+/// bounds is the wait for connections once the sandboxes are dealt with.
+///
+/// ponytail: one fixed number. Upgrade: derive it from `TimeoutStopSec` in
+/// the unit, or make it a setting if an operator runs a slower stop.
+const SHUTDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What open connections get after the sandboxes are parked or destroyed: what
+/// is left of `SHUTDOWN_CAP`, and never less than 2 s (so a long park does not
+/// cut a request that is a moment from done).
+fn connection_grace(since_sigterm: std::time::Duration) -> std::time::Duration {
+    SHUTDOWN_CAP.saturating_sub(since_sigterm).max(std::time::Duration::from_secs(2))
+}
+
+/// Runs `serve` (which finishes by itself once its connections have drained
+/// after the shutdown signal) but gives up on it `grace` after `grace_rx`
+/// delivers it: the hold the daemon used to have on one connection that never
+/// closes.
+async fn until_drained<F>(
+    serve: F,
+    grace_rx: tokio::sync::oneshot::Receiver<std::time::Duration>,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        r = serve => r,
+        _ = async {
+            match grace_rx.await {
+                Ok(grace) => tokio::time::sleep(grace).await,
+                Err(_) => std::future::pending::<()>().await,
+            }
+        } => {
+            tracing::warn!("connections still open at the shutdown bound; exiting anyway");
+            Ok(())
+        }
+    }
 }
 
 /// SIGTERM matters as much as SIGINT: it is how launchd and systemd stop us, and
@@ -358,5 +404,49 @@ async fn terminate() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    /// Exit is bounded: what is left of 30 s after SIGTERM, but a late start of
+    /// the drain still gets 2 s.
+    #[test]
+    fn connections_get_what_is_left_of_the_shutdown_cap_and_at_least_two_seconds() {
+        assert_eq!(super::connection_grace(Duration::from_secs(3)), Duration::from_secs(27));
+        assert_eq!(super::connection_grace(Duration::from_secs(29)), Duration::from_secs(2));
+        assert_eq!(super::connection_grace(Duration::from_secs(45)), Duration::from_secs(2), "a long park");
+    }
+
+    /// An open connection that never closes (an event stream, a long exec) held
+    /// the non-TLS daemon until systemd killed it. The wait ends at the grace.
+    #[tokio::test]
+    async fn a_connection_that_never_closes_does_not_hold_the_exit() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Duration::from_millis(100)).unwrap();
+        let t = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), super::until_drained(std::future::pending(), rx))
+            .await
+            .expect("held by a connection that never closes")
+            .unwrap();
+        assert!(t.elapsed() >= Duration::from_millis(100) && t.elapsed() < Duration::from_secs(2));
+
+        // Connections that do drain end it at once, with their own result.
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let t = Instant::now();
+        super::until_drained(async { Ok(()) }, rx).await.unwrap();
+        assert!(t.elapsed() < Duration::from_millis(500));
+
+        // Before the signal there is no bound at all: the grace clock starts with it.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = tx.send(Duration::from_secs(60));
+        });
+        let r =
+            tokio::time::timeout(Duration::from_millis(200), super::until_drained(std::future::pending(), rx)).await;
+        assert!(r.is_err(), "no grace delivered yet, so no deadline");
     }
 }

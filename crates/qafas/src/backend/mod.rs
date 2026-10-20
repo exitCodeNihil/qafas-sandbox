@@ -267,6 +267,12 @@ pub trait Backend: Send + Sync {
     }
     fn create(&self, spec: Spec) -> BoxFut<'_, anyhow::Result<Sandbox>>;
     fn destroy(&self, sb: &Sandbox) -> BoxFut<'_, anyhow::Result<()>>;
+    /// The daemon got SIGTERM. A `create` still waiting for its guest has to give
+    /// up now, through its own error path (so the VM and its files are removed),
+    /// rather than hold the shutdown for as long as the wait would have lasted.
+    /// Only the tier whose wait is long (a microVM cold boot: tens of seconds)
+    /// answers; a container's is bounded at ten.
+    fn begin_shutdown(&self) {}
 
     // ---- v5 sizes and limits (protocol §3a). Applied at create and again when
     // a pooled sandbox is handed out, always from out here: nothing the workload

@@ -38,6 +38,8 @@ pub struct Firecracker {
     /// the live sandbox's tap to build it, putting two guests on one address.
     /// Only `destroy` gives a slot back.
     slots: Mutex<BTreeSet<u32>>,
+    /// Turns true when the daemon starts shutting down (`begin_shutdown`).
+    stopping: tokio::sync::watch::Sender<bool>,
 }
 
 /// How many /30s `ips` carves out of 172.16.0.0/16.
@@ -110,7 +112,7 @@ impl Firecracker {
         // every jail without an owner, so the re-adopted slots are the only ones
         // taken the moment it returns.
         let slots = keep.iter().filter_map(|r| slot_of(r.peer_ip).ok()).collect();
-        let fc = Self { cfg, http, slots: Mutex::new(slots) };
+        let fc = Self { cfg, http, slots: Mutex::new(slots), stopping: tokio::sync::watch::channel(false).0 };
         fc.nftables()?;
         fc.sweep_orphans(keep);
         Ok(fc)
@@ -266,6 +268,25 @@ async fn wait_for(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
     anyhow::bail!("{} never accepted a connection", path.display())
 }
 
+/// `wait_healthy`, except that it gives up the moment `stop` turns true. Dropping
+/// the wait is safe: it holds nothing, and the caller's error path does the
+/// cleaning (`create` kills the VM and removes its jail, tap and cgroup).
+async fn healthy_unless_shutdown(
+    conn: &Connector,
+    within: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        r = super::wait_healthy(conn, within) => r,
+        _ = async {
+            // A dropped sender is not a shutdown.
+            if stop.wait_for(|s| *s).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        } => anyhow::bail!("qafas is shutting down"),
+    }
+}
+
 impl Backend for Firecracker {
     fn name(&self) -> &'static str {
         "firecracker"
@@ -273,10 +294,18 @@ impl Backend for Firecracker {
     fn pool_by_workspace(&self) -> bool {
         false
     }
+    fn begin_shutdown(&self) {
+        self.stopping.send_replace(true);
+    }
 
     fn create(&self, spec: Spec) -> BoxFut<'_, anyhow::Result<Sandbox>> {
         Box::pin(async move {
             let id = spec.id.clone();
+            // Nothing to boot for a daemon that is going down (a refill or a scan
+            // that started just before SIGTERM).
+            if *self.stopping.borrow() {
+                anyhow::bail!("qafas is shutting down");
+            }
             // Before anything is written or spawned: a host with no address left
             // says so, rather than booting a VM onto somebody else's subnet.
             let slot = self.take_slot()?;
@@ -783,8 +812,10 @@ impl Firecracker {
         // (15 s more nested; the guest gives up waiting after 60 s), so that no
         // sandbox is handed out, and no template captured, unwatched. A restore
         // of a template captured that way answers at once. 90 s still bounds a
-        // guest that never comes up.
-        super::wait_healthy(&connector, Duration::from_secs(90)).await?;
+        // guest that never comes up, and SIGTERM ends the wait at once: a cold
+        // boot measured at 83 s would otherwise outlast systemd's 60 s stop
+        // timeout and be SIGKILLed, orphaning the VM it was booting.
+        healthy_unless_shutdown(&connector, Duration::from_secs(90), self.stopping.subscribe()).await?;
         Ok(connector)
     }
 
@@ -938,6 +969,55 @@ mod tests {
         wait_for(&path, Duration::from_millis(100)).await.unwrap();
         unsafe { libc::close(fd) };
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A guest agent that answers `/healthz` with `status` for as long as it lives.
+    async fn fake_agent(status: &'static str) -> std::net::SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let _ = s.read(&mut [0u8; 512]).await;
+                    let _ = s.write_all(format!("HTTP/1.0 {status}\r\ncontent-length: 0\r\n\r\n").as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A create waiting on a guest that never reports healthy (a cold boot that
+    /// has not got its bpftrace feed, 90 s) must stop waiting when SIGTERM
+    /// arrives, not 90 s later: past systemd's 60 s the daemon is SIGKILLed and
+    /// the VM it was booting is orphaned. Without the shutdown arm this waits out
+    /// all 30 s.
+    #[tokio::test]
+    async fn a_create_waiting_for_its_guest_gives_up_when_shutdown_begins() {
+        let agent = Connector::Tcp(fake_agent("503 Service Unavailable").await);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send_replace(true);
+        });
+        let t = Instant::now();
+        let e = healthy_unless_shutdown(&agent, Duration::from_secs(30), rx).await.unwrap_err();
+        assert!(e.to_string().contains("shutting down"), "{e}");
+        assert!(t.elapsed() >= Duration::from_millis(100), "it waited until the signal, not before");
+        assert!(t.elapsed() < Duration::from_secs(3), "and stopped with it, not at the 30 s bound: {:?}", t.elapsed());
+
+        // Already shutting down when the wait starts: no wait at all.
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let t = Instant::now();
+        assert!(healthy_unless_shutdown(&agent, Duration::from_secs(30), rx).await.is_err());
+        assert!(t.elapsed() < Duration::from_secs(1));
+
+        // Without a shutdown it is still `wait_healthy`: a live guest is ready,
+        // and a sender that went away is not a shutdown.
+        let live = Connector::Tcp(fake_agent("200 OK").await);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        healthy_unless_shutdown(&live, Duration::from_secs(5), rx).await.unwrap();
     }
 
     /// The cgroup of a VM that is still tearing down refuses `rmdir`; here a file

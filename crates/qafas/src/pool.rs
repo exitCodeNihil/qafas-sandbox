@@ -452,14 +452,24 @@ impl Pool {
         out
     }
 
+    /// The first thing shutdown does, before it parks anything: nothing is
+    /// pooled after this, and a backend whose `create` is still waiting for its
+    /// guest is told to give up (`Backend::begin_shutdown`), so the creates in
+    /// flight end in their own error path now instead of holding the stop for
+    /// as long as a cold boot takes.
+    pub async fn close(&self) {
+        self.inner.lock().await.closed = true;
+        self.backend.begin_shutdown();
+    }
+
     /// Called on shutdown. Destroys every warm sandbox and closes the pool, then
     /// waits for refills still booting: each destroys
     /// what it finishes instead of pooling it. Without the wait, every refill in
     /// flight at shutdown left a running container behind (10 after a burst).
     pub async fn drain(&self) {
+        self.close().await;
         let all: Vec<Sandbox> = {
             let mut g = self.inner.lock().await;
-            g.closed = true;
             g.slots.drain().flat_map(|(_, s)| s.warm).collect()
         };
         for sb in all {
@@ -714,6 +724,54 @@ mod tests {
         let e = pool.acquire("base", "/w", &[], "", None, &MINI).await.unwrap_err();
         assert!(e.to_string().contains("shutting down"), "{e}");
         assert_eq!(b.1.load(Ordering::SeqCst), 2, "and so is one created after the drain");
+    }
+
+    /// SIGTERM while a create is waiting for its guest: the pool tells the backend
+    /// at once, so the create fails through its own error path (which removes the
+    /// VM) instead of the stop waiting out a 90 s boot. The backend here waits
+    /// for that signal and nothing else, as the microVM tier's readiness wait does.
+    #[tokio::test]
+    async fn closing_the_pool_ends_a_create_that_is_still_waiting_for_its_guest() {
+        struct Booting(tokio::sync::Notify, AtomicU32);
+        impl Backend for Booting {
+            fn name(&self) -> &'static str {
+                "booting"
+            }
+            fn create(&self, _spec: Spec) -> BoxFut<'_, anyhow::Result<Sandbox>> {
+                Box::pin(async move {
+                    tokio::select! {
+                        _ = self.0.notified() => {
+                            self.1.fetch_add(1, Ordering::SeqCst); // the error path ran
+                            anyhow::bail!("qafas is shutting down")
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => anyhow::bail!("booted"),
+                    }
+                })
+            }
+            fn destroy(&self, _sb: &Sandbox) -> BoxFut<'_, anyhow::Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn begin_shutdown(&self) {
+                self.0.notify_one();
+            }
+        }
+        let b = Arc::new(Booting(tokio::sync::Notify::new(), AtomicU32::new(0)));
+        let pool = Pool::new(b.clone(), policy(0), crate::events::bus(), "h".into(), MINI);
+        let waiting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.acquire("base", "/w", &[], "", None, &MINI).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await; // mid-create
+        let t = Instant::now();
+        pool.close().await;
+        let e = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the create outlived the shutdown signal")
+            .unwrap()
+            .unwrap_err();
+        assert!(e.to_string().contains("shutting down"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert_eq!(b.1.load(Ordering::SeqCst), 1);
     }
 
     /// B-bug: a warm entry whose guest died must not be handed out as a 201 with
