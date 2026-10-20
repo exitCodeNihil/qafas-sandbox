@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use wildmatch::WildMatch;
 
+use crate::backend::native::survive_accept;
 use crate::events::{http_client, new_event, now_rfc3339, Corr, HttpClient};
 
 const MAX_HEADERS: usize = 64 * 1024;
@@ -322,7 +323,7 @@ pub async fn run(
 /// peer address.
 pub async fn serve(l: TcpListener, ctx: Arc<ProxyCtx>) -> anyhow::Result<()> {
     loop {
-        let (sock, peer) = l.accept().await?;
+        let Some((sock, peer)) = survive_accept(l.accept().await, "egress proxy").await? else { continue };
         // A relay forwards whatever arrives as it arrives; Nagle would hold a
         // short tail back for the peer's delayed ACK. Both sides, as on the relay.
         let _ = sock.set_nodelay(true);
@@ -342,7 +343,7 @@ pub async fn serve(l: TcpListener, ctx: Arc<ProxyCtx>) -> anyhow::Result<()> {
 /// gains nothing it did not have — it can already reach its neighbours.
 pub async fn serve_relay(l: TcpListener, net: (IpAddr, u8)) -> anyhow::Result<()> {
     loop {
-        let (mut sock, peer) = l.accept().await?;
+        let Some((mut sock, peer)) = survive_accept(l.accept().await, "proxy relay").await? else { continue };
         let _ = sock.set_nodelay(true);
         tokio::spawn(async move {
             if in_cidr(peer.ip(), net) {
