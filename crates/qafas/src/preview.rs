@@ -36,7 +36,9 @@ pub fn presented(
     port: u16,
 ) -> Option<(String, bool)> {
     if let Some(t) = query.and_then(|q| param(q, "sbx_preview")) {
-        return Some((t, true));
+        // A token always has a `:` in it, which a browser or an HTTP client is
+        // free to send as `%3A`; the header and the cookie carry it as it is.
+        return Some((agent_core::cmdline_decode(&t), true));
     }
     if let Some(t) = header {
         return Some((t.trim().to_string(), false));
@@ -91,5 +93,30 @@ mod tests {
         assert_eq!(presented(None, None, None, id, port), None);
         assert_eq!(strip_token("a=1&sbx_preview=t&b=2"), "a=1&b=2");
         assert_eq!(strip_token("sbx_preview=t"), "");
+    }
+
+    /// Every token has a `:` in it (`payload:signature`), and a client that
+    /// percent-encodes the query sends `%3A`. Verified as received, that was a 401.
+    #[test]
+    fn a_token_whose_colon_was_percent_encoded_still_verifies() {
+        let (secret, now) = ("dev", 1_000u64);
+        let t = mint(secret, "sbx_a", 8000, now + 60);
+        assert!(t.contains(':'), "the premise: a token carries a colon");
+        let encoded = t.replace(':', "%3A");
+        assert_ne!(encoded, t);
+
+        let (got, from_query) =
+            presented(Some(&format!("x=1&sbx_preview={encoded}")), None, None, "sbx_a", 8000).unwrap();
+        assert!(from_query);
+        assert_eq!(got, t);
+        assert!(verify(secret, &got, "sbx_a", 8000, now));
+        // The lower-case spelling, and the unencoded one, are the same token.
+        let lower = t.replace(':', "%3a");
+        assert_eq!(presented(Some(&format!("sbx_preview={lower}")), None, None, "sbx_a", 8000).unwrap().0, t);
+        assert_eq!(presented(Some(&format!("sbx_preview={t}")), None, None, "sbx_a", 8000).unwrap().0, t);
+        // Decoding must not turn a different token into this one.
+        let other = mint(secret, "sbx_b", 8000, now + 60).replace(':', "%3A");
+        let (got, _) = presented(Some(&format!("sbx_preview={other}")), None, None, "sbx_a", 8000).unwrap();
+        assert!(!verify(secret, &got, "sbx_a", 8000, now));
     }
 }
