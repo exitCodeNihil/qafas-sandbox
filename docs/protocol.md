@@ -145,7 +145,7 @@ The control plane exposes every session as an OTLP trace: `GET /api/sessions/{id
 
 | Route | Request | Response |
 |---|---|---|
-| `GET /healthz` | — | `200 {"ok":true,"uid":1000,"version":"0.1.0"}` |
+| `GET /healthz` | — | `200 {"ok":true,"uid":1000,"version":"0.1.0"}`; v5.4: on a `remote` guest `503 {"ok":false,…}` while the bpftrace program compiles, for at most 60 s from its spawn, then `200` whether or not it attached. The daemon waits for `200`, up to 90 s, before it pools, hands out or captures a microVM, so no sandbox is handed out without its kernel feed. Tiers without bpftrace answer `200` at once |
 | `POST /exec` | `{"cmd":"rg -n foo .","cwd":"/abs" (optional since v4c; home/workspace when absent),"env":{},"timeout_ms":30000}` | `200 {"exit":0,"stdout":"…","stderr":"…","duration_ms":12}` |
 | `GET /exec/ws` | WebSocket upgrade; frames below | frames below |
 | `GET /fs/read?path=` | — | `200 application/octet-stream` or `404` |
@@ -371,7 +371,7 @@ Notes on the table:
 - firecracker (`remote`): image/dockerfile → a rootfs ext4 built with the host's podman (what `images/build-rootfs.sh` does), `kind: image`. sandbox_id → pause + full snapshot of that VM (`kind: vm`).
 - native: `501`.
 
-Creating from a `vm` snapshot is a restore: the guest gets `POST /restored {id, ip, gw, proxy, now}` and re-plants canaries, reconfigures eth0, sets the clock and hostname; the kernel reseeds its PRNG from VMGenID. Restoring one snapshot many times is what makes this sub-100 ms. The sandbox id, canary tokens and network identity are the per-restore state and are all replaced.
+Creating from a `vm` snapshot is a restore: the guest gets `POST /restored {id, ip, gw, proxy, now}` and re-plants canaries, reconfigures eth0, sets the clock and hostname; randomness is renewed. v5.4: `POST /restored` also takes `entropy`, base64 of 32 bytes the daemon draws for that restore only; the guest writes them to `/dev/urandom` and issues `RNDRESEEDCRNG` before it re-plants canaries (a missing field means the old behaviour). The guest kernel's VMGenID driver, where the guest kernel has one, reseeds the kernel pool on restore but never user space, so every guest-minted ULID (event ids, session ids, canary tokens) takes its random part from `getrandom(2)` on each call and keeps nothing in user memory. Restoring one snapshot many times is what makes this sub-100 ms. The sandbox id, canary tokens and network identity are the per-restore state and are all replaced.
 
 #### Per host
 
