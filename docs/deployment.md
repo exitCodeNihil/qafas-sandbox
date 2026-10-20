@@ -199,6 +199,7 @@ Docker writes its own iptables/nftables rules, but the rules above are still the
 | `/etc/qafas/egress.json` | 0644 | the egress allowlist |
 | `/var/lib/controlplane/` | controlplane | `sandbox.db` |
 | `/var/lib/qafas/` | root | TLS pair, templates and their scans, the sandbox table, spooled events, the Firecracker bundle and jails |
+| `/var/lib/qafas/egress-ca/` | 0700 root, `ca.key` 0600 | the egress CA, when `egress.json` has routes (section 7) |
 
 ## 5. Install methods
 
@@ -329,7 +330,7 @@ Notes:
 
 - The `qafas` container serves the `vm` tier through the host's Docker (or podman: `CONTAINER_SOCK=/run/podman/podman.sock`). The sandboxes are ordinary host containers with the same boundary as the package install.
 - Mount every directory people work in at the same path (`/home` and `/root` are there already).
-- Mount your own `egress.json` over `/etc/qafas/egress.json`.
+- Mount your own `egress.json` over `/etc/qafas/egress.json`. Route secrets go in as compose secrets (section 7).
 - The control plane's TLS pair mounts into its container (`SBX_TLS_CERT`, `SBX_TLS_KEY`; section 6).
 
 ### 5.3 By hand, from the tarball
@@ -538,6 +539,56 @@ Every sandbox's only way out is the proxy on its worker. The proxy reads `/etc/q
 - A harness may add names for one sandbox (`egress_allow` on create; an API key can limit which names its holder may add). It can never add ranges. The model inside the sandbox can change nothing.
 - Every refusal is an `egress.deny` event. Probes of metadata endpoints raise alerts on the dashboard's Alerts page.
 
+### Routes: credentials and per-request rules
+
+A route lets a sandbox use a credential it never holds ([D34](decisions.md#d34--credentials-are-attached-at-the-egress-proxy-for-bound-hosts-only-2026-10-20)). The sandbox gets a placeholder in an environment variable; the proxy terminates TLS for the route's hosts, swaps the placeholder for the real secret, checks each request against the route's rules, and removes the secret from every response. The full field list is in [protocol.md §6](protocol.md#routes-v54-d34).
+
+```json
+{
+  "allow": ["pypi.org", "files.pythonhosted.org"],
+  "routes": [
+    {
+      "name": "github",
+      "hosts": ["github.com", "api.github.com"],
+      "secret": "file:///etc/qafas/secrets/github.token",
+      "env": "GITHUB_TOKEN",
+      "inject": { "header": "Authorization", "format": "Bearer {secret}" },
+      "rules": [{ "methods": ["GET", "POST"], "paths": ["/acme/*", "/repos/acme/*"] }]
+    }
+  ]
+}
+```
+
+- **Secrets** are references: `env://NAME` (the `qafas` process's environment) or `file:///abs/path` (`chmod 600`, owned by the user `qafas` runs as). They are read once at start; edit and restart. A route whose secret cannot be read stops `qafas` from starting, and `qafas doctor` names it (`egress routes … FAIL`). The value never appears in a log, an event, an API reply or what the worker reports to the control plane.
+- **Who gets it:** sandboxes whose trust the route lists, `trusted` by default. They see `GITHUB_TOKEN=qafas_ph_github_<24 hex>`. For them every connection to `github.com:443` is intercepted, and `github.com` on any other port or over plain HTTP is refused. An untrusted sandbox gets no placeholder; for it `github.com` is an ordinary name, reachable only if `allow` lists it, and then without the credential.
+- **Hosts:** list exact names. A glob that covers names other people control (`*.s3.amazonaws.com`, `*.github.io`) sends them the secret.
+- **Clients:** the sandbox's `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO` and `PIP_CERT` point at a bundle with the system roots plus the egress CA, `NODE_EXTRA_CA_CERTS` at the CA alone, and Chromium trusts it by key hash. Java trust stores are not configured. HTTP/1.1 only.
+- **git:** git sends credentials only after a 401, so either give the route an `inject` header, or hand git the placeholder through a credential helper:
+
+  ```sh
+  git -c credential.helper='!f(){ echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f' clone https://github.com/acme/app.git
+  ```
+
+- **Internal hosts with an internal CA:** set `SBX_EGRESS_CA_FILE` (config key `egress_ca_file`) to that CA's PEM. Route hosts are verified against the system roots plus that file. A route host on a private address still needs its range in `allow_private_cidrs`.
+- **The CA** lives in `<state_dir>/egress-ca/` (`/var/lib/qafas/egress-ca/` for the packages): `ca.pem`, and `ca.key` mode `0600`. It is made on the first start with routes and kept, so placeholders and every sandbox's trust survive restarts. To rotate it, delete the directory and restart `qafas`; running sandboxes keep the old placeholders, so recreate them. Warm pools need nothing: placeholders and the CA are handed over when a sandbox is acquired.
+- **Native tier:** the sandbox runs as the daemon's own user, so keep a `file://` secret where that tier cannot read: the daemon's home or state directory, not `/etc`.
+- **Containers (section 5.2):** pass the secret as a compose secret and point the route at it:
+
+  ```yaml
+  # compose.yml, qafas service
+  services:
+    qafas:
+      secrets: [github_token]
+      volumes:
+        - ./egress.json:/etc/qafas/egress.json:ro
+  secrets:
+    github_token:
+      file: ./github.token   # chmod 600
+  ```
+
+  and in `egress.json`: `"secret": "file:///run/secrets/github_token"`. The worker hands the routes, their secrets and the CA to its proxy container in one environment variable (`SBX_ROUTES_JSON`), so anyone who can inspect containers on that host can read them: the same people who can read the secret file.
+- **Events:** each request on a route is one `egress.allow` or `egress.deny` with `method`, `path` (no query), `route` and `injected`. A rule miss is `reason: "l7 rule"`.
+
 ## 8. Operations
 
 ### Upgrades
@@ -561,7 +612,7 @@ sudo sqlite3 /var/lib/controlplane/sandbox.db ".backup '/backup/sandbox-$(date +
 
 To restore: stop the service, put the file back, start it. Workers re-register by themselves.
 
-Workers: back up `/etc/qafas/` and `/var/lib/qafas/tls/` (its pinned certificate). Templates can be rebuilt; the rest is per-sandbox state.
+Workers: back up `/etc/qafas/`, `/var/lib/qafas/tls/` (its pinned certificate) and, with routes, `/var/lib/qafas/egress-ca/` (keep it as private as the secrets). Templates can be rebuilt; the rest is per-sandbox state.
 
 ### Monitoring
 
@@ -584,6 +635,9 @@ Workers: back up `/etc/qafas/` and `/var/lib/qafas/tls/` (its pinned certificate
 | a changed `pool_size` has no effect | an earlier `PUT /snapshots/base {warm}` is kept in `/var/lib/qafas/snapshots/base.warm` and wins (the log says so at start): delete the file, or `PUT` the new number |
 | `mem_mib … exceeds this host's template RAM` | raise `[firecracker] mem_mib`, or ask for a smaller size |
 | `template … failed its security scan` | an untrusted sandbox asked for an F-graded template: open it under Templates to see why |
+| `egress route "…": secret … is not set` / `… is readable by group or others` (doctor FAIL, `serve` refuses) | set the variable in the `qafas` service's environment, or `chmod 600` the file (section 7) |
+| a route host answers `502` with `egress.deny` `upstream tls failed` | the host's certificate does not chain to the system roots: put its CA in `SBX_EGRESS_CA_FILE` (section 7) |
+| a client in the sandbox rejects a route host's certificate | it ignores the CA variables (a Java client, a pinned certificate): point it at `$SSL_CERT_FILE` |
 | `qafas doctor`: `native user` FAIL | the daemon runs as root, and a root daemon does not serve `native`: run `qafas` as the developer's own user (section 5.5) |
 | `qafas doctor`: `bwrap sandbox` FAIL, `bwrap: setting up uid map: Permission denied` | AppArmor restricts unprivileged user namespaces (Ubuntu 24.04 and later): add the `bwrap` profile in section 5.5 |
 
