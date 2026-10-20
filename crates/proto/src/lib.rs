@@ -959,6 +959,68 @@ pub struct EgressPolicy {
     /// loopback, link-local and CGNAT stay denied whatever it lists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_private_cidrs: Vec<String>,
+    /// v5.4 (D34): destinations the proxy terminates TLS for, to attach a
+    /// credential and/or apply per-request rules. Host file only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<EgressRoute>,
+}
+
+fn default_route_ports() -> Vec<u16> {
+    vec![443]
+}
+
+fn default_route_trust() -> Vec<Trust> {
+    vec![Trust::Trusted]
+}
+
+/// v5.4. One bound destination. The hosts are allowed implicitly (private-address
+/// rules still apply) and only `ports` are open for them: every connection there
+/// is intercepted, so `rules` cannot be walked around on another port.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EgressRoute {
+    /// `[a-z0-9_-]+`, unique in the file. Shows up in events and in the placeholder.
+    pub name: String,
+    /// Host globs, as in `allow`. Never a bare `*`.
+    pub hosts: Vec<String>,
+    #[serde(default = "default_route_ports")]
+    pub ports: Vec<u16>,
+    /// `env://NAME` (the daemon's environment) or `file:///abs/path`. A reference,
+    /// read once at start; the value is never logged, never in an event, never
+    /// sent to a sandbox, a client or the control plane (a host reports its policy
+    /// without this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// The sandbox environment variable that carries the placeholder. Required
+    /// with `secret`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Add this header with the secret when the request does not carry the
+    /// placeholder (for clients that only send credentials after a 401).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<EgressInject>,
+    /// Allow-list of requests. Empty = every request to the hosts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<EgressRule>,
+    /// Which sandboxes the route applies to. Default: trusted only.
+    #[serde(default = "default_route_trust")]
+    pub trust: Vec<Trust>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EgressInject {
+    /// For example `Authorization`.
+    pub header: String,
+    /// For example `Bearer {secret}`.
+    pub format: String,
+}
+
+/// A request matches when its method is listed (empty = any) and its path, without
+/// the query string, matches one of the globs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EgressRule {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 // ---------------------------------------------------------------- tokens
@@ -1022,6 +1084,26 @@ mod tests {
         // One failed boundary check outranks everything else, however clean.
         assert_eq!(security_grade(&[c("boundary", false), c("hygiene", true)]), "F");
         assert_eq!(security_grade(&[]), "A");
+    }
+
+    /// v5.4: a v5.3 file still parses, and a route's defaults are the safe ones.
+    #[test]
+    fn egress_routes_are_additive_and_default_to_https_and_trusted_only() {
+        let old: EgressPolicy =
+            serde_json::from_str(r#"{"allow":["pypi.org"],"allow_private_cidrs":["10.0.0.0/8"]}"#).unwrap();
+        assert!(old.routes.is_empty());
+        let p: EgressPolicy = serde_json::from_str(
+            r#"{"routes":[{"name":"github","hosts":["github.com"],"secret":"env://GH","env":"GITHUB_TOKEN",
+                "rules":[{"methods":["GET"],"paths":["/org/*"]}]}]}"#,
+        )
+        .unwrap();
+        let r = &p.routes[0];
+        assert_eq!((r.ports.as_slice(), r.trust.as_slice()), (&[443u16][..], &[Trust::Trusted][..]));
+        assert_eq!(r.rules[0].paths, ["/org/*"]);
+        // What a host reports must be able to leave `secret` out.
+        let mut reported = r.clone();
+        reported.secret = None;
+        assert!(!serde_json::to_string(&reported).unwrap().contains("secret"));
     }
 
     #[test]
