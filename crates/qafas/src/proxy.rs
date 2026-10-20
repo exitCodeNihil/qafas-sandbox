@@ -92,6 +92,23 @@ pub fn is_private(ip: IpAddr) -> bool {
             if let Some(v4) = a.to_ipv4_mapped() {
                 return is_private_v4(v4);
             }
+            // Forms that carry an IPv4 address are judged by the one inside: an
+            // allowed name whose AAAA record is `64:ff9b::a9fe:a9fe` reaches the
+            // metadata endpoint on a host with NAT64. Covered: NAT64 `64:ff9b::/96`,
+            // the deprecated IPv4-compatible `::/96` and 6to4 `2002::/16`. Teredo
+            // (`2001::/32`) and the local-use NAT64 prefix (`64:ff9b:1::/48`) are refused
+            // outright, since nothing here has a use for them.
+            let s = a.segments();
+            let embedded = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || s[..6] == [0; 6] {
+                return is_private_v4(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return is_private_v4(embedded(s[1], s[2]));
+            }
+            if (s[0] == 0x2001 && s[1] == 0) || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) {
+                return true;
+            }
             a.is_loopback()
                 || a.is_unspecified()
                 || a.is_multicast()
@@ -518,6 +535,7 @@ mod tests {
             allow: vec!["github.com".into(), "*.github.com".into(), "pypi.org".into()],
             deny_cidrs_extra: vec!["203.0.113.0/24".into()],
             allow_private_cidrs: vec![],
+            ..Default::default()
         })
     }
 
@@ -585,6 +603,7 @@ mod tests {
                 "100.64.0.0/10".into(),
                 "fd00::/8".into(),
             ],
+            ..Default::default()
         });
         let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
         assert!(p.decide("mirror.corp", &[ip("10.1.2.3")]).is_ok());
@@ -746,9 +765,22 @@ mod tests {
             "fd00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            // IPv4 inside an IPv6 address (NAT64, IPv4-compatible, 6to4, Teredo).
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+            "::a9fe:a9fe",
+            "2002:a9fe:a9fe::1",
+            "2002:7f00:1::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "64:ff9b:1::1",
         ] {
             let ip: IpAddr = bad.parse().unwrap();
             assert!(p.decide("github.com", &[ip]).is_err(), "{bad} must be denied");
+        }
+        // A public IPv4 behind a NAT64 or 6to4 prefix is as public as the IPv4.
+        for ok in ["64:ff9b::808:808", "2002:808:808::1", "2606:4700::1111"] {
+            assert!(p.decide("github.com", &[ok.parse().unwrap()]).is_ok(), "{ok} must be allowed");
         }
         // One bad address in the set poisons the whole answer.
         assert!(p.decide("github.com", &[public, "10.0.0.1".parse().unwrap()]).is_err());

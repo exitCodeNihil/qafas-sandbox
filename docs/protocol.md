@@ -68,7 +68,7 @@ Sections keep their numbers because code and other docs cite them (for example "
 | `exec.end` | `{exit, duration_ms, bytes_out}` |
 | `file.read` / `file.write` / `file.edit` | `{path, bytes}` |
 | `browser.navigate` | `{url}` |
-| `egress.allow` / `egress.deny` | `{host, port, bytes, reason?, peer?}`; v5.4 adds `via` on allow (`baseline` or `sandbox`: which name list matched) and, for a request to a route (§6), one event per request with `{host, port, method, path, route, injected}` (path without the query; `injected` lists the route names whose secret was attached; no secret value ever appears) |
+| `egress.allow` / `egress.deny` | `{host, port, bytes, reason?, peer?}`; v5.4 adds `via` and `duration_ms` on allow (`via` is `baseline` or `sandbox`: which name list matched; `duration_ms` is how long the tunnel lasted, which is how the event is attributed to the tool call that opened it) and, on a failed upstream connect, an `egress.deny` with reason `upstream connect failed` and `duration_ms`; and, for a request to a route (§6), one event per request with `{host, port, method, path, route, injected}` (path without the query; `injected` lists the route names whose secret was attached; no secret value ever appears) |
 | `pool.refill` | `{template, size}` |
 | `error` | `{msg}` |
 | v2 `sandbox.tier_selected` | `{requested, selected, reason}` |
@@ -741,7 +741,7 @@ Implemented once in `proto::hmac_token` and once in Go (~15 lines).
 }
 ```
 
-Always denied regardless of `allow`: loopback, RFC1918, link-local (`169.254.0.0/16`, `fe80::/10`), unspecified, unique-local `fd00::/8`, and `169.254.169.254` explicitly. Matching is on the CONNECT host or the absolute-URI host (wildmatch globs), then on every resolved address.
+Always denied regardless of `allow`: loopback, RFC1918, link-local (`169.254.0.0/16`, `fe80::/10`), unspecified, unique-local `fd00::/8`, and `169.254.169.254` explicitly. An IPv4 address carried inside an IPv6 one (NAT64 `64:ff9b::/96`, IPv4-compatible `::/96`, 6to4 `2002::/16`) is judged by the IPv4 inside; Teredo and the local-use NAT64 prefix are always denied. Matching is on the CONNECT host or the absolute-URI host (wildmatch globs), then on every resolved address.
 
 **`allow_private_cidrs` (v5.3).** Host file only; additive, default empty.
 
