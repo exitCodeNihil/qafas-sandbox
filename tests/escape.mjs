@@ -1,4 +1,4 @@
-// Adversarial escape battery: 21 probes an agent might try, run through a real sandbox.
+// Adversarial escape battery: 21 probes an agent might try (20 on remote), run through a real sandbox.
 // Usage: node tests/escape.mjs <qafas_url> <admin_token> <native|vm|remote> <workspace>
 // Prints probe | escaped? | alert rule(s); exits 1 if any probe escaped or a must-alert probe was silent.
 // `make escape TIER=native` runs it against a daemon on :7700 with SBX_TOKEN.
@@ -78,7 +78,11 @@ else: print('spawned',n)" 2>&1 | tail -1`, (o) => /spawned 600/.test(o.stdout), 
   ...portProbe,
 ];
 const rows = [];
-for (const [name, cmd, escaped, mustAlert] of probes) {
+// A microVM shares no filesystem with its host: a write to the guest's own (writable) home cannot
+// reach the host, so "write outside workspace" has nothing to escape to there and raises no alert.
+const notApplicable = isolation === "remote" ? new Set(["write outside workspace"]) : new Set();
+for (const n of notApplicable) console.log(`skipped: ${n} (remote: the guest's home is its own filesystem, not the host's)`);
+for (const [name, cmd, escaped, mustAlert] of probes.filter(([n]) => !notApplicable.has(n))) {
   const before = events.length;
   const out = await exec(cmd);
   await new Promise((r) => setTimeout(r, 1500));
