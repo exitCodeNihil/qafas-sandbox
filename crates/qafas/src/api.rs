@@ -300,7 +300,7 @@ impl AppState {
         let live = self.live.clone();
         Arc::new(move |ip| {
             let live = live.clone();
-            Box::pin(async move { peer_of(&*live.lock().await, ip) })
+            Box::pin(async move { Ok(peer_of(&*live.lock().await, ip)) })
         })
     }
 }
@@ -2975,14 +2975,14 @@ mod tests {
         assert_eq!((&again.egress_allow, again.trust), (&rec.egress_allow, rec.trust), "the next write keeps them");
         live_at(&st, "sbx_pb", Connector::Tcp("127.0.0.1:1".parse().unwrap()), None, Some("10.89.0.3"), "").await;
         let want = |allow: &[&str], trust| {
-            Some(crate::proxy::PeerInfo { egress_allow: allow.iter().map(|s| s.to_string()).collect(), trust })
+            Ok(Some(crate::proxy::PeerInfo { egress_allow: allow.iter().map(|s| s.to_string()).collect(), trust }))
         };
         let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
 
         let direct = st.peer_lookup();
         assert_eq!(direct(ip("10.89.0.2")).await, want(&["only-a.example"], proto::Trust::Untrusted));
         assert_eq!(direct(ip("10.89.0.3")).await, want(&[], proto::Trust::Trusted));
-        assert_eq!(direct(ip("10.89.0.9")).await, None);
+        assert_eq!(direct(ip("10.89.0.9")).await, Ok(None));
 
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sink = format!("http://{}/internal/events", l.local_addr().unwrap());
@@ -2991,14 +2991,16 @@ mod tests {
         let http = |tok: &str| crate::proxy::http_peer(&sink, crate::events::http_client(), tok.into()).unwrap();
         let admin = http(&st.cfg.token);
         assert_eq!(admin(ip("10.89.0.2")).await, want(&["only-a.example"], proto::Trust::Untrusted));
-        assert_eq!(admin(ip("10.89.0.9")).await, None, "an address nobody has");
+        assert_eq!(admin(ip("10.89.0.9")).await, Ok(None), "an address nobody has");
+        // A refusal is a lookup that failed, not an address nobody has (D34).
         let scoped = hmac_token::mint(&st.cfg.token, "sbx_pa", (now_ms() / 1000) as u64 + 60);
-        assert_eq!(http(&scoped)(ip("10.89.0.2")).await, None, "a sandbox's own token cannot ask");
-        assert_eq!(http("nope")(ip("10.89.0.2")).await, None);
+        let refused = http(&scoped)(ip("10.89.0.2")).await;
+        assert!(refused.as_ref().is_err_and(|e| e.contains("403")), "a sandbox's own token cannot ask: {refused:?}");
+        assert!(http("nope")(ip("10.89.0.2")).await.is_err());
 
         // A stopped container's address may already be someone else's.
         st.live_get("sbx_pa").await.unwrap().set_state(SandboxState::Stopped);
-        assert_eq!(admin(ip("10.89.0.2")).await, None);
+        assert_eq!(admin(ip("10.89.0.2")).await, Ok(None));
         let _ = std::fs::remove_dir_all(&st.cfg.state_dir);
     }
 
