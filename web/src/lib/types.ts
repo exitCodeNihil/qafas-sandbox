@@ -196,7 +196,20 @@ export type Host = {
 
 export type PolicyRule = { rule: string; severity: Severity; description: string };
 export type HostPolicy = {
-  egress?: { allow?: string[]; deny_cidrs_extra?: string[]; allow_private_cidrs?: string[] };
+  egress?: {
+    allow?: string[];
+    deny_cidrs_extra?: string[];
+    allow_private_cidrs?: string[];
+    /** v5.4: bound destinations; the host reports them without `secret`. */
+    routes?: {
+      name: string;
+      hosts: string[];
+      ports?: number[];
+      env?: string;
+      rules?: { methods?: string[]; paths: string[] }[];
+      trust?: string[];
+    }[];
+  };
   rules?: PolicyRule[];
   watch?: Record<string, string[]>;
 };

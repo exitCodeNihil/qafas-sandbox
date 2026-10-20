@@ -602,6 +602,32 @@ type EgressPolicy struct {
 	DenyCidrsExtra []string `json:"deny_cidrs_extra,omitempty"`
 	// v5.3: private ranges an allowed name may resolve into (internal mirrors). Host file only.
 	AllowPrivateCidrs []string `json:"allow_private_cidrs,omitempty"`
+	// v5.4 (D34): destinations the proxy terminates TLS for, to attach a credential and/or apply
+	// per-request rules. Host file only; a host reports its policy without `secret`.
+	Routes []EgressRoute `json:"routes,omitempty"`
+}
+
+// EgressRoute is one bound destination (v5.4). Hosts are allowed implicitly; only Ports are open
+// for them (default [443]) and every connection there is intercepted.
+type EgressRoute struct {
+	Name   string   `json:"name"`
+	Hosts  []string `json:"hosts"`
+	Ports  []int    `json:"ports,omitempty"`
+	Secret string   `json:"secret,omitempty"` // env://NAME or file:///abs/path; a reference, never the value
+	Env    string   `json:"env,omitempty"`    // the sandbox env var that carries the placeholder
+	Inject *struct {
+		Header string `json:"header"`
+		Format string `json:"format"`
+	} `json:"inject,omitempty"`
+	Rules []EgressRule `json:"rules,omitempty"`
+	Trust []string     `json:"trust,omitempty"` // default ["trusted"]
+}
+
+// EgressRule allows a request when its method is listed (empty = any) and its path, without the
+// query, matches one of the globs.
+type EgressRule struct {
+	Methods []string `json:"methods,omitempty"`
+	Paths   []string `json:"paths"`
 }
 
 // TokenEqual compares static admin tokens in constant time.

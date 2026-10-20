@@ -457,6 +457,29 @@ export interface EgressPolicy {
   deny_cidrs_extra?: string[];
   /** v5.3: private ranges an allowed name may resolve into (internal mirrors). Host file only. */
   allow_private_cidrs?: string[];
+  /** v5.4 (D34): destinations the proxy terminates TLS for, to attach a credential and/or apply per-request rules. Host file only. */
+  routes?: EgressRoute[];
+}
+
+/** v5.4. Hosts are allowed implicitly; only `ports` are open for them and all of it is intercepted. */
+export interface EgressRoute {
+  name: string;
+  hosts: string[];
+  ports?: number[]; // default [443]
+  /** `env://NAME` or `file:///abs/path`: a reference, never the value. A host reports its policy without it. */
+  secret?: string;
+  /** The sandbox env var that carries the placeholder; required with `secret`. */
+  env?: string;
+  /** Add this header with the secret when the request carries no placeholder. */
+  inject?: { header: string; format: string };
+  /** Allow-list of requests; empty = every request to the hosts. */
+  rules?: EgressRule[];
+  trust?: Trust[]; // default ["trusted"]
+}
+
+export interface EgressRule {
+  methods?: string[]; // empty = any
+  paths: string[]; // globs on the path, without the query
 }
 
 // ---------------------------------------------------------------- tokens
