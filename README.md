@@ -136,6 +136,7 @@ Inside a sandbox you get:
 - your current directory, at the **same absolute path**;
 - a Debian userland: git, curl, ripgrep, python3 + uv, node 22, headless Chromium;
 - no network except what `/etc/qafas/egress.json` allows (`curl https://example.com` works, `curl https://google.com` is refused by the proxy);
+- credentials it never holds: an egress **route** gives the sandbox a placeholder, and the proxy swaps in the real token only for the hosts you bound it to, with per-request method and path rules ([deployment guide](docs/deployment.md#7-egress));
 - the CPU, memory, disk and process limits of its size.
 
 The dashboard keeps every sandbox's process, file and network timeline, each allow and deny the egress proxy decided, and the alerts. Here, a sandbox reads the planted `~/.aws/credentials` and probes the cloud metadata address:

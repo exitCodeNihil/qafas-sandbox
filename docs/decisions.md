@@ -1,6 +1,6 @@
 # Decisions (ADR log)
 
-This is the log of decisions already made, D1 to D33, in the order they were made. Other docs and code cite them by ID (for example "D25"), so IDs never change and are never reused.
+This is the log of decisions already made, D1 to D34, in the order they were made. Other docs and code cite them by ID (for example "D25"), so IDs never change and are never reused.
 
 Each entry gives the decision (in the heading), why it was made, and, where the entry says so, what would change it or what was deliberately not done. Decisions are not re-opened. A later entry can amend an earlier one and says so: D27 amends D25, and D32 records a deviation from D7.
 
@@ -41,6 +41,7 @@ Each entry gives the decision (in the heading), why it was made, and, where the 
 | [D31](#d31--internal-mirrors-are-an-operators-private-range-allowlist-not-a-policy-override-2026-10-06) | Internal mirrors are an operator's private-range allowlist (2026-10-06) |
 | [D32](#d32--the-vm-tier-also-runs-on-docker-engine-as-a-dialect-of-the-podman-backend-2026-10-06) | The vm tier also runs on Docker Engine (2026-10-06) |
 | [D33](#d33--on-podman-no_new_privs-is-set-per-process-not-on-the-container-2026-10-09) | On podman, no_new_privs is set per process (2026-10-09) |
+| [D34](#d34--credentials-are-attached-at-the-egress-proxy-for-bound-hosts-only-2026-10-20) | Credentials are attached at the egress proxy, for bound hosts only (2026-10-20) |
 
 ## D1 — Warm pool + snapshot machinery, not fast boot
 Nothing cold-boots a Linux userland in tens of ms; Firecracker's ~125 ms is the floor and every sub-100 ms vendor serves from a pool (RESEARCH §0, §2). The POC allocates from a warm pool and boots only to refill it. Snapshot restore with working-set prefetch is phase 2.
@@ -276,3 +277,37 @@ Cause: the container-wide `no_new_privileges` makes AppArmor stack podman's prof
 The guest agent already sets `PR_SET_NO_NEW_PRIVS` on every process it starts (`harden::apply`, before seccomp), and a flag set inside the container, with no profile transition, leaves signals working — so the podman sandbox spec drops the container-wide flag and the workload keeps no_new_privs, as `images/probe/scan.sh` still checks. What loses it is the guest agent itself (uid 1000, no capabilities). The egress proxy container, Docker and Firecracker keep their settings.
 
 What would change it: a podman/crun AppArmor profile that allows signals within the stacked label, on the distributions we support — then the container-wide flag comes back.
+
+
+## D34 — Credentials are attached at the egress proxy, for bound hosts only (2026-10-20)
+D6's second half. An agent has to `git push`, pull from a private registry or call an internal API, and until now the only way was to put the token in the sandbox, where the model can read it and send it to any allowed host.
+
+Options, and why not:
+
+- **The token in the sandbox** (env, a credential helper, a socket that hands it out): whatever the sandbox can ask for, the model can print.
+- **Terminate TLS for every destination:** every blind tunnel becomes a man in the middle, pinning clients break everywhere, and nothing needs it; only the hosts a credential is for are intercepted.
+- **A CA per sandbox or per run:** placeholders and the trust a warm sandbox holds would change on every start. The CA is per install instead (`<state_dir>/egress-ca/`, made once, the key `0600`).
+- **A name-constrained CA:** the constraint would have to follow the route file, so every edit would mean a new CA and new placeholders. The CA gets a distinctive subject (`qafas egress CA <id>`), path length 0, and a key that never leaves the proxy.
+
+Chosen (contract v5.4, `routes` in the host's `egress.json`; an operator decision, never a create request's):
+
+- A route binds host globs and ports to a secret (`env://NAME` or `file:///path`, read once at start; `serve` and `doctor` refuse a route whose secret cannot be read) and/or to rules (method + path globs). It applies to the sandboxes whose trust it lists, `trusted` by default. The trust comes from the daemon's table per peer address (the shared proxies) or from the create (native).
+- For a sandbox it applies to, every CONNECT to a route host on a route port is intercepted, and every other way to that host is refused: another port, or plain HTTP. For any other sandbox the route host is just a name: refused unless `allow` (or its `egress_allow`) lists it, and then a blind tunnel as before.
+- Inside the tunnel: the SNI must be the CONNECT host, ALPN is HTTP/1.1 only, and the `Host` (or absolute URI) of every request must be that host too, or a CDN in front of it could route the secret to someone else's site. The rules are checked on a path that must be canonical: `..`, `.`, empty segments, backslashes and escapes of characters that need none are refused before the globs are tried, so `/org/*` cannot be walked out of.
+- The sandbox holds a placeholder, `qafas_ph_<name>_<HMAC of the CA key>`, stable across restarts and different per install. The proxy replaces it in header values (an `Authorization: Basic` value is decoded first) and in the query, and adds the `inject` header when the request carried none; a copy of that header the sandbox sent itself is dropped. Only this route's placeholder becomes this route's secret.
+- The request goes over TLS to the addresses the policy approved, verified against the system roots plus `SBX_EGRESS_CA_FILE`, never resolved again. On a route with a secret it asks for `Accept-Encoding: identity` whatever the client asked for, so the response is plain bytes; an upstream that compresses anyway gets a 502 (the fallback, not the rule). Every copy of the secret is overwritten in the response headers and body: raw, query-encoded, JSON-escaped, and the parts of its base64 (standard and URL) that only it determines at each alignment, which is what a Basic echo carries. Streaming, with the tail of each chunk held back so a secret split across two chunks is still whole when searched, and length-preserving, so `Content-Length` stays true. Redirects are handed back, never followed.
+- One `egress.allow`/`egress.deny` per request, `{host, port, method, path, route, injected, bytes, duration_ms, peer}`, never a value. What a host reports to the control plane carries every route without its `secret`.
+- Delivery: at acquire (and again on a wake), the sandbox's env gets the placeholders and `SSL_CERT_FILE` and friends, and `POST /ca` writes the CA and a bundle (system roots plus the CA) to `/tmp/qafas-ca` (the native tier: its own scratch, since its `/tmp` is the host's). Chromium trusts the CA by its key hash (`--ignore-certificate-errors-spki-list`), never more widely. Because it is delivered at acquire, a warm pool needs no refresh.
+
+Known limits:
+
+- HTTP/1.1 only: a client that will speak nothing but HTTP/2 fails to connect. One upstream connection per request.
+- Only header and query values are rewritten: a placeholder in a request body (a JSON login form) goes out as it is. Request bodies, compressed or not, are forwarded untouched.
+- After a WebSocket upgrade the stream is relayed without scrubbing.
+- The scrubber knows the forms above. A route host that reflects the secret transformed otherwise (hex, HTML entities, line-wrapped base64, inside a compressed archive) would hand it back. The route host receives the secret by design; the rules decide which requests can carry it.
+- Rules bind names, not services: another allowed name that reaches the same service is outside them, though it never carries the secret.
+- A host glob that covers names other people control (`*.s3.amazonaws.com`, `*.github.io`) sends the secret to them. List exact hosts.
+- Clients that pin certificates, ignore the CA variables, or use their own store (Java's trust store is not configured) fail closed.
+- Rotation is deleting `<state_dir>/egress-ca/` and restarting: running sandboxes keep the old placeholders and CA, so recreate them.
+- On the native tier the sandbox runs as the daemon's user: a `file://` secret must sit where that tier cannot read (the daemon's home or state directory; not `/etc`).
+- The vm tier's proxy container receives the secrets and the CA key in its environment (`SBX_ROUTES_JSON`), visible to whoever can inspect that container: the host operator.
