@@ -69,7 +69,7 @@ How the pieces work together:
 | Role | Needs |
 |---|---|
 | control plane | nothing beyond the OS: a static binary with the dashboard built in (or the `controlplane` container) |
-| `vm` worker | Docker Engine 26+ or podman 4.4+ with `podman.socket`; cgroup v2. Docker below 26 is refused at start (its internal networks forwarded DNS outside, CVE-2024-29018). |
+| `vm` worker | Docker Engine 26+ or podman 4.4+ with `podman.socket`; cgroup v2. Docker below 26 is refused at start (its internal networks forwarded DNS outside, CVE-2024-29018). Optionally a sandboxing OCI runtime (gVisor `runsc`, Kata) registered with the engine (section 5.1, "Sandbox runtime"). |
 | `remote` worker | `/dev/kvm` (bare metal, or nested virtualisation), cgroup v2, `nft` (nftables), `ip` (iproute2), `mkfs.ext4` (e2fsprogs), podman for building templates, and the `qafas-firecracker` bundle (section 5.4) |
 | `native` (dev only) | macOS 14+: Seatbelt (`/usr/bin/sandbox-exec`). Linux: `bwrap` (bubblewrap) on `PATH`, Landlock in the kernel (ABI 2+), and `qafas` running as the developer's own user, never as root (section 5.5). |
 
@@ -185,6 +185,7 @@ Docker writes its own iptables/nftables rules, but the rules above are still the
 ### Sandboxes
 
 - Sandboxes have an empty capability set, `no_new_privs`, a seccomp filter, a read-only root filesystem and no network but the proxy.
+- What the boundary is depends on the tier and the host. `vm` on Linux is a container on the host's own kernel, not a VM, unless `SBX_VM_RUNTIME` names a sandboxing runtime (section 5.1); on macOS the container engine is a VM. Hostile code from several tenants belongs on a `remote` worker. [security.md](security.md) has the table.
 - On podman and Firecracker they run as uid 1000, with the workspace mapped so that writes land as the directory's owner.
 - On Docker, which has no idmapped mounts, they run as the workspace's owner directly, and a root-owned workspace is refused.
 - Give each user a workspace they own (their home directory is the usual one).
@@ -272,6 +273,36 @@ curl -s -H "Authorization: Bearer $SBX_ADMIN_TOKEN" http://cp.example:7800/api/h
 
 - Every key, with its default: `/usr/share/doc/qafas/qafas.toml.example`.
 - Environment variables (`SBX_*`) override the file. The package pins the guest image that way (`/usr/lib/systemd/system/qafas.service.d/image.conf`), so it follows each upgrade.
+
+#### Sandbox runtime on `vm` workers
+
+`vm_runtime` in `/etc/qafas/qafas.toml` (or `SBX_VM_RUNTIME`) is the OCI runtime the `vm` tier's sandbox containers run under. Empty, the default, is the engine's own: `runc` on Docker, usually `crun` on podman, so on Linux a container on the host's kernel. Name a sandboxing runtime to put a user-space kernel (gVisor `runsc`) or a VM (Kata `kata`) between a sandbox and the host kernel. The egress proxy container always keeps the default runtime.
+
+1. Install the runtime and register it with the engine. For gVisor on Docker, from a release of [gVisor](https://gvisor.dev/docs/user_guide/install/) (offline: carry its `runsc` and `containerd-shim-runsc-v1` in, like any other artifact):
+
+   ```sh
+   sudo install -m755 runsc containerd-shim-runsc-v1 /usr/local/bin/    # plus the gvisor-bin/ directory a release ships beside runsc
+   sudo runsc install                                                  # adds "runsc" to "runtimes" in /etc/docker/daemon.json
+   sudo systemctl restart docker
+   ```
+
+2. Set the name, restart `qafas`, and read the doctor line. The key goes at the top level, above any `[table]`; the packaged file takes an appended line.
+
+   ```sh
+   echo 'vm_runtime = "runsc"' | sudo tee -a /etc/qafas/qafas.toml
+   sudo systemctl restart qafas
+   sudo qafas doctor        # vm runtime   Docker 29.1.3: runsc: sandboxed (gVisor): ...
+   ```
+
+   With the container install, add `SBX_VM_RUNTIME: ${SBX_VM_RUNTIME:-}` under `qafas.environment` in the compose file (it passes only the variables it lists) and set it in `.env`.
+
+Verify: `qafas doctor` shows `vm runtime` with the name and `sandboxed (gVisor)` or `sandboxed (Kata)`; without the setting it shows `engine default` and `shared host kernel`. On macOS it says the engine is a VM.
+
+Notes:
+
+- The name must be one the engine has. Docker: a key of `"runtimes"` in `daemon.json` (`docker info` lists them). A name it does not know makes `qafas doctor` fail and `qafas serve` refuse to start, instead of running under the default.
+- podman applies the per-container runtime only from 6.0. Before that, `doctor` fails with "ignores the create field oci_runtime": set the runtime as the engine's default in `/etc/containers/containers.conf` (`runtime = "runsc"`, which changes every container on that engine, the proxy included) and leave `vm_runtime` empty. The line then reads `engine default, runsc`.
+- gVisor was validated on Docker 29.1.3 (gVisor release-20261012.0, systrap, Ubuntu 24.04 aarch64) and is not yet fit for `trust: untrusted`: `/proc/1/environ` still exposes the agent token there, so the template scan grades `base` F and an untrusted create answers `409`; and a command can `kill -9 1` and end its own sandbox. [security.md](security.md) (Known gaps) has the details. Kata is untested.
 
 ### 5.2 Containers
 
@@ -546,6 +577,8 @@ Workers: back up `/etc/qafas/` and `/var/lib/qafas/tls/` (its pinned certificate
 | it is listed, but sandboxes fail to start | `public_url` is reachable from the control plane and the clients on 7700 |
 | `no tier available on this host` | `sudo qafas doctor`: the runtime socket, `/dev/kvm`, the Firecracker files |
 | `Docker Engine … is too old` | upgrade to Docker 26 or later |
+| `vm runtime: … does not know the runtime …` (doctor FAIL, `serve` refuses) | register the runtime in `daemon.json` under `"runtimes"` and restart Docker, or fix `vm_runtime` (section 5.1) |
+| `vm runtime: podman … ignores the create field oci_runtime` | podman before 6.0 cannot run one container under another runtime: set it as the engine default in `containers.conf` and leave `vm_runtime` empty (section 5.1) |
 | `… is owned by root` / `… does not exist; on the Docker runtime …` | run from an existing directory a regular user owns |
 | `pull …: …` on first start | the guest image is not loaded and the registry is unreachable: load it ([airgap.md](airgap.md)) |
 | a changed `pool_size` has no effect | an earlier `PUT /snapshots/base {warm}` is kept in `/var/lib/qafas/snapshots/base.warm` and wins (the log says so at start): delete the file, or `PUT` the new number |

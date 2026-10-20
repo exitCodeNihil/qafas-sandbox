@@ -162,10 +162,16 @@ The dashboard keeps every sandbox's process, file and network timeline, each all
 | Tier | Also accepted as | Boundary | Use it for |
 |---|---|---|---|
 | `native` | `process` | the OS sandbox (Seatbelt on macOS; bwrap, Landlock and seccomp on Linux), sharing the host kernel | fast iteration on trusted code, on a developer's own machine |
-| `vm` | `docker` | a container with its own root filesystem (Docker or podman) | general purpose, including untrusted code |
-| `remote` | `firecracker` | a Firecracker microVM with its own kernel (Linux with KVM) | the strongest isolation, shared hosts |
+| `vm` | `docker` | a container with its own root filesystem (Docker or podman); what stands between it and the host depends on the host, see below | general purpose, and code you do not trust when one team runs it (not hostile code from several tenants) |
+| `remote` | `firecracker` | a Firecracker microVM with its own kernel (Linux with KVM) | the strongest isolation: hostile or multi-tenant code, shared hosts |
 
 A request with `trust: untrusted` never runs on `native`.
+
+What `vm` isolates depends on where it runs:
+
+- **macOS:** the container engine is a VM (the podman machine), so a VM boundary separates every sandbox from the Mac. Concurrent sandboxes share that VM's kernel.
+- **Linux:** a container on the host's own kernel (namespaces, seccomp, no capabilities, read-only root, no network but the proxy). A kernel exploit inside a sandbox is a host compromise. Set `SBX_VM_RUNTIME` to a sandboxing OCI runtime (gVisor `runsc`, Kata) to put a user-space kernel or a VM in between; `qafas doctor` shows which one is in effect ([deployment guide](docs/deployment.md), [security.md](docs/security.md)).
+- Hostile code from several tenants belongs on `remote`. A host that can run Firecracker serves `remote` instead of `vm`, so there `trust: untrusted` lands on a microVM; a Linux host without it sends it to `vm`, a container boundary.
 
 ### Sizes
 
