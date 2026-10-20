@@ -481,9 +481,44 @@ async fn pool_stats(State(st): State<AppState>, a: Auth) -> Response {
 /// What this host enforces and watches. The same JSON rides along with the
 /// registration so the control plane's Policy page shows it per host.
 pub fn policy_summary(cfg: &Config) -> serde_json::Value {
-    let egress: proto::EgressPolicy =
+    let mut egress: proto::EgressPolicy =
         std::fs::read_to_string(&cfg.policy).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    // D34: where a route's credential lives is the host's business; the control
+    // plane and `GET /policy` see the route without it.
+    for r in &mut egress.routes {
+        r.secret = None;
+    }
     agent_core::rules::policy_summary(&egress)
+}
+
+/// D34. The request's `env` with what the routes that apply to a `trust`
+/// sandbox add on top of it (each placeholder, the CA paths under `ca_dir`),
+/// which a caller's own names can never replace, plus the CA to hand the guest.
+/// Without routes, or with none for this trust: the `env` as it was, no CA.
+fn route_env(
+    ic: Option<&crate::intercept::Intercept>,
+    env: &BTreeMap<String, String>,
+    trust: proto::Trust,
+    ca_dir: &str,
+) -> (BTreeMap<String, String>, Option<String>) {
+    match ic.filter(|ic| ic.applies(trust)) {
+        Some(ic) => {
+            let mut env = env.clone();
+            env.extend(ic.sandbox_env(trust, ca_dir));
+            (env, Some(ic.ca_pem().to_string()))
+        }
+        None => (env.clone(), None),
+    }
+}
+
+/// `POST /ca` on the guest. A guest image without the route still runs, but no
+/// TLS client in it trusts a route host: it fails closed, and the log says why.
+async fn deliver_ca(conn: &Connector, token: Option<&str>, id: &str, pem: &str) {
+    match crate::backend::guest_call(conn, token, "POST", "/ca", &json!({"pem": pem})).await {
+        Ok((s, _)) if (200..300).contains(&s) => {}
+        Ok((s, _)) => tracing::warn!(sandbox_id = id, status = s, "guest did not take the egress CA"),
+        Err(e) => tracing::warn!(sandbox_id = id, error = %e, "guest did not take the egress CA"),
+    }
 }
 
 async fn policy(State(st): State<AppState>, a: Auth) -> Response {
@@ -667,7 +702,11 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         env: req.env.clone(),
         pi_session: req.pi_session.clone(),
         limits,
+        trust: req.trust,
     };
+    // D34: what the egress routes give this sandbox, if any apply to it.
+    let routes = crate::intercept::installed();
+    let env;
 
     let (sb, backend, warm, events) = match decision.tier {
         Isolation::Native => {
@@ -681,6 +720,10 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
             if req.workspace.is_none() {
                 spec.workspace_path = native.workspace_of(&id);
             }
+            // Its CA sits in its own scratch: a native sandbox's /tmp is the host's.
+            let ca_dir = native.scratch_of(&id).join("qafas-ca").display().to_string();
+            let (with_routes, ca) = route_env(routes.as_deref(), &req.env, req.trust, &ca_dir);
+            (spec.env, env) = (with_routes.clone(), with_routes);
             st.emit(
                 &id,
                 &corr,
@@ -689,6 +732,9 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
             );
             match native.create(spec).await {
                 Ok(sb) => {
+                    if let Some(pem) = ca {
+                        deliver_ca(&sb.connector, None, &id, &pem).await;
+                    }
                     st.emit(&id, &corr, EventType::SandboxReady, json!({"boot_ms": sb.boot_ms}));
                     let events = dial_guest_events(&sb.id, &sb.connector, sb.agent_token.as_deref()).await;
                     (sb, native as Arc<dyn Backend>, false, events)
@@ -698,18 +744,24 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         }
         _ => match st.pool.acquire(&template, &workspace, &req.egress_allow, &image, snap_ref.clone(), &limits).await {
             Ok((mut sb, warm)) => {
+                // D34: delivered here, at acquire, so a warm sandbox made before
+                // a route existed is handed out with it all the same.
+                let ca;
+                (env, ca) = route_env(routes.as_deref(), &req.env, req.trust, agent_core::ca::CA_DIR);
                 // A workspace-agnostic pool (microVMs) booted this one with no
                 // workspace; the request names it, and the tar lands there. The
                 // v3 `env` rides the same call, so a workspace-keyed pool
                 // (containers) makes it only when there is something to say.
-                if !st.pool.backend().pool_by_workspace() || !req.env.is_empty() {
+                if !st.pool.backend().pool_by_workspace() || !env.is_empty() {
                     sb.workspace_path = workspace.clone();
                     if let Err(e) =
-                        crate::backend::set_workspace(&sb.connector, sb.agent_token.as_deref(), &workspace, &req.env)
-                            .await
+                        crate::backend::set_workspace(&sb.connector, sb.agent_token.as_deref(), &workspace, &env).await
                     {
                         tracing::warn!(error = %e, sandbox_id = %sb.id, "guest did not take the workspace path");
                     }
+                }
+                if let Some(pem) = ca {
+                    deliver_ca(&sb.connector, sb.agent_token.as_deref(), &sb.id, &pem).await;
                 }
                 // Pull the guest's own telemetry onto our bus for as long as it
                 // lives; it cannot push to us through an internal network (D7).
@@ -774,7 +826,7 @@ async fn create_inner(st: AppState, headers: HeaderMap, body: axum::body::Bytes)
         max_age_secs: req.max_age_secs.or(Some(st.cfg.max_age_secs)).filter(|s| *s > 0),
         state: std::sync::Mutex::new((SandboxState::Ready, now_ms())),
         op: Mutex::new(()),
-        env: req.env,
+        env,
         egress_allow: req.egress_allow,
         trust: req.trust,
         long_running_fired: Default::default(),
@@ -937,17 +989,22 @@ async fn transition(st: &AppState, l: &Arc<Live>, verb: Verb, reason: &str) -> a
         // workspace, and the session's `env` (§3a). A microVM comes back from a
         // memory snapshot and remembers both; the native shim reads them from
         // its environment.
-        if l.isolation == Isolation::Vm {
-            if let Err(e) = crate::backend::set_workspace(
-                &l.sb.connector,
-                l.sb.agent_token.as_deref(),
-                &l.sb.workspace_path,
-                &l.env,
-            )
-            .await
+        // D34: and the egress CA again (a container's /tmp is a new tmpfs), with
+        // the current placeholders: a microVM's memory may predate a CA rotation.
+        let (env, ca) = match l.isolation {
+            Isolation::Native => (l.env.clone(), None),
+            _ => route_env(crate::intercept::installed().as_deref(), &l.env, l.trust, agent_core::ca::CA_DIR),
+        };
+        if l.isolation == Isolation::Vm || ca.is_some() {
+            if let Err(e) =
+                crate::backend::set_workspace(&l.sb.connector, l.sb.agent_token.as_deref(), &l.sb.workspace_path, &env)
+                    .await
             {
                 tracing::warn!(error = %e, sandbox_id = %id, "woken guest did not take the workspace path");
             }
+        }
+        if let Some(pem) = ca {
+            deliver_ca(&l.sb.connector, l.sb.agent_token.as_deref(), &id, &pem).await;
         }
         // Its telemetry stream died with the old guest, unless this is a resume:
         // that guest never went away, and its stream survived the pause.
@@ -3185,5 +3242,30 @@ mod tests {
         assert_eq!(reloaded.get("node22").await.unwrap().warm, 2);
         assert_eq!(reloaded.get("base").await.unwrap().warm, 3, "base's number is kept too");
         let _ = std::fs::remove_dir_all(&st.cfg.state_dir);
+    }
+
+    /// D34: the routes' variables go on top of the request's own `env`, so a
+    /// caller can replace neither a placeholder nor a CA path; a sandbox no
+    /// route applies to, and a host without routes, get the request's `env`
+    /// exactly and no CA call.
+    #[test]
+    fn route_variables_go_on_top_of_the_requests_env() {
+        let p: proto::EgressPolicy = serde_json::from_value(json!({"routes": [
+            {"name": "gh", "hosts": ["github.com"], "secret": "env://PATH", "env": "GH_TOKEN"}]}))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("sbx-api-routes-{}", std::process::id()));
+        let ca = crate::intercept::Ca::load_or_create(&dir).unwrap();
+        let ic =
+            crate::intercept::Intercept::new(crate::intercept::resolve_routes(&p).unwrap(), ca, String::new()).unwrap();
+        let asked: BTreeMap<String, String> =
+            [("GH_TOKEN", "mine"), ("SSL_CERT_FILE", "/x"), ("KEEP", "1")].map(|(k, v)| (k.into(), v.into())).into();
+        let (env, ca) = route_env(Some(&ic), &asked, proto::Trust::Trusted, "/tmp/qafas-ca");
+        assert!(env["GH_TOKEN"].starts_with("qafas_ph_gh_"), "{env:?}");
+        assert_eq!((env["SSL_CERT_FILE"].as_str(), env["KEEP"].as_str()), ("/tmp/qafas-ca/bundle.pem", "1"));
+        assert_eq!(ca.as_deref(), Some(ic.ca_pem()));
+        assert!(!format!("{env:?}").contains(&std::env::var("PATH").unwrap()), "the placeholder, not the secret");
+        assert_eq!(route_env(Some(&ic), &asked, proto::Trust::Untrusted, "/d"), (asked.clone(), None));
+        assert_eq!(route_env(None, &asked, proto::Trust::Trusted, "/d"), (asked.clone(), None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

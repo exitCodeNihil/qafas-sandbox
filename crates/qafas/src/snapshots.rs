@@ -320,6 +320,7 @@ pub async fn capture_memory(
             pi_session: String::new(),
             // The capture VM is a throwaway that only warms a page cache.
             limits: st.cfg.default_limits(),
+            trust: Default::default(),
         })
         .await?;
     let r = async {

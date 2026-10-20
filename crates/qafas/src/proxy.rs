@@ -169,6 +169,13 @@ impl Policy {
         if ips.is_empty() {
             return Err("dns resolution failed".into());
         }
+        self.check_addresses(ips)?;
+        Ok(via)
+    }
+
+    /// The address half alone: what a route host (D34), allowed by being one,
+    /// is still held to.
+    pub fn check_addresses(&self, ips: &[IpAddr]) -> Result<(), String> {
         for ip in ips {
             let opened = openable(*ip) && self.allow_private.iter().any(|c| in_cidr(*ip, *c));
             if is_private(*ip) && !opened {
@@ -178,7 +185,7 @@ impl Policy {
                 return Err(format!("address {ip} in deny_cidrs_extra"));
             }
         }
-        Ok(via)
+        Ok(())
     }
 }
 
@@ -223,11 +230,27 @@ pub struct ProxyCtx {
     pub token: String,
     pub host_id: String,
     pub http: HttpClient,
+    /// D34: the routes, when the host file has any. `None` is exactly the
+    /// proxy without routes.
+    pub intercept: Option<Arc<crate::intercept::Intercept>>,
+    /// The trust of the one sandbox a native proxy serves; the shared proxies
+    /// learn it per peer (`PeerInfo`).
+    pub trust: Option<proto::Trust>,
 }
 
 impl ProxyCtx {
     pub fn new(policy: Policy, host_id: String, token: String) -> Self {
-        Self { policy, peer: None, sink: None, emit: None, token, host_id, http: http_client() }
+        Self {
+            policy,
+            peer: None,
+            sink: None,
+            emit: None,
+            token,
+            host_id,
+            http: http_client(),
+            intercept: None,
+            trust: None,
+        }
     }
 
     /// The sandbox behind `ip`, asked of the daemon. Only the shared proxies
@@ -260,6 +283,8 @@ pub fn http_peer(sink: &str, http: HttpClient, token: String) -> Option<PeerLook
 
 /// `peer`: the daemon's own lookup when the proxy runs in its process (the
 /// remote tier); `None` derives the HTTP one from `sink` (the container).
+/// `intercept` likewise: the daemon's, or `None` for `SBX_ROUTES_JSON`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listen: SocketAddr,
     policy: &str,
@@ -268,12 +293,17 @@ pub async fn run(
     token: String,
     host_id: String,
     peer: Option<PeerLookup>,
+    intercept: Option<Arc<crate::intercept::Intercept>>,
 ) -> anyhow::Result<()> {
     let mut ctx = ProxyCtx::new(Policy::load(policy), host_id, token);
     if let Some(pem) = sink_ca {
         ctx.http = crate::events::http_client_with(crate::tls::pinned_config(&pem)?);
     }
     ctx.peer = peer.or_else(|| http_peer(sink.as_deref()?, ctx.http.clone(), ctx.token.clone()));
+    ctx.intercept = match intercept {
+        Some(ic) => Some(ic),
+        None => crate::intercept::from_env()?,
+    };
     ctx.sink = sink;
     let l = TcpListener::bind(listen).await?;
     tracing::info!(%listen, policy, "egress proxy listening");
@@ -405,7 +435,7 @@ fn origin_head<'a>(method: &str, path: &str, headers: impl Iterator<Item = &'a s
     out
 }
 
-async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow::Result<()> {
+async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &Arc<ProxyCtx>) -> anyhow::Result<()> {
     let opened = std::time::Instant::now();
     let (head, leftover) = read_headers(&mut sock).await?;
     let mut lines = head.split("\r\n");
@@ -425,6 +455,14 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow
             Vec::new()
         }
     };
+
+    // D34: a route host, for a sandbox the route applies to, is the
+    // interceptor's whatever the lists say; for anyone else it is not there.
+    if let Some(ic) = ctx.intercept.clone() {
+        if let Some(claim) = ic.claim(ctx, peer.ip(), method == "CONNECT", &host, port, &ips).await {
+            return crate::intercept::serve(sock, peer, ctx.clone(), ic, claim, host, port, ips).await;
+        }
+    }
 
     let via = match verdict(ctx, peer.ip(), &host, &ips).await {
         Ok(via) => via,
@@ -502,7 +540,7 @@ async fn upstream(
 
 /// Events carry the peer address; qafas turns it into a `sandbox_id`, since
 /// only it knows which container has which IP.
-async fn emit(ctx: &ProxyCtx, peer: SocketAddr, ty: EventType, mut data: serde_json::Value) {
+pub(crate) async fn emit(ctx: &ProxyCtx, peer: SocketAddr, ty: EventType, mut data: serde_json::Value) {
     data["peer"] = json!(peer.ip().to_canonical().to_string());
     if let Some(f) = &ctx.emit {
         f(ty, data);

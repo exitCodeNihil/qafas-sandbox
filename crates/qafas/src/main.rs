@@ -9,6 +9,7 @@ mod bench;
 mod config;
 mod doctor;
 mod events;
+mod intercept;
 mod livetable;
 mod metrics;
 mod policy;
@@ -122,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
             }
             // The daemon's own certificate, when its API (and so the sink) is TLS.
             let sink_ca = std::env::var("SBX_SINK_CA").ok().filter(|p| !p.is_empty()).map(String::into_bytes);
-            proxy::run(listen, &cfg.policy, sink, sink_ca, cfg.token.clone(), cfg.host_id.clone(), None).await
+            proxy::run(listen, &cfg.policy, sink, sink_ca, cfg.token.clone(), cfg.host_id.clone(), None, None).await
         }
         Cmd::Doctor { json } => doctor::run(cfg, json).await,
         Cmd::Shim { .. } => unreachable!("handled above"),
@@ -163,6 +164,12 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // D34: routes, their secrets and the egress CA, before any proxy starts
+    // (the proxy container gets them in its environment). A route whose secret
+    // cannot be read stops the daemon here, naming the route.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let intercept = intercept::init(&cfg)?;
 
     // The persisted sandbox table, read before anything sweeps: it is the only
     // thing that says which jail, archive and /30 slot still has an owner.
@@ -299,7 +306,7 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
         let peer = Some(state.peer_lookup());
         tokio::spawn(async move {
             let listen = SocketAddr::from(([0, 0, 0, 0], proto::EGRESS_PROXY_PORT));
-            if let Err(e) = proxy::run(listen, &policy, Some(sink), sink_ca, token, host_id, peer).await {
+            if let Err(e) = proxy::run(listen, &policy, Some(sink), sink_ca, token, host_id, peer, intercept).await {
                 tracing::error!(error = %e, "in-process egress proxy died");
             }
         });

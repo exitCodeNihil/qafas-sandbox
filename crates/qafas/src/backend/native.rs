@@ -111,7 +111,7 @@ impl Native {
         Ok(Self { cfg, bus, reg: Default::default(), template, kernel_enforced })
     }
 
-    fn scratch_of(&self, id: &str) -> PathBuf {
+    pub fn scratch_of(&self, id: &str) -> PathBuf {
         PathBuf::from(&self.cfg.scratch_dir).join(format!("sbx-{id}"))
     }
 
@@ -223,6 +223,7 @@ impl Native {
         extra: &[String],
         pi_session: String,
         ev: Emitter,
+        trust: proto::Trust,
     ) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let port = listener.local_addr()?.port();
@@ -241,6 +242,8 @@ impl Native {
         };
         let policy = crate::proxy::Policy::load(&self.cfg.policy).with_extra(extra);
         let mut ctx = crate::proxy::ProxyCtx::new(policy, self.cfg.host_id.clone(), self.cfg.token.clone());
+        // D34: the daemon's routes, applied by this sandbox's trust.
+        (ctx.intercept, ctx.trust) = (crate::intercept::installed(), Some(trust));
         // Events go straight onto the bus already carrying the sandbox id, and
         // the tool call is the one forwarded to it when the connection opened.
         ctx.emit = Some(Arc::new(move |ty, data| {
@@ -369,8 +372,9 @@ impl Native {
                 let _ = bus.send(e);
             }),
         );
-        let (proxy_port, proxy) =
-            self.start_proxy(&spec.id, &scratch, &spec.egress_allow, spec.pi_session.clone(), ev.clone()).await?;
+        let (proxy_port, proxy) = self
+            .start_proxy(&spec.id, &scratch, &spec.egress_allow, spec.pi_session.clone(), ev.clone(), spec.trust)
+            .await?;
         *proxy_abort = Some(proxy.abort_handle());
         let (profile, env) = self.prepare(&spec.id, &scratch, &spec.workspace_path, proxy_port, &spec.env)?;
         let pgid = self.spawn_shim(&scratch, &spec.workspace_path, &profile, &env, &spec.limits).await?;
@@ -1058,7 +1062,10 @@ mod tests {
         let n = Native::new(Arc::new(cfg), bus.clone()).unwrap();
         let mut rx = bus.subscribe();
         let ev = Emitter::new("h", "sbx_ntc", Arc::new(move |e: Event| drop(bus.send(e))));
-        let (port, task) = n.start_proxy("sbx_ntc", &[], "sess".into(), ev).await.unwrap();
+        let scratch = std::env::temp_dir().join(format!("sbx-ntc-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (port, task) =
+            n.start_proxy("sbx_ntc", &scratch, &[], "sess".into(), ev, proto::Trust::Trusted).await.unwrap();
         crate::events::note_call("sbx_ntc", &Corr { pi_session: "sess".into(), tool_call_id: "tc-n".into() });
 
         // A literal nobody listed: denied without a DNS lookup or a network.
@@ -1075,6 +1082,7 @@ mod tests {
         );
         task.abort();
         crate::events::forget_call("sbx_ntc");
+        let _ = std::fs::remove_dir_all(&scratch);
         std::fs::remove_file(&tmpl).unwrap();
     }
 
@@ -1134,6 +1142,7 @@ mod tests {
             snapshot: None,
             env: Default::default(),
             pi_session: String::new(),
+            trust: proto::Trust::Trusted,
             limits,
         };
         let e = n.create(spec).await.unwrap_err();

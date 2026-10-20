@@ -185,6 +185,11 @@ pub async fn run_checks(cfg: &Config) -> Vec<Check> {
         pol,
         format!("{}{}", cfg.policy, if pol { "" } else { " (missing: everything is denied)" }),
     ));
+    // D34: only on a host whose policy has routes; a route whose secret cannot
+    // be read is a failure, and `serve` refuses to start over it.
+    if let Some((ok, detail)) = crate::intercept::doctor(cfg) {
+        out.push(check("egress routes", ok, detail));
+    }
     let tmpl = std::path::Path::new(&cfg.templates).exists();
     out.push(check(
         "tool templates",
@@ -301,7 +306,8 @@ pub async fn run(cfg: Arc<Config>, json: bool) -> anyhow::Result<()> {
                 "serving": caps.tiers(),
             }))?
         );
-        if caps.tiers().is_empty() || vm_runtime_refusal(&checks, &caps).is_some() {
+        if caps.tiers().is_empty() || vm_runtime_refusal(&checks, &caps).is_some() || routes_refusal(&checks).is_some()
+        {
             std::process::exit(1);
         }
         return Ok(());
@@ -327,11 +333,16 @@ pub async fn run(cfg: Arc<Config>, json: bool) -> anyhow::Result<()> {
         eprintln!("\nno tier is available; qafas cannot serve anything on this host");
         std::process::exit(1);
     }
-    if let Some(why) = vm_runtime_refusal(&checks, &caps) {
+    if let Some(why) = vm_runtime_refusal(&checks, &caps).or_else(|| routes_refusal(&checks)) {
         eprintln!("\nqafas serve would refuse to start: {why}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// D34: a route `serve` could not attach its secret for.
+pub fn routes_refusal(checks: &[Check]) -> Option<String> {
+    checks.iter().find(|c| c.name == "egress routes" && !c.ok).map(|c| format!("egress routes: {}", c.detail))
 }
 
 #[cfg(test)]

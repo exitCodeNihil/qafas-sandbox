@@ -185,6 +185,10 @@ pub struct Spec {
     /// v5 §3a. Resolved ceilings. A pool create uses `medium`; `apply_limits`
     /// re-applies the request's when a warm sandbox is handed out.
     pub limits: proto::SandboxLimits,
+    /// D34. Read by the native tier only, whose proxy serves this one sandbox
+    /// and decides which egress routes apply by it. The shared proxies (vm,
+    /// remote) look it up per peer instead, so a pool create leaves the default.
+    pub trust: proto::Trust,
 }
 
 /// What a backend hands back.

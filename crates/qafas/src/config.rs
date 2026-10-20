@@ -47,6 +47,7 @@ pub struct FileConfig {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub ca_file: Option<String>,
+    pub egress_ca_file: Option<String>,
     pub state_dir: Option<String>,
     pub public_url: Option<String>,
     pub token_ttl_secs: Option<u64>,
@@ -141,8 +142,11 @@ pub struct Config {
     pub tls_key: String,
     /// CA bundle an `https://` `cp_url` must chain to; empty: the system bundle.
     pub ca_file: String,
+    /// D34: internal CAs a route host's certificate may chain to, on top of the
+    /// system roots, when the egress proxy terminates TLS for it. `SBX_EGRESS_CA_FILE`.
+    pub egress_ca_file: String,
     /// Where the daemon keeps state it must not regenerate, i.e. the self-signed
-    /// certificate whose fingerprint clients pin.
+    /// certificate whose fingerprint clients pin, and the egress CA (D34).
     pub state_dir: String,
     /// Overrides the URL handed to the control plane and to pi. Needed whenever
     /// the listen address is not the address clients dial (port forwards, NAT).
@@ -335,6 +339,7 @@ impl Config {
             tls_cert: s("SBX_TLS_CERT", f.tls_cert, ""),
             tls_key: s("SBX_TLS_KEY", f.tls_key, ""),
             ca_file: s("SBX_CA_FILE", f.ca_file, ""),
+            egress_ca_file: s("SBX_EGRESS_CA_FILE", f.egress_ca_file, ""),
             state_dir: s("SBX_STATE_DIR", f.state_dir, &default_state_dir()),
             public_url: s("SBX_PUBLIC_URL", f.public_url, "").trim_end_matches('/').to_string(),
             token_ttl_secs: num("SBX_TOKEN_TTL_SECS", f.token_ttl_secs, proto::hmac_token::DEFAULT_TTL_SECS),

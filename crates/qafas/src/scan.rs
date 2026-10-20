@@ -93,6 +93,7 @@ pub async fn scan(st: &AppState, template: &str) -> anyhow::Result<TemplateSecur
             env: Default::default(),
             pi_session: String::new(),
             limits: st.cfg.default_limits(),
+            trust: Default::default(),
         })
         .await?;
     SCANNING.lock().unwrap().push(sb.clone());
