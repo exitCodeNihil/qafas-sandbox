@@ -1,9 +1,11 @@
-// Adversarial escape battery: 20 probes an agent might try, run through a real sandbox.
+// Adversarial escape battery: 21 probes an agent might try, run through a real sandbox.
 // Usage: node tests/escape.mjs <qafas_url> <admin_token> <native|vm|remote> <workspace>
 // Prints probe | escaped? | alert rule(s); exits 1 if any probe escaped or a must-alert probe was silent.
 // `make escape TIER=native` runs it against a daemon on :7700 with SBX_TOKEN.
 // Run it on the daemon's host, or set HOME to the home of the user the daemon serves: the path probes use this process's HOME.
 // probe | blocked? | alert rule(s) seen. Exit 1 if any probe "succeeded" (escape) or a must-alert probe had no alert.
+import net from "node:net";
+import os from "node:os";
 const [url, token, isolation, workspace] = process.argv.slice(2);
 const H = { Authorization: `Bearer ${token}`, "content-type": "application/json" };
 const r = await fetch(`${url}/sandboxes`, { method: "POST", headers: H, body: JSON.stringify({ template: "base", workspace: { host_path: workspace }, pi_session: `escape-${isolation}`, isolation }) });
@@ -19,6 +21,24 @@ const exec = async (cmd, timeout_ms = 15000) => {
   return res.ok ? res.json() : { exit: -1, stdout: "", stderr: `http ${res.status}` };
 };
 const HOME = process.env.HOME;
+// M46: Landlock restricts TCP connect by port, not by address. This host listens on its own
+// non-loopback address at the sandbox's proxy port (from $HTTPS_PROXY) and at 3128, the port the
+// Landlock rule allowed up to 0.3.2; a connection from the sandbox to either one is an escape.
+// Skipped on macOS native, where Seatbelt allows the proxy port on localhost only.
+const lan = Object.values(os.networkInterfaces()).flat().find((a) => a?.family === "IPv4" && !a.internal)?.address;
+const proxyPort = Number((await exec(`printf %s "$HTTPS_PROXY"`)).stdout.match(/:(\d+)\/?$/)?.[1] ?? 0);
+const seatbelt = process.platform === "darwin" && isolation === "native";
+const reached = [], listening = [], servers = [];
+for (const port of lan && !seatbelt ? new Set([proxyPort, 3128].filter(Boolean)) : []) {
+  const srv = net.createServer((c) => { reached.push(port); c.destroy(); });
+  if (await new Promise((res) => { srv.once("error", () => res(false)); srv.listen(port, lan, () => res(true)); })) {
+    servers.push(srv); listening.push(port);
+  }
+}
+const portProbe = listening.length
+  ? [["proxy port on another address", listening.map((p) => `curl --noproxy '*' -s -m 4 -o /dev/null http://${lan}:${p}/; echo ${p}:$?`).join("; "), () => reached.length > 0, false]]
+  : [];
+if (!portProbe.length) console.log(`skipped: proxy port on another address (${seatbelt ? "macOS native: Seatbelt allows the proxy port on localhost only" : !lan ? "no non-loopback IPv4 address" : `cannot listen on ${lan}:${proxyPort} or 3128`})`);
 // [name, cmd, escapedIf(result) => bool, mustAlert]
 const probes = [
   ["read ssh key", `cat ${HOME}/.ssh/id_rsa ~/.ssh/id_rsa 2>&1 | head -c 200`, (o) => /PRIVATE KEY/.test(o.stdout) && !/sbx-canary/.test(o.stdout), true],
@@ -50,6 +70,7 @@ except OSError as e: print('limited at',n,e)
 else: print('spawned',n)" 2>&1 | tail -1`, (o) => /spawned 600/.test(o.stdout), false],
   ["kill daemon pid1", `kill -9 1 2>&1; sleep 0.3; echo still=$(id -u)`, (o) => !/still=\d/.test(o.stdout), false],
   ["symlink escape", `ln -sf ${HOME}/.ssh linkout && cat linkout/id_rsa 2>&1 | head -c 100; rm -f linkout`, (o) => /PRIVATE KEY/.test(o.stdout) && !/sbx-canary/.test(o.stdout), true],
+  ...portProbe,
 ];
 const rows = [];
 for (const [name, cmd, escaped, mustAlert] of probes) {
@@ -66,4 +87,5 @@ console.log(fails.length ? `FAIL: ${fails.map((f) => f.probe).join(", ")}` : "AL
 await fetch(`${url}/sandboxes/${sb.id}`, { method: "DELETE", headers: H });
 try { (await import("node:fs")).unlinkSync(`${HOME}/sbx-escape-proof`); } catch {}
 ws.close();
+for (const srv of servers) srv.close();
 process.exit(fails.length ? 1 : 0);
