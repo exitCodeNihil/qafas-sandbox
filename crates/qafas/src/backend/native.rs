@@ -98,6 +98,9 @@ pub struct Native {
     /// Decided once: it is a property of the kernel and of our privileges, not
     /// of the sandbox. `false` → the shim's watchdog, `enforcement: "daemon"`.
     kernel_enforced: bool,
+    /// D34: the state directory and the routes' secret files, on top of the
+    /// credential directories: denied by Seatbelt, covered under bwrap.
+    hidden: Vec<String>,
 }
 
 impl Native {
@@ -108,7 +111,8 @@ impl Native {
         if !kernel_enforced {
             tracing::info!("native tier limits are daemon-enforced (no writable cgroup v2 root)");
         }
-        Ok(Self { cfg, bus, reg: Default::default(), template, kernel_enforced })
+        let hidden = crate::intercept::hidden_paths(&cfg);
+        Ok(Self { cfg, bus, reg: Default::default(), template, kernel_enforced, hidden })
     }
 
     pub fn scratch_of(&self, id: &str) -> PathBuf {
@@ -283,7 +287,7 @@ impl Native {
             scratch: scratch.display().to_string(),
             home: home.display().to_string(),
             toolchains: seatbelt::default_toolchains(&real_home),
-            sensitive: seatbelt::default_sensitive(&real_home),
+            sensitive: [seatbelt::default_sensitive(&real_home), self.hidden.clone()].concat(),
             real_home: real_home.clone(),
             canaries,
             proxy_port,
@@ -427,7 +431,7 @@ impl Native {
         use std::os::unix::process::CommandExt;
         let socket = scratch.join("agent.sock");
         let me = std::env::current_exe()?;
-        let mut argv = wrapper_prefix(&self.cfg, profile, workspace, scratch, l);
+        let mut argv = wrapper_prefix(&self.cfg, profile, workspace, scratch, l, &self.hidden);
         argv.extend([me.display().to_string(), "shim".into(), "--socket".into(), socket.display().to_string()]);
 
         let mut c = std::process::Command::new(&argv[0]);
@@ -482,6 +486,7 @@ fn wrapper_prefix(
     workspace: &str,
     scratch: &Path,
     l: &proto::SandboxLimits,
+    hidden: &[String],
 ) -> Vec<String> {
     if cfg.native_permissive {
         tracing::warn!("SBX_NATIVE_PERMISSIVE: the native tier is running unwrapped");
@@ -489,13 +494,13 @@ fn wrapper_prefix(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (workspace, scratch, l);
+        let _ = (workspace, scratch, l, hidden);
         vec!["/usr/bin/sandbox-exec".into(), "-f".into(), profile.display().to_string()]
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = profile;
-        linux::bwrap_prefix(workspace, scratch, l.disk_mib)
+        linux::bwrap_prefix(workspace, scratch, l.disk_mib, hidden)
     }
 }
 
@@ -796,8 +801,20 @@ pub mod linux {
     /// the network namespace has only `lo`, so no address outside the sandbox
     /// is reachable at all (Landlock restricts TCP by port, never by address);
     /// the shim relays the egress proxy port back in over `proxy.sock`.
-    pub fn bwrap_prefix(workspace: &str, scratch: &Path, disk_mib: u64) -> Vec<String> {
+    /// `hidden` (D34): the state directory and the routes' secret files, covered
+    /// like the credential paths.
+    pub fn bwrap_prefix(workspace: &str, scratch: &Path, disk_mib: u64, hidden: &[String]) -> Vec<String> {
         let Some(bw) = bwrap() else { return Vec::new() };
+        bwrap_args(&bw, workspace, scratch, disk_mib, hidden)
+    }
+
+    pub(super) fn bwrap_args(
+        bw: &Path,
+        workspace: &str,
+        scratch: &Path,
+        disk_mib: u64,
+        hidden: &[String],
+    ) -> Vec<String> {
         let real_home = std::env::var("HOME").unwrap_or_default();
         let s = scratch.display().to_string();
         let mut v: Vec<String> = vec![bw.display().to_string()];
@@ -817,7 +834,7 @@ pub mod linux {
         }
         v.extend(["--bind".into(), workspace.into(), workspace.into()]);
         v.extend(["--bind".into(), s.clone(), s]);
-        for p in crate::seatbelt::default_sensitive(&real_home) {
+        for p in crate::seatbelt::default_sensitive(&real_home).into_iter().chain(hidden.iter().cloned()) {
             match std::fs::metadata(&p) {
                 Ok(m) if m.is_dir() => v.extend(["--tmpfs".into(), p]),
                 Ok(_) => v.extend(["--ro-bind".into(), "/dev/null".into(), p]),
@@ -978,7 +995,7 @@ pub mod linux {
     pub fn bwrap() -> Option<PathBuf> {
         None
     }
-    pub fn bwrap_prefix(_workspace: &str, _scratch: &Path, _disk_mib: u64) -> Vec<String> {
+    pub fn bwrap_prefix(_workspace: &str, _scratch: &Path, _disk_mib: u64, _hidden: &[String]) -> Vec<String> {
         Vec::new()
     }
     /// No cgroups on macOS: the native tier is `enforcement: "daemon"` there
@@ -1047,6 +1064,56 @@ mod tests {
         assert_eq!(n.workspace_of("abc"), "/tmp/sbx-abc");
         assert_ne!(n.workspace_of("abc"), "/tmp");
         std::fs::remove_file(&tmpl).unwrap();
+    }
+
+    /// D34: a workspace that contains the daemon's state directory (the CA key)
+    /// or a route's secret file must not expose them. The profile `prepare`
+    /// writes denies reads of both, like the credential directories.
+    #[test]
+    fn the_profile_hides_the_state_dir_and_the_route_secrets() {
+        let base = std::env::temp_dir().join(format!("sbx-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (state, ws, scratch) = (base.join("ws/state"), base.join("ws"), base.join("scratch"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let secret = ws.join("gh.token");
+        std::fs::write(&secret, "x").unwrap();
+        let policy = base.join("egress.json");
+        let route = serde_json::json!({"name": "gh", "hosts": ["github.com"], "env": "GH_TOKEN",
+            "secret": format!("file://{}", secret.display())});
+        std::fs::write(&policy, serde_json::json!({"routes": [route]}).to_string()).unwrap();
+        let mut cfg = crate::config::Config::resolve(crate::config::FileConfig::default());
+        cfg.seatbelt_profile = concat!(env!("CARGO_MANIFEST_DIR"), "/../../policy/seatbelt.sb.tmpl").into();
+        (cfg.state_dir, cfg.policy) = (state.display().to_string(), policy.display().to_string());
+        let n = Native::new(Arc::new(cfg), crate::events::bus()).unwrap();
+        let (profile, _) = n.prepare("sbx_hid", &scratch, &ws.display().to_string(), 1, &BTreeMap::new()).unwrap();
+        let text = std::fs::read_to_string(profile).unwrap();
+        let denied = text.split("(deny file-read*").nth(1).unwrap().split("(with message").next().unwrap();
+        for p in [&state, &secret] {
+            let rule = format!("(subpath \"{}\")", seatbelt::normalize(&p.display().to_string()));
+            assert!(denied.contains(&rule), "{rule} not in the deny block:\n{denied}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The same under bwrap: a directory gets an empty tmpfs, a file
+    /// `/dev/null`, after the workspace bind so they cover it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_covers_the_hidden_paths_inside_the_workspace() {
+        let base = std::env::temp_dir().join(format!("sbx-bwhid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (state, secret) = (base.join("state"), base.join("gh.token"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(&secret, "x").unwrap();
+        let (state, secret) = (state.display().to_string(), secret.display().to_string());
+        let ws = base.display().to_string();
+        let v = linux::bwrap_args(Path::new("/usr/bin/bwrap"), &ws, &base, 64, &[state.clone(), secret.clone()]);
+        let at = |w: &[&str]| v.windows(w.len()).position(|x| x.iter().zip(w).all(|(a, b)| a == b));
+        let bind = at(&["--bind", &ws, &ws]).expect("the workspace is bound");
+        assert!(at(&["--tmpfs", &state]).is_some_and(|i| i > bind), "{v:?}");
+        assert!(at(&["--ro-bind", "/dev/null", &secret]).is_some_and(|i| i > bind), "{v:?}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// Hard rule: every event carries `tool_call_id`. The per-sandbox proxy's
