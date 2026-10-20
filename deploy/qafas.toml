@@ -101,6 +101,11 @@ tiers = ["native", "vm"]
 ## Env: SBX_VM_RUNTIME.
 # vm_runtime = ""
 
+## PEM file of an internal CA the egress proxy trusts, besides the system roots, when it
+## connects to a route host (docs/deployment.md 7: credential injection and L7 rules).
+## Env: SBX_EGRESS_CA_FILE.
+# egress_ca_file = ""
+
 ## Let the native tier serve `tools: ["chromium"]`. Off by default: one Chromium
 ## per process is shared across native sandboxes, so browser work goes to the vm
 ## tier unless you know that is fine.

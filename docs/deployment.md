@@ -295,14 +295,14 @@ curl -s -H "Authorization: Bearer $SBX_ADMIN_TOKEN" http://cp.example:7800/api/h
    sudo qafas doctor        # vm runtime   Docker 29.1.3: runsc: sandboxed (gVisor): ...
    ```
 
-   With the container install, add `SBX_VM_RUNTIME: ${SBX_VM_RUNTIME:-}` under `qafas.environment` in the compose file (it passes only the variables it lists) and set it in `.env`.
+   With the container install, set `SBX_VM_RUNTIME` in `.env`; `compose.yml` passes it through (it passes only the variables it lists).
 
 Verify: `qafas doctor` shows `vm runtime` with the name and `sandboxed (gVisor)` or `sandboxed (Kata)`; without the setting it shows `engine default` and `shared host kernel`. On macOS it says the engine is a VM.
 
 Notes:
 
 - The name must be one the engine has. Docker: a key of `"runtimes"` in `daemon.json` (`docker info` lists them). A name it does not know makes `qafas doctor` fail and `qafas serve` refuse to start, instead of running under the default.
-- podman applies the per-container runtime only from 6.0. Before that, `doctor` fails with "ignores the create field oci_runtime": set the runtime as the engine's default in `/etc/containers/containers.conf` (`runtime = "runsc"`, which changes every container on that engine, the proxy included) and leave `vm_runtime` empty. The line then reads `engine default, runsc`.
+- podman applies the per-container runtime only from 6.0. Before that, `doctor` fails with "ignores the create field oci_runtime": set the runtime as the engine's default in `/etc/containers/containers.conf` (under `[engine]`, `runtime = "runsc"`, and register the binary under `[engine.runtimes]` as `runsc = ["/usr/local/bin/runsc"]`; this changes every container on that engine, the proxy included) and leave `vm_runtime` empty. The line then reads `engine default, runsc`.
 - gVisor was validated on Docker 29.1.3 (gVisor release-20261012.0, systrap, Ubuntu 24.04 aarch64): the template scan grades `base` A, `trust: untrusted` creates work, and the escape battery contains everything except one probe: a command can `kill -9 1` and end its own sandbox (gVisor does not give PID 1 the protection a kernel pid namespace does; a denial of service against itself, not an escape). [security.md](security.md) (Known gaps) has the details. Kata is untested.
 
 ### 5.2 Containers
@@ -571,7 +571,7 @@ A route lets a sandbox use a credential it never holds ([D34](decisions.md#d34--
 
 - **Internal hosts with an internal CA:** set `SBX_EGRESS_CA_FILE` (config key `egress_ca_file`) to that CA's PEM. Route hosts are verified against the system roots plus that file. A route host on a private address still needs its range in `allow_private_cidrs`.
 - **The CA** lives in `<state_dir>/egress-ca/` (`/var/lib/qafas/egress-ca/` for the packages): `ca.pem`, and `ca.key` mode `0600`. It is made on the first start with routes and kept, so placeholders and every sandbox's trust survive restarts. To rotate it, delete the directory and restart `qafas`; running sandboxes keep the old placeholders, so recreate them. Warm pools need nothing: placeholders and the CA are handed over when a sandbox is acquired.
-- **Native tier:** the sandbox runs as the daemon's own user, so keep a `file://` secret where that tier cannot read: the daemon's home or state directory, not `/etc`.
+- **Native tier:** the sandbox runs as the daemon's own user, so keep a `file://` secret where that tier cannot read. `~/.qafas`, the default state directory of a non-root daemon (it holds the CA key), is hidden from native sandboxes by default, so a workspace of `$HOME` does not expose it; a state directory or secret anywhere else is safe only if the workspace does not contain it. Not `/etc`: both Seatbelt and bwrap let a native sandbox read it.
 - **Containers (section 5.2):** pass the secret as a compose secret and point the route at it:
 
   ```yaml
@@ -586,7 +586,10 @@ A route lets a sandbox use a credential it never holds ([D34](decisions.md#d34--
       file: ./github.token   # chmod 600
   ```
 
-  and in `egress.json`: `"secret": "file:///run/secrets/github_token"`. The worker hands the routes, their secrets and the CA to its proxy container in one environment variable (`SBX_ROUTES_JSON`), so anyone who can inspect containers on that host can read them: the same people who can read the secret file.
+  Compose bind-mounts the file with the host's permissions (`mode:` is ignored outside swarm), and `qafas` refuses a secret file that is group- or world-readable, so `chmod 600` the host file. In `egress.json`: `"secret": "file:///run/secrets/github_token"`. For `SBX_EGRESS_CA_FILE`, mount the PEM into the container and set the variable to its path there. The worker hands the routes, their secrets and the CA to its proxy container in one environment variable (`SBX_ROUTES_JSON`), so anyone who can inspect containers on that host can read them: the same people who can read the secret file.
+- **What is checked at start** (`serve` and `doctor` refuse a bad route, naming it, never a value): the name is `[a-z0-9_-]+` and unique; `hosts` is not all wildcards (`*`, `*.*`); `ports` and `trust` are non-empty and no port is 0; `env` is a valid variable name, unique across routes, not a protected name (`HOME`, `PATH`, the proxy variables, anything starting `LD_` or `DYLD_`) and not one of the CA variables, and it needs `secret` and the other way round; the secret is at least 8 printable ASCII characters; `inject.format` contains `{secret}` and `inject.header` is not a framing or hop-by-hop header (`Host`, `Content-Length`, `Transfer-Encoding`, …); a rule's `paths` start with `/` or `*`, its methods are letters. A path glob's `*` matches across `/`.
+- **`qafas doctor` reads `env://` secrets from its own shell**, not from the service's environment: under systemd run it with the service's variables (`sudo systemctl show qafas -p Environment`, or `sudo env NAME=… qafas doctor`), or it reports a missing secret for a service that is fine.
+- **Operational facts:** upstream certificates are verified against the first of `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem` that exists on the worker plus `SBX_EGRESS_CA_FILE`; with none of them every route host fails `upstream tls failed`. The upstream connect and handshake time out at 30 s. The proxy container's peer lookup waits 2 s and then fails closed to the host file. The CA is valid for about ten years (delete the directory to renew it). Leaf certificates are cached for 12 hours, 256 at most. On a route with a secret, the end of each response chunk is held back until the next chunk (so a secret split across two is still found), which delays a tiny server-sent event until the next one or the end of the response.
 - **Events:** each request on a route is one `egress.allow` or `egress.deny` with `method`, `path` (no query), `route` and `injected`. A rule miss is `reason: "l7 rule"`.
 
 ## 8. Operations
@@ -598,7 +601,8 @@ A route lets a sandbox use a credential it never holds ([D34](decisions.md#d34--
    - apt asks when the packaged default changed too. Keep yours (`N`; unattended, `apt-get -o Dpkg::Options::=--force-confold install …`) and compare it with the new default it leaves beside it (`qafas.toml.dpkg-dist`).
    - dnf keeps yours without asking and writes `.rpmnew`.
 3. On Firecracker workers, extract the new bundle with `tar -m` before restarting `qafas`. The `base` capture is redone automatically.
-4. Rebuild your own templates after an upgrade (dashboard → Templates → delete and recreate, or the API): they carry the guest agent from when they were built.
+4. Rebuild your own templates after an upgrade (dashboard → Templates → delete and recreate, or the API): they carry the guest agent from when they were built. A template built before 0.4 has no `POST /ca`: with routes configured its sandboxes log a warning and TLS to a route host fails closed until the template is rebuilt.
+5. Running `vm` and `native` sandboxes that were adopted from before 0.4 come back as untrusted and without their `egress_allow` (the live table gained those fields), so they get no route placeholders and no interception until they are recreated.
 
 A worker restart destroys its running `vm` sandboxes; `remote` sandboxes are paused to disk and resumed.
 

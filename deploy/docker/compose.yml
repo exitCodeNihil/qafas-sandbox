@@ -43,6 +43,8 @@ services:
       # The host's container runtime runs the sandboxes: Docker's socket by default.
       - ${CONTAINER_SOCK:-/var/run/docker.sock}:/run/qafas/runtime.sock
       - qafas-state:/var/lib/qafas
+      # An internal CA for route hosts: mount it here and set SBX_EGRESS_CA_FILE to this path.
+      # - ./internal-ca.pem:/etc/qafas/internal-ca.pem:ro
       # The directories people work in, at the same path: the daemon reads their owner to
       # mount each workspace as that owner. Add yours.
       - /home:/home
