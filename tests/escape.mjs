@@ -2,7 +2,7 @@
 // Usage: node tests/escape.mjs <qafas_url> <admin_token> <native|vm|remote> <workspace>
 // Prints probe | escaped? | alert rule(s); exits 1 if any probe escaped or a must-alert probe was silent.
 // `make escape TIER=native` runs it against a daemon on :7700 with SBX_TOKEN.
-// Run it on the daemon's host, or set HOME to the home of the user the daemon serves: the path probes use this process's HOME.
+// Run it on the daemon's host, or set HOME to the home of the user the daemon serves: on native and vm the path probes use this process's HOME (on remote, the guest's own $HOME).
 // probe | blocked? | alert rule(s) seen. Exit 1 if any probe "succeeded" (escape) or a must-alert probe had no alert.
 import net from "node:net";
 import os from "node:os";
@@ -20,7 +20,12 @@ const exec = async (cmd, timeout_ms = 15000) => {
   const res = await fetch(`${sb.endpoint}/exec`, { method: "POST", headers: { Authorization: `Bearer ${sb.token}`, "content-type": "application/json", "X-Pi-Session": `escape-${isolation}`, "X-Tool-Call-Id": "probe-" + Math.random().toString(36).slice(2, 8) }, body: JSON.stringify({ cmd, cwd: workspace, timeout_ms }) });
   return res.ok ? res.json() : { exit: -1, stdout: "", stderr: `http ${res.status}` };
 };
-const HOME = process.env.HOME;
+// The home the path probes aim at. native and vm: this process's, as before (run it where the
+// daemon serves, or set HOME). remote: a microVM shares nothing with this host, so the
+// probes use the guest user's own $HOME; this process's path does not exist there, the write
+// fails for want of a directory, and no alert is the result.
+const HOST_HOME = process.env.HOME;
+const HOME = isolation === "remote" ? (await exec(`printf %s "$HOME"`)).stdout.trim() || HOST_HOME : HOST_HOME;
 // M46: Landlock restricts TCP connect by port, not by address. This host listens on its own
 // non-loopback address at the sandbox's proxy port (from $HTTPS_PROXY) and at 3128, the port the
 // Landlock rule allowed up to 0.3.2; a connection from the sandbox to either one is an escape.
@@ -85,7 +90,7 @@ console.table(rows.map(({ probe, escaped, alerts, exit, out }) => ({ probe, esca
 const fails = rows.filter((r) => r.escaped || (r.mustAlert && r.alerts === "-"));
 console.log(fails.length ? `FAIL: ${fails.map((f) => f.probe).join(", ")}` : "ALL CONTAINED + ALERTED");
 await fetch(`${url}/sandboxes/${sb.id}`, { method: "DELETE", headers: H });
-try { (await import("node:fs")).unlinkSync(`${HOME}/sbx-escape-proof`); } catch {}
+try { (await import("node:fs")).unlinkSync(`${HOST_HOME}/sbx-escape-proof`); } catch {}
 ws.close();
 for (const srv of servers) srv.close();
 process.exit(fails.length ? 1 : 0);
