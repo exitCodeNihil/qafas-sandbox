@@ -109,10 +109,24 @@ pub fn default_toolchains(home: &str) -> Vec<String> {
 /// The credential directories of protocol §1.1, under the *real* home — the one
 /// the daemon runs as, which is what a native sandbox could otherwise reach.
 pub fn default_sensitive(real_home: &str) -> Vec<String> {
-    [".ssh", ".aws", ".config/gh", ".config/gcloud", ".kube", ".docker", ".gnupg", ".netrc", ".npmrc", ".pypirc"]
-        .iter()
-        .map(|d| format!("{real_home}/{d}"))
-        .collect()
+    // `.qafas` is the daemon's own state directory for a non-root daemon: the egress CA key
+    // (D34), the live table and the snapshots. A workspace of `$HOME` must not expose it.
+    [
+        ".ssh",
+        ".aws",
+        ".config/gh",
+        ".config/gcloud",
+        ".kube",
+        ".docker",
+        ".gnupg",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".qafas",
+    ]
+    .iter()
+    .map(|d| format!("{real_home}/{d}"))
+    .collect()
 }
 
 /// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: the per-user temp dir Apple's tools use
@@ -203,6 +217,13 @@ impl Profile {
 
 #[cfg(test)]
 mod tests {
+    /// A workspace of `$HOME` must not expose what the daemon keeps in its own state
+    /// directory (the egress CA key among it).
+    #[test]
+    fn the_daemons_own_state_directory_is_never_readable_from_a_sandbox() {
+        assert!(default_sensitive("/home/ops").contains(&"/home/ops/.qafas".to_string()));
+    }
+
     use super::*;
 
     fn template() -> String {
