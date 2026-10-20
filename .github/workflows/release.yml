@@ -3,8 +3,7 @@ name: Release
 # Release Please keeps one release PR open on main, built from conventional commits
 # (release-please-config.json). Merging it bumps the version, writes CHANGELOG.md, tags
 # vX.Y.Z and opens the GitHub release as a draft; the jobs below then build everything in
-# this same run (a tag made with the default token would not start another workflow),
-# attach it, and `finalize` publishes the release once nothing is missing:
+# this same run, attach it, and `finalize` publishes the release once nothing is missing:
 #   qafas{,-controlplane}_<v>-1_{arm64,amd64}.deb, qafas-cli_<v>-1_all.deb      Debian/Ubuntu/Mint
 #   qafas{,-controlplane}-<v>-1.{aarch64,x86_64}.rpm, qafas-cli-<v>-1.noarch.rpm  RHEL/Rocky/Alma/Fedora
 #   qafas-<v>-linux-{aarch64,x86_64}.tar.gz   qafas + guest-agent (static musl),
@@ -58,10 +57,23 @@ jobs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
+      # Release Please acts as the release GitHub App, so its release PR starts CI like any
+      # other PR. Without the App (RELEASE_APP_CLIENT_ID unset) it falls back to the workflow
+      # token, and the release PR's runs wait for approval (CLAUDE.md "Releasing").
+      - id: app
+        if: github.event_name == 'push' && vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
       - id: rp
         if: github.event_name == 'push'
         uses: googleapis/release-please-action@v4
         with:
+          token: ${{ steps.app.outputs.token || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
