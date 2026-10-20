@@ -209,13 +209,15 @@ pub struct PeerInfo {
     pub trust: proto::Trust,
 }
 
-/// `peer address -> PeerInfo`, `None` for an address no running sandbox has.
-/// The daemon answers from its live table (`AppState::peer_lookup`); the proxy
-/// container asks it over the event sink's channel (`http_peer`).
-pub type PeerLookup = Arc<dyn Fn(IpAddr) -> BoxFuture<'static, Option<PeerInfo>> + Send + Sync>;
+/// `peer address -> PeerInfo`: `Ok(None)` for an address no running sandbox
+/// has, `Err` when the daemon could not be asked (unreachable, an error status,
+/// an answer that does not parse). The daemon answers from its live table
+/// (`AppState::peer_lookup`); the proxy container asks it over the event sink's
+/// channel (`http_peer`).
+pub type PeerLookup = Arc<dyn Fn(IpAddr) -> BoxFuture<'static, Result<Option<PeerInfo>, String>> + Send + Sync>;
 
-/// How long a connection waits on the daemon's answer before it is decided
-/// on the host file alone. Loopback or the container bridge: milliseconds.
+/// How long a connection waits on the daemon's answer before the lookup counts
+/// as failed. Loopback or the container bridge: milliseconds.
 const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub struct ProxyCtx {
@@ -254,10 +256,11 @@ impl ProxyCtx {
     }
 
     /// The sandbox behind `ip`, asked of the daemon. Only the shared proxies
-    /// have someone to ask.
-    pub async fn peer_info(&self, ip: IpAddr) -> Option<PeerInfo> {
-        let look = self.peer.as_ref()?;
-        tokio::time::timeout(PEER_TIMEOUT, look(ip.to_canonical())).await.ok()?
+    /// have someone to ask; without a lookup every address is nobody's. A
+    /// timeout is a failed lookup, never an unknown peer.
+    pub async fn peer_info(&self, ip: IpAddr) -> Result<Option<PeerInfo>, String> {
+        let Some(look) = self.peer.as_ref() else { return Ok(None) };
+        tokio::time::timeout(PEER_TIMEOUT, look(ip.to_canonical())).await.unwrap_or_else(|_| Err("timed out".into()))
     }
 }
 
@@ -271,12 +274,15 @@ pub fn http_peer(sink: &str, http: HttpClient, token: String) -> Option<PeerLook
             let req = hyper::Request::get(url)
                 .header("authorization", format!("Bearer {token}"))
                 .body(Full::new(Bytes::new()))
-                .ok()?;
-            let resp = http.request(req).await.ok()?;
-            if !resp.status().is_success() {
-                return None;
+                .map_err(|e| e.to_string())?;
+            let resp = http.request(req).await.map_err(|e| format!("daemon unreachable: {e}"))?;
+            match resp.status() {
+                hyper::StatusCode::NOT_FOUND => return Ok(None),
+                s if !s.is_success() => return Err(format!("daemon answered {s}")),
+                _ => {}
             }
-            serde_json::from_slice(&resp.into_body().collect().await.ok()?.to_bytes()).ok()
+            let body = resp.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
+            serde_json::from_slice(&body).map(Some).map_err(|e| format!("daemon answer does not parse: {e}"))
         })
     }))
 }
@@ -505,8 +511,8 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &Arc<ProxyCtx>) -> a
 async fn verdict(ctx: &ProxyCtx, peer: IpAddr, host: &str, ips: &[IpAddr]) -> Result<&'static str, String> {
     match ctx.policy.decide(host, ips) {
         Err(r) if r == NOT_LISTED => match ctx.peer_info(peer).await {
-            Some(p) => ctx.policy.decide_with(host, ips, &p.egress_allow),
-            None => Err(r),
+            Ok(Some(p)) => ctx.policy.decide_with(host, ips, &p.egress_allow),
+            _ => Err(r),
         },
         v => v,
     }
@@ -690,7 +696,7 @@ mod tests {
                 "10.89.0.3" => Some(info(&[])),
                 _ => None,
             };
-            Box::pin(async move { found })
+            Box::pin(async move { Ok(found) })
         }));
 
         assert_eq!(verdict(&ctx, a, "only-a.example", &[public]).await, Ok("sandbox"));
@@ -726,7 +732,7 @@ mod tests {
         ctx.emit = Some(Arc::new(move |_, data| g.lock().unwrap().push(data)));
         ctx.peer = Some(Arc::new(|peer| {
             let allow = if peer.to_string() == "127.0.0.2" { vec!["203.0.113.7".to_string()] } else { vec![] };
-            Box::pin(async move { Some(PeerInfo { egress_allow: allow, trust: proto::Trust::Trusted }) })
+            Box::pin(async move { Ok(Some(PeerInfo { egress_allow: allow, trust: proto::Trust::Trusted })) })
         }));
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();

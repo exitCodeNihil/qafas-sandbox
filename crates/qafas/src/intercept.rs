@@ -771,6 +771,9 @@ impl Intercept {
     /// `None` when no route binds `host` for this peer: the ordinary policy
     /// decides, exactly as without routes. A peer the route does not apply to
     /// (by trust, or one the daemon does not know) is not given the host either.
+    /// A peer the daemon could not be asked about is refused: handing it to
+    /// the ordinary policy would make a route host that `allow` also lists a
+    /// blind tunnel, past the rules, for a sandbox the route applies to.
     pub async fn claim(
         &self,
         ctx: &ProxyCtx,
@@ -786,7 +789,14 @@ impl Intercept {
         }
         let trust = match ctx.trust {
             Some(t) => t,
-            None => ctx.peer_info(peer).await?.trust,
+            None => match ctx.peer_info(peer).await {
+                Ok(p) => p?.trust,
+                Err(why) => {
+                    tracing::warn!(%peer, error = %why, "peer lookup failed; a route host is refused");
+                    let first = self.routes.iter().find(|r| r.binds(&host)).map(|r| r.name.clone());
+                    return Some(Claim::Deny("peer lookup failed".into(), first.unwrap_or_default()));
+                }
+            },
         };
         let mine: Vec<usize> = (0..self.routes.len())
             .filter(|i| self.routes[*i].binds(&host) && self.routes[*i].trust.contains(&trust))
@@ -1957,6 +1967,33 @@ mod tests {
         let (ctx, _) = hook_ctx("claims2", Some(Trust::Trusted), &[]);
         assert!(matches!(ic.claim(&ctx, peer, true, IP_HOST, 443, &ip).await, Some(Claim::Tunnel(0))));
         assert!(ic.claim(&ctx, peer, true, "other.example", 443, &ip).await.is_none(), "not a route host");
+    }
+
+    /// A shared proxy that cannot ask the daemon about its peer (an error, or
+    /// no answer in time) refuses a route host, even one `allow` lists; only an
+    /// address the daemon says nobody has is left to the ordinary policy.
+    #[tokio::test]
+    async fn a_failed_peer_lookup_refuses_a_route_host() {
+        let with = |tag: &str, look: crate::proxy::PeerLookup| {
+            let (ctx, seen) = hook_ctx(tag, None, &[IP_HOST]);
+            let mut ctx = Arc::into_inner(ctx).unwrap();
+            ctx.peer = Some(look);
+            (Arc::new(ctx), seen)
+        };
+        let (ctx, seen) = with("lookup-err", Arc::new(|_| Box::pin(async { Err("daemon answered 500".to_string()) })));
+        let r = through(ctx, &format!("CONNECT {IP_HOST}:443 HTTP/1.1\r\n\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        assert_eq!(reason(&seen).await, "peer lookup failed");
+        let (ty, d) = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((ty, d["route"].as_str()), (EventType::EgressDeny, Some("ip")));
+
+        let (ip, peer): ([IpAddr; 1], IpAddr) = ([IP_HOST.parse().unwrap()], "127.0.0.1".parse().unwrap());
+        let (ctx, _) = with("lookup-hang", Arc::new(|_| Box::pin(futures_util::future::pending())));
+        let c = ctx.intercept.clone().unwrap().claim(&ctx, peer, true, IP_HOST, 443, &ip).await;
+        assert!(matches!(c, Some(Claim::Deny(r, _)) if r == "peer lookup failed"), "a timeout is a failure");
+        let (ctx, _) = with("lookup-none", Arc::new(|_| Box::pin(async { Ok(None) })));
+        let c = ctx.intercept.clone().unwrap().claim(&ctx, peer, true, IP_HOST, 443, &ip).await;
+        assert!(c.is_none(), "an address nobody has: the ordinary policy decides");
     }
 
     /// Hosts no route binds go through `handle` exactly as before.
