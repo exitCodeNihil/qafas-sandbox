@@ -500,6 +500,10 @@ impl Podman {
         if let (Some(hc), Value::Object(limits)) = (hc.as_object_mut(), docker_limits(&spec.limits)) {
             hc.extend(limits);
         }
+        // `SBX_VM_RUNTIME`: the sandbox only; the proxy container keeps the default runtime.
+        if !self.cfg.vm_runtime.is_empty() {
+            hc["Runtime"] = json!(self.cfg.vm_runtime);
+        }
         json!({
             "Image": image,
             "User": user,
@@ -576,6 +580,11 @@ impl Podman {
             // set and the network; a container_t policy that admits the workspace is
             // the upgrade path (docs/security.md).
             c["selinux_opts"] = json!(["disable"]);
+        }
+        // `SBX_VM_RUNTIME`: the sandbox only; the proxy container keeps the default runtime.
+        // podman honours `oci_runtime` from 6.0 and ignores it before, which `runtime_status` catches.
+        if !self.cfg.vm_runtime.is_empty() {
+            c["oci_runtime"] = json!(self.cfg.vm_runtime);
         }
         c
     }
@@ -1042,6 +1051,83 @@ pub async fn image_remove(name: &str) -> anyhow::Result<()> {
     )
 }
 
+/// What the engine will run a sandbox under (`SBX_VM_RUNTIME`), asked of the engine.
+#[derive(Debug)]
+pub struct RuntimeStatus {
+    /// "podman 5.6.2" or "Docker 28.3.1".
+    pub engine: String,
+    /// The runtime sandboxes get: the configured one, or the engine's default.
+    pub runtime: String,
+    pub configured: bool,
+}
+
+impl Podman {
+    /// The runtime a sandbox container will run under, or why it will not. Neither API
+    /// lists the runtimes it can start: podman's `/libpod/info` names only the default
+    /// (`host.ociRuntime`) and Docker's `/info` lists `Runtimes` from daemon.json. So Docker is
+    /// checked against that list, and podman by asking it to create (never start) a container
+    /// from `rootfs: /` with the runtime and reading back which one it recorded: podman 6.0
+    /// rejects an unknown name ("requested OCI runtime X is not available", from its source,
+    /// not run here), and podman before 6.0 (5.6.2 run, 5.8 read) ignores the `oci_runtime`
+    /// field and would run the sandbox under the default without a word, which is the silent
+    /// fallback `serve` must not take.
+    /// ponytail: a runtime that is registered but cannot start (a missing kernel module, say)
+    /// still passes here and fails on the first sandbox; the upgrade is to start the probe.
+    pub async fn runtime_status(&self) -> anyhow::Result<RuntimeStatus> {
+        self.detect().await?;
+        let want = self.cfg.vm_runtime.as_str();
+        let docker = self.is_docker();
+        let info = self.json("GET", &format!("{}/info", self.api()), None).await?;
+        let (engine, default) = match docker {
+            true => (
+                format!("Docker {}", info["ServerVersion"].as_str().unwrap_or("?")),
+                info["DefaultRuntime"].as_str().unwrap_or("runc").to_string(),
+            ),
+            false => (
+                format!("podman {}", info["version"]["Version"].as_str().unwrap_or("?")),
+                info["host"]["ociRuntime"]["name"].as_str().unwrap_or("?").to_string(),
+            ),
+        };
+        if want.is_empty() {
+            return Ok(RuntimeStatus { engine, runtime: default, configured: false });
+        }
+        if docker {
+            let known: Vec<&str> =
+                info["Runtimes"].as_object().map(|m| m.keys().map(String::as_str).collect()).unwrap_or_default();
+            anyhow::ensure!(
+                known.contains(&want),
+                "{engine} does not know the runtime {want:?} (it has: {}); register it under \"runtimes\" in daemon.json",
+                known.join(", ")
+            );
+        } else {
+            let name = "sbx-runtime-probe";
+            let _ = self.call("DELETE", &format!("{API}/containers/{name}?force=true"), None).await;
+            let spec = json!({"name": name, "rootfs": "/", "oci_runtime": want});
+            let (status, body) = self.call("POST", &format!("{API}/containers/create"), Some(spec)).await?;
+            let recorded = match (200..300).contains(&status) {
+                true => self
+                    .json("GET", &format!("{API}/containers/{name}/json"), None)
+                    .await
+                    .map(|c| c["OCIRuntime"].as_str().unwrap_or("").to_string()),
+                false => Err(anyhow::anyhow!(
+                    "{engine} refused the runtime {want:?}: {status} {}",
+                    String::from_utf8_lossy(&body).trim()
+                )),
+            };
+            let _ = self.call("DELETE", &format!("{API}/containers/{name}?force=true"), None).await;
+            let recorded = recorded?;
+            anyhow::ensure!(
+                recorded == want,
+                "{engine} ignores the create field oci_runtime (podman applies it from 6.0): its probe ran under \
+                 {recorded:?}, not {want:?}. Set {want} as the engine's default runtime in containers.conf \
+                 (runtime = \"{want}\"; the engine then refuses a name it does not have) and leave \
+                 SBX_VM_RUNTIME empty"
+            );
+        }
+        Ok(RuntimeStatus { engine, runtime: want.to_string(), configured: true })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1290,5 +1376,158 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    // --- SBX_VM_RUNTIME
+
+    fn with_runtime(runtime: &str, docker: bool) -> Podman {
+        let mut cfg = Config::resolve(crate::config::FileConfig::default());
+        cfg.vm_runtime = runtime.into();
+        let p = Podman { cfg: Arc::new(cfg), ..podman() };
+        p.docker.store(docker, std::sync::atomic::Ordering::Relaxed);
+        p
+    }
+
+    /// The sandbox containers get the runtime, in each engine's own field; empty means the engine's
+    /// default, which is no field at all.
+    #[test]
+    fn the_vm_runtime_is_in_the_sandbox_specs_when_set_and_absent_when_empty() {
+        let bare = Spec { workspace_path: "/home/agent".into(), ..spec_for() };
+        let libpod = with_runtime("runsc", false).spec(&bare, 41000, "t");
+        assert_eq!(libpod["oci_runtime"], "runsc");
+        let docker = with_runtime("runsc", true).spec(&bare, 41000, "t");
+        assert_eq!(docker["HostConfig"]["Runtime"], "runsc");
+
+        assert!(with_runtime("", false).spec(&bare, 41000, "t").get("oci_runtime").is_none());
+        assert!(with_runtime("", true).spec(&bare, 41000, "t")["HostConfig"].get("Runtime").is_none());
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+
+    /// A fake engine socket: `reply(method, path)` answers, every request is recorded with its JSON
+    /// body. `podman_api` makes `/_ping` carry the header `detect` tells podman from Docker by.
+    async fn fake_engine(
+        podman_api: bool,
+        reply: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Seen) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seen = Seen::default();
+        let (log, reply) = (seen.clone(), Arc::new(reply));
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let (log, reply) = (log.clone(), reply.clone());
+            async move {
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+                let (method, path) = (parts.method.to_string(), parts.uri.path().to_string());
+                log.lock().unwrap().push((
+                    method.clone(),
+                    path.clone(),
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                ));
+                let (status, body) = reply(&method, &path);
+                let mut resp = axum::response::Response::builder().status(status);
+                if podman_api && path == "/_ping" {
+                    resp = resp.header("libpod-api-version", "5.0.0");
+                }
+                resp.body(axum::body::Body::from(body)).unwrap()
+            }
+        });
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sock = std::env::temp_dir().join(format!("sbx-fake-engine-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let l = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (sock.display().to_string(), seen)
+    }
+
+    /// The egress proxy is not a sandbox: it keeps the engine's default runtime, whatever the
+    /// operator chose for the sandboxes. Against a fake engine, in both dialects.
+    #[tokio::test]
+    async fn the_proxy_container_keeps_the_default_runtime() {
+        let inspect = json!({"NetworkSettings": {"Networks": {NETWORK: {"IPAddress": "10.0.0.254"}}}}).to_string();
+        for docker in [false, true] {
+            let inspect = inspect.clone();
+            let (sock, seen) = fake_engine(!docker, move |m, p| match (m, p) {
+                ("GET", p) if p.ends_with("/containers/sbx-proxy/json") => (200, inspect.clone()),
+                ("POST", p) if p.ends_with("/containers/create") => (201, "{}".into()),
+                _ => (200, "{}".into()),
+            })
+            .await;
+            let p = Podman { sock, ..with_runtime("runsc", docker) };
+            p.ensure_proxy(Some("10.0.0.254"), Some("10.0.0.0/24")).await.unwrap();
+            let seen = seen.lock().unwrap();
+            let create = seen.iter().find(|(m, p, _)| m == "POST" && p.ends_with("/containers/create"));
+            let body = &create.expect("the proxy was created").2;
+            assert_eq!(body["Image"].as_str().or(body["image"].as_str()), Some("localhost/sbx-base:dev"));
+            assert!(!body.to_string().contains("runsc"), "docker={docker}: the proxy spec names the runtime: {body}");
+        }
+    }
+
+    /// Neither API lists the runtimes it can start, so each is checked the way it can answer.
+    #[tokio::test]
+    async fn the_runtime_is_checked_against_what_each_engine_exposes() {
+        let info = |v: &str| json!({"host": {"ociRuntime": {"name": "crun"}}, "version": {"Version": v}}).to_string();
+        let probe = "/v5.0.0/libpod/containers/sbx-runtime-probe";
+        // podman 6: honours the field, so the probe container records the runtime we asked for.
+        let honoured = |recorded: &'static str| {
+            let info = info("6.0.0");
+            move |m: &str, p: &str| match (m, p) {
+                ("GET", "/v5.0.0/libpod/info") => (200, info.clone()),
+                ("POST", "/v5.0.0/libpod/containers/create") => (201, "{}".into()),
+                ("GET", p) if p == format!("{probe}/json") => (200, json!({"OCIRuntime": recorded}).to_string()),
+                _ => (200, "{}".into()),
+            }
+        };
+        let (sock, seen) = fake_engine(true, honoured("runsc")).await;
+        let st = Podman { sock, ..with_runtime("runsc", false) }.runtime_status().await.unwrap();
+        assert_eq!((st.runtime.as_str(), st.configured, st.engine.as_str()), ("runsc", true, "podman 6.0.0"));
+        let create = seen.lock().unwrap().iter().find(|(_, p, _)| p.ends_with("/containers/create")).cloned().unwrap();
+        assert_eq!(create.2["oci_runtime"], "runsc", "the probe asks podman for the configured runtime");
+        let started = seen.lock().unwrap().iter().any(|(_, p, _)| p.ends_with("/start"));
+        assert!(!started, "the probe is created, never started");
+        assert!(seen.lock().unwrap().iter().any(|(m, p, _)| m == "DELETE" && p == probe), "and always removed");
+
+        // podman 5.x ignores `oci_runtime`: the probe records the default, and that is a refusal,
+        // not a quiet run under crun.
+        let (sock, seen) = fake_engine(true, honoured("crun")).await;
+        let e = Podman { sock, ..with_runtime("runsc", false) }.runtime_status().await.unwrap_err().to_string();
+        assert!(e.contains("ignores") && e.contains("runsc") && e.contains("containers.conf"), "{e}");
+        assert!(seen.lock().unwrap().iter().any(|(m, p, _)| m == "DELETE" && p == probe), "removed on failure too");
+
+        // podman 6 rejects a name it does not have.
+        let (sock, _) = fake_engine(true, |m, p| match (m, p) {
+            ("GET", "/v5.0.0/libpod/info") => (200, json!({"host": {"ociRuntime": {"name": "crun"}}}).to_string()),
+            ("POST", "/v5.0.0/libpod/containers/create") => {
+                (500, r#"{"cause":"requested OCI runtime nosuch is not available"}"#.into())
+            }
+            _ => (200, "{}".into()),
+        })
+        .await;
+        let e = Podman { sock, ..with_runtime("nosuch", false) }.runtime_status().await.unwrap_err().to_string();
+        assert!(e.contains("nosuch") && e.contains("not available"), "{e}");
+
+        // Nothing configured: the engine's default is reported, and nothing is created.
+        let (sock, seen) = fake_engine(true, honoured("crun")).await;
+        let st = Podman { sock, ..with_runtime("", false) }.runtime_status().await.unwrap();
+        assert_eq!((st.runtime.as_str(), st.configured), ("crun", false));
+        assert!(!seen.lock().unwrap().iter().any(|(m, ..)| m == "POST"), "an empty setting probes nothing");
+
+        // Docker lists its runtimes; a name outside the list is refused, naming what it has.
+        let docker = |m: &str, p: &str| match (m, p) {
+            ("GET", "/version") => (200, r#"{"Version":"28.3.1"}"#.to_string()),
+            ("GET", "/info") => (
+                200,
+                json!({"ServerVersion": "28.3.1", "DefaultRuntime": "runc", "Runtimes": {"runc": {}, "runsc": {}}})
+                    .to_string(),
+            ),
+            _ => (200, "{}".into()),
+        };
+        let (sock, _) = fake_engine(false, docker).await;
+        let st = Podman { sock: sock.clone(), ..with_runtime("runsc", false) }.runtime_status().await.unwrap();
+        assert_eq!((st.runtime.as_str(), st.engine.as_str()), ("runsc", "Docker 28.3.1"));
+        let e = Podman { sock: sock.clone(), ..with_runtime("kata", false) }.runtime_status().await.unwrap_err();
+        assert!(e.to_string().contains("does not know") && e.to_string().contains("runc, runsc"), "{e}");
+        let st = Podman { sock, ..with_runtime("", false) }.runtime_status().await.unwrap();
+        assert_eq!((st.runtime.as_str(), st.configured), ("runc", false));
     }
 }

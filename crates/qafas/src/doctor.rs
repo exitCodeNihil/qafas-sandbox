@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::backend::native;
+use crate::backend::podman::Podman;
 use crate::config::Config;
 use crate::policy::Caps;
 
@@ -37,6 +38,65 @@ async fn podman_ok(cfg: &Config) -> (bool, String) {
         Ok(_) => (true, format!("{sock}, image {}", cfg.template_image)),
         Err(e) => (false, format!("{sock}: {e}")),
     }
+}
+
+/// What a vm-tier runtime puts between a sandbox and the kernel that runs it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Isolation {
+    /// runc, crun, youki...: namespaces and seccomp on the host's (or the podman machine's) kernel.
+    SharedKernel,
+    /// gVisor or Kata: a user-space kernel, or a VM per sandbox.
+    Sandboxed(&'static str),
+}
+
+/// By name, and only the two families `docs/security.md` has an opinion on.
+/// ponytail: a name list (also matches `io.containerd.runsc.v1`, `kata-qemu`, a full path);
+/// a runtime it does not know, such as `crun-vm` or `krun`, reads as a shared kernel until it is added.
+pub fn classify_runtime(name: &str) -> Isolation {
+    let n = name.to_ascii_lowercase();
+    if n.contains("runsc") || n.contains("gvisor") {
+        Isolation::Sandboxed("gVisor")
+    } else if n.contains("kata") {
+        Isolation::Sandboxed("Kata")
+    } else {
+        Isolation::SharedKernel
+    }
+}
+
+/// The `vm runtime` line: which runtime sandboxes get, and what that isolates.
+fn runtime_detail(engine: &str, runtime: &str, configured: bool) -> String {
+    let which = if configured { runtime.to_string() } else { format!("engine default, {runtime}") };
+    let vm = cfg!(target_os = "macos");
+    let verdict = match (classify_runtime(runtime), vm) {
+        (Isolation::SharedKernel, false) => "shared host kernel: a container boundary, not a VM".to_string(),
+        (Isolation::SharedKernel, true) => {
+            "shared kernel inside the engine's VM: the VM is the boundary from this Mac".to_string()
+        }
+        (Isolation::Sandboxed(k), false) => format!("sandboxed ({k}): the host kernel is not the sandbox's kernel"),
+        (Isolation::Sandboxed(k), true) => format!("sandboxed ({k}) inside the engine's VM"),
+    };
+    format!("{engine}: {which}: {verdict}")
+}
+
+/// The runtime the vm tier's sandboxes will run under, as the engine reports it; a failure when
+/// `SBX_VM_RUNTIME` names one the engine does not have (or, on podman, would silently not apply).
+/// `None` where the vm tier is off or there is no engine to ask: the `podman` line says why.
+async fn vm_runtime_check(cfg: &Config) -> Option<Check> {
+    if !cfg.serves("vm") {
+        return None;
+    }
+    let engine = Podman::new(Arc::new(cfg.clone())).ok()?;
+    Some(match engine.runtime_status().await {
+        Ok(st) => check("vm runtime", true, runtime_detail(&st.engine, &st.runtime, st.configured)),
+        Err(e) => check("vm runtime", false, format!("{e:#}")),
+    })
+}
+
+/// Why `serve` must not start, when it must not: the vm tier would be served and its configured
+/// runtime is not usable. A silent fallback to the default runtime is the worse outcome.
+pub fn vm_runtime_refusal(checks: &[Check], caps: &Caps) -> Option<String> {
+    let bad = checks.iter().find(|c| c.name == "vm runtime" && !c.ok)?;
+    caps.vm.then(|| format!("vm runtime: {}", bad.detail))
 }
 
 pub async fn run_checks(cfg: &Config) -> Vec<Check> {
@@ -97,6 +157,9 @@ pub async fn run_checks(cfg: &Config) -> Vec<Check> {
     // --- vm
     let (pod, detail) = podman_ok(cfg).await;
     out.push(check("podman", pod, detail));
+    if pod {
+        out.extend(vm_runtime_check(cfg).await);
+    }
 
     // --- remote
     let kvm = std::path::Path::new("/dev/kvm").exists();
@@ -238,7 +301,7 @@ pub async fn run(cfg: Arc<Config>, json: bool) -> anyhow::Result<()> {
                 "serving": caps.tiers(),
             }))?
         );
-        if caps.tiers().is_empty() {
+        if caps.tiers().is_empty() || vm_runtime_refusal(&checks, &caps).is_some() {
             std::process::exit(1);
         }
         return Ok(());
@@ -262,6 +325,10 @@ pub async fn run(cfg: Arc<Config>, json: bool) -> anyhow::Result<()> {
 
     if caps.tiers().is_empty() {
         eprintln!("\nno tier is available; qafas cannot serve anything on this host");
+        std::process::exit(1);
+    }
+    if let Some(why) = vm_runtime_refusal(&checks, &caps) {
+        eprintln!("\nqafas serve would refuse to start: {why}");
         std::process::exit(1);
     }
     Ok(())
@@ -333,6 +400,44 @@ mod tests {
         assert!(hc.podman && hc.kvm && hc.firecracker && !hc.bpftrace);
         assert_eq!((hc.os.as_str(), hc.arch.as_str()), (std::env::consts::OS, std::env::consts::ARCH));
         assert!(hc.cpus > 0 && hc.mem_mib > 0, "this machine has a cpu and some memory");
+    }
+
+    /// gVisor and Kata read as sandboxed, whatever the engine calls them (a bare name, a shim name,
+    /// a path); everything else is a container on a shared kernel.
+    #[test]
+    fn runtimes_are_classified_by_what_isolates_the_sandbox() {
+        for gvisor in ["runsc", "runsc-kvm", "runsc-ptrace", "gvisor", "/usr/local/bin/runsc", "io.containerd.runsc.v1"]
+        {
+            assert_eq!(classify_runtime(gvisor), Isolation::Sandboxed("gVisor"), "{gvisor}");
+        }
+        for kata in ["kata", "kata-runtime", "kata-qemu", "kata-fc", "io.containerd.kata.v2"] {
+            assert_eq!(classify_runtime(kata), Isolation::Sandboxed("Kata"), "{kata}");
+        }
+        for shared in ["crun", "runc", "youki", "/usr/bin/crun", ""] {
+            assert_eq!(classify_runtime(shared), Isolation::SharedKernel, "{shared:?}");
+        }
+        // The line says which of the two it is, and says so about the engine default too.
+        assert!(runtime_detail("podman 5.6.2", "crun", false).contains("engine default, crun"));
+        let gv = runtime_detail("Docker 28.3.1", "runsc", true);
+        assert!(gv.contains("sandboxed (gVisor)") && !gv.contains("shared"), "{gv}");
+        let shared = runtime_detail("Docker 28.3.1", "runc", true);
+        assert!(
+            shared.contains("shared") && shared.contains(if cfg!(target_os = "macos") { "VM" } else { "host kernel" })
+        );
+    }
+
+    /// An unusable configured runtime stops `serve` only when the vm tier would be served: a host
+    /// that serves something else is not refused for a setting that does not apply to it.
+    #[test]
+    fn an_unknown_vm_runtime_refuses_only_where_the_vm_tier_is_served() {
+        let bad = vec![check("podman", true, ""), check("vm runtime", false, "no such runtime")];
+        let serving = Caps { vm: true, ..Default::default() };
+        let why = vm_runtime_refusal(&bad, &serving).expect("refused");
+        assert!(why.contains("no such runtime"), "{why}");
+        assert!(vm_runtime_refusal(&bad, &Caps { native: true, ..Default::default() }).is_none());
+        let good = vec![check("podman", true, ""), check("vm runtime", true, "")];
+        assert!(vm_runtime_refusal(&good, &serving).is_none());
+        assert!(vm_runtime_refusal(&[check("podman", true, "")], &serving).is_none(), "no check, no refusal");
     }
 
     #[tokio::test]

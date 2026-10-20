@@ -144,6 +144,10 @@ async fn serve(cfg: Arc<Config>) -> anyhow::Result<()> {
     if caps.tiers().is_empty() {
         anyhow::bail!("no tier available on this host; run `qafas doctor`");
     }
+    // An unknown SBX_VM_RUNTIME is a refusal, never a quiet run under the engine's default.
+    if let Some(why) = doctor::vm_runtime_refusal(&checks, &caps) {
+        anyhow::bail!("{why}; run `qafas doctor`");
+    }
     tracing::info!(tiers = ?caps.tiers(), "serving");
 
     let bus = events::bus();
