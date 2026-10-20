@@ -1072,7 +1072,14 @@ impl Conn {
             return text(StatusCode::FORBIDDEN, "blocked by egress policy");
         }
 
+        // An upgrade leaves HTTP, and the rules with it: only a WebSocket, whose
+        // handshake the rules just checked, is relayed. `h2c` would carry
+        // requests the rules never see.
         let upgrade = req.headers().contains_key(header::UPGRADE);
+        if upgrade && !only_websocket(req.headers()) {
+            self.deny(data, started, "upgrade other than websocket").await;
+            return text(StatusCode::BAD_REQUEST, "only a websocket upgrade is relayed");
+        }
         let from_client = upgrade.then(|| hyper::upgrade::on(&mut req));
         let (mut head, body) = req.into_parts();
         let injected = self.rewrite(&mut head, upgrade);
@@ -1090,6 +1097,10 @@ impl Conn {
             }
         };
 
+        if resp.status() == StatusCode::SWITCHING_PROTOCOLS && !only_websocket(resp.headers()) {
+            self.deny(data, started, "upstream switched to a protocol other than websocket").await;
+            return text(StatusCode::BAD_GATEWAY, "upstream unavailable");
+        }
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS && from_client.is_some() {
             // ponytail: an upgraded connection (WebSocket) is relayed as bytes,
             // after the rules check and the swap on its handshake, with no
@@ -1208,10 +1219,9 @@ impl Conn {
         }
         h.insert(header::HOST, HeaderValue::from_str(&self.authority()).expect("a host is a header value"));
         if upgrade {
+            // `request` let nothing but a WebSocket through.
             h.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-            if let Some(u) = head.headers.get(header::UPGRADE) {
-                h.insert(header::UPGRADE, u.clone());
-            }
+            h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
         } else {
             // ponytail: one upstream connection per request. Upgrade: a pool
             // per (route, address), if a route's latency ever shows in a trace.
@@ -1251,6 +1261,24 @@ impl Conn {
         });
         sender.send_request(req).await.map_err(|e| format!("upstream request failed: {e}"))
     }
+}
+
+/// The comma-separated tokens of every value of `name`, trimmed, lower-cased,
+/// empty ones dropped. A value that is not UTF-8 is a token nothing matches.
+fn tokens(h: &HeaderMap, name: HeaderName) -> Vec<String> {
+    h.get_all(name)
+        .iter()
+        .flat_map(|v| {
+            String::from_utf8_lossy(v.as_bytes()).split(',').map(|t| t.trim().to_ascii_lowercase()).collect::<Vec<_>>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// `Upgrade` names exactly the WebSocket protocol, in any case, and nothing else.
+fn only_websocket(h: &HeaderMap) -> bool {
+    let t = tokens(h, header::UPGRADE);
+    !t.is_empty() && t.iter().all(|t| t == "websocket")
 }
 
 fn redact_headers(h: &mut HeaderMap, needles: &[Vec<u8>]) {
@@ -1819,6 +1847,36 @@ mod tests {
         let mut c = open(&h, HOST).await.unwrap();
         let denied = req("GET", "/other").header(header::UPGRADE, "websocket").header(header::CONNECTION, "upgrade");
         assert_eq!(call(&mut c, denied).await.0, StatusCode::FORBIDDEN, "the rules hold for an upgrade too");
+    }
+
+    /// An upgrade to anything but a WebSocket (`h2c` would carry requests the
+    /// rules never see) is refused before it reaches the upstream.
+    #[tokio::test]
+    async fn only_a_websocket_upgrade_is_relayed() {
+        let mut r = github();
+        r["rules"] = json!([{"paths": ["/ws", "/echo"]}]);
+        let h = harness("h2c", vec![def(r, SECRET)]).await;
+        let refused = ["h2c", "websocket, h2c", "WebSocket/13", "TLS/1.2", ","];
+        for up in refused {
+            let mut c = open(&h, HOST).await.unwrap();
+            let q = req("GET", "/echo")
+                .header(header::UPGRADE, up)
+                .header(header::CONNECTION, "Upgrade, HTTP2-Settings")
+                .header("http2-settings", "AAMAAABkAAQAAP__");
+            assert_eq!(call(&mut c, q).await.0, StatusCode::BAD_REQUEST, "{up}");
+        }
+        let mut c = open(&h, HOST).await.unwrap();
+        let two = req("GET", "/echo").header(header::UPGRADE, "websocket").header(header::UPGRADE, "h2c");
+        assert_eq!(call(&mut c, two.header(header::CONNECTION, "upgrade")).await.0, StatusCode::BAD_REQUEST);
+        assert!(h.got.lock().unwrap().is_empty(), "nothing refused reached the upstream");
+        let evs = events(&h, refused.len() + 1).await;
+        assert!(evs.iter().all(|(t, d)| *t == EventType::EgressDeny && d["reason"] == "upgrade other than websocket"));
+
+        let mut c = open(&h, HOST).await.unwrap();
+        let ws = req("GET", "/ws").header(header::UPGRADE, "WebSocket").header(header::CONNECTION, "Upgrade");
+        let resp = c.send_request(ws.body(Full::new(Bytes::new())).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS, "a WebSocket in any case");
+        assert_eq!(upstream_saw(&h, 0, "upgrade"), ["websocket"]);
     }
 
     // ---------------------------------------------------------------- rules
