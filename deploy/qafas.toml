@@ -91,6 +91,16 @@ tiers = ["native", "vm"]
 ## resolver of its own either way (D7).
 # proxy_dns = []
 
+## The OCI runtime the vm tier's *sandbox* containers run under, for example
+## "runsc" (gVisor) or "kata". Empty means the engine's default (crun or runc: a
+## container on the host's kernel). The egress proxy container always keeps the
+## default. It must be registered with the engine (Docker: "runtimes" in
+## daemon.json). `qafas doctor` reports it and `qafas serve` refuses to start when
+## the engine does not have it. podman applies it from 6.0; on older podman set it
+## as the engine's default in containers.conf instead and leave this empty.
+## Env: SBX_VM_RUNTIME.
+# vm_runtime = ""
+
 ## Let the native tier serve `tools: ["chromium"]`. Off by default: one Chromium
 ## per process is shared across native sandboxes, so browser work goes to the vm
 ## tier unless you know that is fine.

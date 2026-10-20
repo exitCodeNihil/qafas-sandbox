@@ -40,6 +40,7 @@ pub struct FileConfig {
     pub scratch_dir: Option<String>,
     pub max_upload_mb: Option<u64>,
     pub proxy_dns: Option<Vec<String>>,
+    pub vm_runtime: Option<String>,
     pub native_browser: Option<bool>,
     pub native_permissive: Option<bool>,
     pub tls: Option<bool>,
@@ -124,6 +125,10 @@ pub struct Config {
     /// Optional explicit resolvers for the egress proxy container. Empty means
     /// "use the podman network's", which is the normal case.
     pub proxy_dns: Vec<String>,
+    /// OCI runtime the vm tier's *sandbox* containers run under (`runsc` for gVisor,
+    /// `kata`, ...). Empty: the engine's default. The egress proxy container always
+    /// keeps the default. `SBX_VM_RUNTIME`.
+    pub vm_runtime: String,
     /// Let the native tier serve `chromium`: one browser per process is shared there.
     pub native_browser: bool,
     /// Debug escape hatch: the OS sandbox logs instead of denying (PLAN §5 risks).
@@ -323,6 +328,7 @@ impl Config {
                 .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
                 .or(f.proxy_dns)
                 .unwrap_or_default(),
+            vm_runtime: s("SBX_VM_RUNTIME", f.vm_runtime, "").trim().to_string(),
             native_browser: flag("SBX_NATIVE_BROWSER", f.native_browser, false),
             native_permissive: flag("SBX_NATIVE_PERMISSIVE", f.native_permissive, false),
             tls: flag("SBX_TLS", f.tls, false),
@@ -437,6 +443,7 @@ mod tests {
             .env("SBX_TOKEN", "from-env")
             .env("SBX_POOL_SIZE", "3")
             .env("SBX_TIERS", "Native")
+            .env("SBX_VM_RUNTIME", " kata ")
             .output()
             .expect("re-running the test binary");
         let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -453,10 +460,12 @@ mod tests {
             token: Some("from-file".into()),
             pool_size: Some(7),
             tiers: Some(vec!["vm".into()]),
+            vm_runtime: Some("runsc".into()),
             ..Default::default()
         };
         let c = Config::resolve(f);
         assert_eq!(c.token, "from-env", "env beats the file");
+        assert_eq!(c.vm_runtime, "kata", "the runtime name too, trimmed");
         assert_eq!(c.pool_size, 3);
         assert_eq!(c.tiers, ["native"], "and it is normalised the same way");
         assert_eq!(c.host_id, "mac-local", "what no variable names still comes from the default");
@@ -468,10 +477,13 @@ mod tests {
             token: Some("from-file".into()),
             pool_size: Some(7),
             tiers: Some(vec!["VM".into()]),
+            vm_runtime: Some("runsc".into()),
             ..Default::default()
         };
         let c = Config::resolve(f);
         assert_eq!(c.token, "from-file", "file beats the default");
+        assert_eq!(c.vm_runtime, "runsc");
+        assert_eq!(Config::resolve(FileConfig::default()).vm_runtime, "", "empty = the engine's default");
         assert_eq!(c.pool_size, 7);
         assert_eq!(c.tiers, ["vm"], "tier names are normalised");
         assert_eq!(c.host_id, "mac-local", "and the default still applies elsewhere");
