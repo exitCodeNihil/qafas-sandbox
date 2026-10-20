@@ -242,10 +242,10 @@ impl Native {
         let policy = crate::proxy::Policy::load(&self.cfg.policy).with_extra(extra);
         let mut ctx = crate::proxy::ProxyCtx::new(policy, self.cfg.host_id.clone(), self.cfg.token.clone());
         // Events go straight onto the bus already carrying the sandbox id, and
-        // the tool call is recovered from whichever process group is live.
-        let corr = agent_core::Corr { pi_session, tool_call_id: String::new() };
+        // the tool call is the one forwarded to it when the connection opened.
         ctx.emit = Some(Arc::new(move |ty, data| {
-            ev.emit(&corr, ty, data);
+            let tool_call_id = crate::events::egress_call(ev.sandbox_id(), &data);
+            ev.emit(&agent_core::Corr { pi_session: pi_session.clone(), tool_call_id }, ty, data);
         }));
         let id = id.to_string();
         let task = tokio::spawn(async move {
@@ -1042,6 +1042,39 @@ mod tests {
         let n = Native::new(Arc::new(cfg), crate::events::bus()).unwrap();
         assert_eq!(n.workspace_of("abc"), "/tmp/sbx-abc");
         assert_ne!(n.workspace_of("abc"), "/tmp");
+        std::fs::remove_file(&tmpl).unwrap();
+    }
+
+    /// Hard rule: every event carries `tool_call_id`. The per-sandbox proxy's
+    /// `egress.*` takes the newest call forwarded to its sandbox.
+    #[tokio::test]
+    async fn the_native_proxys_events_carry_the_newest_tool_call() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmpl = std::env::temp_dir().join(format!("sbx-tmpl-tc-{}.sb", std::process::id()));
+        std::fs::write(&tmpl, "(version 1)").unwrap();
+        let mut cfg = crate::config::Config::resolve(crate::config::FileConfig::default());
+        cfg.seatbelt_profile = tmpl.display().to_string();
+        let bus = crate::events::bus();
+        let n = Native::new(Arc::new(cfg), bus.clone()).unwrap();
+        let mut rx = bus.subscribe();
+        let ev = Emitter::new("h", "sbx_ntc", Arc::new(move |e: Event| drop(bus.send(e))));
+        let (port, task) = n.start_proxy("sbx_ntc", &[], "sess".into(), ev).await.unwrap();
+        crate::events::note_call("sbx_ntc", &Corr { pi_session: "sess".into(), tool_call_id: "tc-n".into() });
+
+        // A literal nobody listed: denied without a DNS lookup or a network.
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        c.write_all(b"CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        c.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 403"), "{reply:?}");
+        let e = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(e.r#type, proto::EventType::EgressDeny);
+        assert_eq!(
+            (e.sandbox_id.as_str(), e.pi_session.as_str(), e.tool_call_id.as_str()),
+            ("sbx_ntc", "sess", "tc-n")
+        );
+        task.abort();
+        crate::events::forget_call("sbx_ntc");
         std::fs::remove_file(&tmpl).unwrap();
     }
 

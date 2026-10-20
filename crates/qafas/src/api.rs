@@ -281,9 +281,13 @@ impl AppState {
         let _ = self.bus.send(new_event(&self.cfg.host_id, sandbox_id, corr, ty, data));
     }
 
-    async fn touch(&self, id: &str) {
+    /// A request on its way to the guest: the idle clock restarts, and its tool
+    /// call becomes the one this sandbox's `egress.*` is attributed to. Under the
+    /// live lock, so a destroy's `forget_call` cannot be overtaken by it.
+    async fn touch(&self, id: &str, corr: &Corr) {
         if let Some(l) = self.live.lock().await.get(id) {
             l.last_activity.store(now_ms(), Ordering::Relaxed);
+            crate::events::note_call(id, corr);
         }
     }
 
@@ -876,6 +880,7 @@ async fn destroy_inner(st: &AppState, id: &str, reason: &str) -> bool {
         tracing::warn!(error = %e, sandbox_id = id, "destroy failed");
     }
     st.forget(id);
+    crate::events::forget_call(id);
     st.emit(id, &Corr::default(), EventType::SandboxDestroyed, json!({"reason": reason}));
     true
 }
@@ -1475,7 +1480,7 @@ async fn preview_proxy(State(st): State<AppState>, req: Request) -> Response {
         Ok(c) => c,
         Err(r) => return r,
     };
-    st.touch(&id).await;
+    st.touch(&id, &Corr::default()).await;
     // A macOS native sandbox's server listens on the host's loopback and its shim
     // is not allowed to dial loopback (policy/seatbelt.sb.tmpl), so qafas, which
     // is outside the sandbox, connects to the port itself. On Linux the server
@@ -1560,6 +1565,9 @@ async fn internal_events(State(st): State<AppState>, auth: Auth, Json(evs): Json
                 ev.sandbox_id = id.clone();
                 if ev.pi_session.is_empty() {
                     ev.pi_session = session.clone();
+                }
+                if ev.tool_call_id.is_empty() {
+                    ev.tool_call_id = crate::events::egress_call(id, &ev.data);
                 }
             }
         }
@@ -1823,8 +1831,8 @@ async fn agent_http(
         Ok(c) => c,
         Err(r) => return r,
     };
-    st.touch(&id).await;
     let corr = Corr::from_headers(req.headers());
+    st.touch(&id, &corr).await;
     let started = std::time::Instant::now();
     let method = req.method().clone();
     let path = query_path(req.uri());
@@ -1919,10 +1927,10 @@ async fn agent_ws(
         Ok(c) => c,
         Err(r) => return r,
     };
-    st.touch(&id).await;
+    let corr = Corr::from_headers(&headers);
+    st.touch(&id, &corr).await;
     // Everything after `/agent` is the agent path.
     let rest = uri.path().split_once("/agent/").map(|(_, r)| r.to_string()).unwrap_or_default();
-    let corr = Corr::from_headers(&headers);
     ws.on_upgrade(move |client| relay(st, id, conn, token, rest, corr, client))
 }
 
@@ -2067,6 +2075,9 @@ pub async fn shutdown(st: &AppState) {
     // must not outlast the stop (systemd gives it 60 s, a cold boot takes 83).
     st.pool.close().await;
     let all: Vec<Arc<Live>> = st.live.lock().await.drain().map(|(_, v)| v).collect();
+    for l in &all {
+        crate::events::forget_call(&l.sb.id);
+    }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(PARK_BUDGET_SECS);
     let jobs = all.into_iter().map(|l| async move {
         let rec = crate::livetable::LiveRecord::from(&*l);
@@ -2412,7 +2423,7 @@ mod tests {
         let st = state();
         assert!(agent_conn(&st, "sbx_missing").await.is_err());
         assert!(st.list().await.is_empty());
-        st.touch("sbx_missing").await;
+        st.touch("sbx_missing", &Corr::default()).await;
     }
 
     /// The timer table of §3a, in one place. `s` is seconds as milliseconds.
@@ -2774,6 +2785,118 @@ mod tests {
         let unknown = rx.try_recv().expect("an unknown peer still reaches the bus");
         assert_eq!(unknown.sandbox_id, "");
         assert_eq!(unknown.pi_session, "");
+    }
+
+    /// Hard rule: every event carries `tool_call_id`. The proxy sees a
+    /// connection, not a request, so `egress.*` gets the tool call that was
+    /// current at the sandbox when the connection opened — and a request without
+    /// one leaves it be. The interleaving is the one seen on the Mac vm tier:
+    /// A's tunnel closes, B starts, and only then does A's `egress.allow` arrive.
+    #[tokio::test]
+    async fn egress_events_carry_the_tool_call_current_when_they_opened() {
+        let st = state();
+        let dead = || Connector::Tcp("127.0.0.1:1".parse().unwrap());
+        live_at(&st, "sbx_tc", dead(), None, Some("172.16.12.2"), "sess").await;
+        live_at(&st, "sbx_tc_idle", dead(), None, Some("172.16.12.6"), "sess").await;
+        let forward = |tool_call: &str| {
+            let mut req = Request::new(axum::body::Body::empty());
+            *req.uri_mut() = "/sandboxes/sbx_tc/agent/fs/list?path=/w".parse().unwrap();
+            req.headers_mut().insert(proto::HDR_PI_SESSION, "sess".parse().unwrap());
+            if !tool_call.is_empty() {
+                req.headers_mut().insert(proto::HDR_TOOL_CALL_ID, tool_call.parse().unwrap());
+            }
+            agent_http(
+                State(st.clone()),
+                Auth { admin: true, sandbox: None },
+                Path(("sbx_tc".into(), "fs/list".into())),
+                req,
+            )
+        };
+        // The guest is a dead port: the forward fails, but it was a forward.
+        assert_eq!(forward("tc-1").await.status(), StatusCode::BAD_GATEWAY);
+        let after_a = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert_eq!(forward("tc-2").await.status(), StatusCode::BAD_GATEWAY);
+        forward("").await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        // A's tunnel opened 20 ms into A, before B: that is all the allow says.
+        let a_tunnel = after_a.elapsed().as_millis() as u64 - 20;
+
+        let mut rx = st.bus.subscribe();
+        let ev = |ty, peer: &str, duration_ms: Option<u64>| {
+            let mut data = json!({"host": "example.org", "port": 443, "peer": peer});
+            if let Some(ms) = duration_ms {
+                data["duration_ms"] = json!(ms);
+            }
+            Event {
+                id: "01".into(),
+                ts: now_rfc3339(),
+                host_id: "h".into(),
+                sandbox_id: String::new(),
+                pi_session: String::new(),
+                tool_call_id: String::new(),
+                r#type: ty,
+                data,
+            }
+        };
+        let evs = vec![
+            ev(EventType::EgressAllow, "172.16.12.2", Some(a_tunnel)),
+            ev(EventType::EgressAllow, "172.16.12.2", Some(0)),
+            ev(EventType::EgressDeny, "172.16.12.2", None),
+            ev(EventType::EgressDeny, "172.16.12.6", None),
+        ];
+        internal_events(State(st.clone()), Auth { admin: true, sandbox: None }, Json(evs)).await;
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let e = rx.try_recv().expect("an egress event");
+            assert_eq!((e.sandbox_id.as_str(), e.pi_session.as_str()), ("sbx_tc", "sess"));
+            got.push(e.tool_call_id);
+        }
+        assert_eq!(got[0], "tc-1", "A's tunnel is A's, though it arrived during B");
+        assert_eq!(got[1..], ["tc-2", "tc-2"], "the newest call, kept across a request without one");
+        let idle = rx.try_recv().expect("the neighbour's");
+        assert_eq!((idle.sandbox_id.as_str(), idle.tool_call_id.as_str()), ("sbx_tc_idle", ""), "nothing ran there");
+    }
+
+    /// The call table is as big as the live table: every way a sandbox leaves
+    /// (`DELETE`, the reaper's timers and its death check, which all end in
+    /// `destroy_inner`, and shutdown) takes its row with it.
+    #[tokio::test]
+    async fn every_destroy_path_forgets_the_sandboxs_tool_call() {
+        struct Dead;
+        impl crate::backend::Backend for Dead {
+            fn name(&self) -> &'static str {
+                "null"
+            }
+            fn create(&self, _s: Spec) -> crate::backend::BoxFut<'_, anyhow::Result<Sandbox>> {
+                Box::pin(async { anyhow::bail!("no") })
+            }
+            fn destroy(&self, _s: &Sandbox) -> crate::backend::BoxFut<'_, anyhow::Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn alive(&self, _s: &Sandbox) -> crate::backend::BoxFut<'_, bool> {
+                Box::pin(async { false })
+            }
+        }
+        let st = state_with("api-calls", Caps::default(), Arc::new(Dead));
+        let ids = ["sbx_fc_del", "sbx_fc_died", "sbx_fc_timer", "sbx_fc_down"];
+        let mut lives = Vec::new();
+        for id in ids {
+            lives.push(live_for(&st, id).await);
+            crate::events::note_call(id, &Corr { pi_session: String::new(), tool_call_id: format!("tc-{id}") });
+            assert_eq!(crate::events::egress_call(id, &json!({})), format!("tc-{id}"));
+        }
+        assert_eq!(
+            destroy(State(st.clone()), Auth { admin: true, sandbox: None }, Path(ids[0].into())).await.status(),
+            204
+        );
+        assert!(died(&st, &lives[1]).await, "the death check destroys it");
+        assert!(destroy_inner(&st, ids[2], "auto_delete").await);
+        shutdown(&st).await;
+        for id in ids {
+            assert_eq!(crate::events::egress_call(id, &json!({})), "", "{id} left its tool call behind");
+        }
+        let _ = std::fs::remove_dir_all(&st.cfg.state_dir);
     }
 
     /// E1: the shared proxies learn a sandbox's own names from the live table —

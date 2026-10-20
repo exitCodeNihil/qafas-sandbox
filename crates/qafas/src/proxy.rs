@@ -389,6 +389,7 @@ fn origin_head<'a>(method: &str, path: &str, headers: impl Iterator<Item = &'a s
 }
 
 async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow::Result<()> {
+    let opened = std::time::Instant::now();
     let (head, leftover) = read_headers(&mut sock).await?;
     let mut lines = head.split("\r\n");
     let first = lines.next().unwrap_or_default();
@@ -432,7 +433,11 @@ async fn handle(mut sock: TcpStream, peer: SocketAddr, ctx: &ProxyCtx) -> anyhow
     }
 
     let (a, b) = tokio::io::copy_bidirectional(&mut sock, &mut up).await.unwrap_or((0, 0));
-    emit(ctx, peer, EventType::EgressAllow, json!({"host": host, "port": port, "bytes": a + b, "via": via})).await;
+    // `duration_ms`: the event goes out at close, so qafas needs it to find the
+    // tool call that was current when the tunnel opened (`events::egress_call`).
+    let ms = opened.elapsed().as_millis() as u64;
+    let data = json!({"host": host, "port": port, "bytes": a + b, "via": via, "duration_ms": ms});
+    emit(ctx, peer, EventType::EgressAllow, data).await;
     Ok(())
 }
 
@@ -463,13 +468,17 @@ async fn upstream(
     port: u16,
     ips: &[IpAddr],
 ) -> Option<TcpStream> {
+    let started = std::time::Instant::now();
     let e = match TcpStream::connect(&ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect::<Vec<_>>()[..]).await {
         Ok(up) => return Some(up),
         Err(e) => e,
     };
     tracing::info!(host, port, error = %e, "upstream connect failed");
     let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-    let data = json!({"host": host, "port": port, "bytes": 0, "reason": "upstream connect failed"});
+    // A refused or timed-out connect can take a minute: like an allow, it says
+    // how long, so it is matched to the call that made it.
+    let ms = started.elapsed().as_millis() as u64;
+    let data = json!({"host": host, "port": port, "bytes": 0, "reason": "upstream connect failed", "duration_ms": ms});
     emit(ctx, peer, EventType::EgressDeny, data).await;
     None
 }
@@ -701,6 +710,7 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].0, EventType::EgressDeny);
         assert_eq!(got[0].1["reason"], "upstream connect failed");
+        assert!(got[0].1["duration_ms"].is_u64(), "it says how long, for the tool call lookup");
         assert_eq!(
             (got[0].1["host"].as_str(), got[0].1["port"].as_u64()),
             (Some("mirror.example"), Some(closed.into()))
