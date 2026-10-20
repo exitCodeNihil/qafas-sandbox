@@ -273,8 +273,13 @@ impl Ctx {
 
 // ------------------------------------------------------------------ router
 
-async fn healthz() -> Json<Healthz> {
-    Json(Healthz { ok: true, uid: nix::unistd::getuid().as_raw(), version: proto::VERSION.to_string() })
+/// `503 {"ok":false}` while the remote tier's bpftrace feed is still compiling
+/// (`Monitor::feed_pending`): the daemon waits on this before it pools, hands
+/// out or photographs a microVM, so none of them runs, or is cloned, unwatched.
+async fn healthz(State(ctx): State<Arc<Ctx>>) -> (axum::http::StatusCode, Json<Healthz>) {
+    let ok = !ctx.mon.feed_pending();
+    let code = if ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(Healthz { ok, uid: nix::unistd::getuid().as_raw(), version: proto::VERSION.to_string() }))
 }
 
 /// Bodies are parsed by hand, not with `Json`, so a plain `curl -d` with no
@@ -586,6 +591,7 @@ mod tests {
     #[tokio::test]
     async fn agent_token_guards_everything_but_healthz() {
         let ctx = Ctx::new(spawn::Hardened::default(), Emitter::null(), rules::Rules::guest("/tmp", "/tmp/nohome"));
+        ctx.mon.feed_live(); // root with bpftrace installed would otherwise answer 503 while it compiles
         let app = guard(router(ctx), Some("s3cret".to_string()));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
@@ -609,6 +615,37 @@ mod tests {
         assert_eq!(get("/processes", Some("wrong!")).await, 401);
         assert_eq!(get("/processes", Some("s3cret")).await, 200);
         assert_eq!(get("/healthz", None).await, 200);
+    }
+
+    /// The remote tier is not ready while bpftrace compiles: `/healthz` answers
+    /// 503 until the feed is live, and stops holding out after `FEED_WAIT`.
+    #[tokio::test]
+    async fn healthz_waits_for_the_kernel_feed() {
+        let ctx = Ctx::new(spawn::Hardened::default(), Emitter::null(), rules::Rules::guest("/tmp", "/tmp/nohome"));
+        ctx.mon.feed_live(); // whatever this host's own bpftrace is doing
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let app = router(ctx.clone());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let get = || async move {
+            let s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let (mut send, conn) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s)).await.unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = axum::http::Request::builder().uri("/healthz").header("host", "x");
+            send.send_request(req.body(axum::body::Body::empty()).unwrap()).await.unwrap().status().as_u16()
+        };
+        assert_eq!(get().await, 200);
+        ctx.mon.feed_pending_from(std::time::Instant::now());
+        assert_eq!(get().await, 503, "compiling: not ready");
+        ctx.mon.feed_live();
+        assert_eq!(get().await, 200, "attached (or gone): ready");
+        if let Some(t) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(61)) {
+            ctx.mon.feed_pending_from(t);
+            assert_eq!(get().await, 200, "a feed that never attaches stops holding the sandbox back");
+        }
     }
 
     /// No env, no layer: the tiers where reachability is the boundary keep
