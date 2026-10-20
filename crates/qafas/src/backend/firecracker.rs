@@ -123,12 +123,14 @@ impl Firecracker {
         let kept: BTreeSet<String> = keep.iter().map(|r| jail_id(&r.id)).collect();
         let dir = PathBuf::from(&self.cfg.fc_jail_dir).join("firecracker");
         let mut n = 0;
+        let mut killed = BTreeSet::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
                 let jail_id = e.file_name().to_string_lossy().to_string();
                 // Even a re-adopted sandbox is meant to have no process: whatever
                 // still runs under its jail id is an orphan of the previous run.
                 let _ = kill_vm(&jail_id);
+                killed.insert(jail_id.clone());
                 if kept.contains(&jail_id) {
                     continue;
                 }
@@ -139,10 +141,9 @@ impl Firecracker {
         let _ = sh("sh", &["-c", "for t in $(ip -o link | awk -F': ' '/sbxtap/{print $2}'); do ip link del $t; done"]);
         // The jailer makes `/sys/fs/cgroup/firecracker/<jail>` per VM and never
         // removes it; a live VM's dir is non-empty and `rmdir` leaves it alone.
-        if let Ok(entries) = std::fs::read_dir(host_cgroup_dir("")) {
-            for e in entries.flatten() {
-                let _ = std::fs::remove_dir(e.path());
-            }
+        let left = sweep_cgroups(&host_cgroup_dir(""), &killed, SWEEP_CGROUP_WAIT);
+        if left > 0 {
+            tracing::warn!(cgroups = left, "microVM cgroups still busy after the sweep; the next start retries");
         }
         // A `stop` keeps the guest IP so the scoped token and the endpoint stay
         // valid, which means the tap has to come back before the sandbox can be
@@ -283,11 +284,16 @@ impl Backend for Firecracker {
                 Ok(sb) => Ok(sb),
                 Err(e) => {
                     // A half-booted VM is still a firecracker process holding memory,
-                    // and its tap outlives it unless it goes here too (E1b).
+                    // and its tap outlives it unless it goes here too (E1b). So does
+                    // its cgroup: the jailer makes it before the VM exists, and it
+                    // is awaited here (not spawned like `destroy`'s) because a
+                    // create that fails at shutdown must finish this before the
+                    // runtime goes, or the dir waits for the next start's sweep.
                     let _ = kill_vm(&jail_id(&id));
                     let _ = std::fs::remove_dir_all(jail_dir(&self.cfg, &id));
                     let _ = sh("ip", &["link", "del", &tap_name(slot)]);
                     self.free_slot(slot);
+                    remove_dir_within(host_cgroup_dir(&jail_id(&id)), CGROUP_WAIT).await;
                     Err(e)
                 }
             }
@@ -515,6 +521,14 @@ fn host_cgroup_dir(jail_id: &str) -> PathBuf {
     PathBuf::from("/sys/fs/cgroup/firecracker").join(jail_id)
 }
 
+/// How long a dead VM's cgroup may stay busy while the kernel tears the VM down.
+const CGROUP_WAIT: Duration = Duration::from_secs(2);
+
+/// All the orphans' cgroups together, at startup: they are retried side by side
+/// under one deadline, so a host with twenty leftovers waits this long, not
+/// twenty times `CGROUP_WAIT`.
+const SWEEP_CGROUP_WAIT: Duration = Duration::from_secs(3);
+
 /// `rmdir` of a dead VM's jailer cgroup, off the request path. `kill_vm` returns
 /// when the process no longer matches `pgrep`, but the kernel is still tearing it
 /// down (unmapping its guest memory, reaping it) and `rmdir` answers EBUSY until
@@ -526,21 +540,55 @@ fn host_cgroup_dir(jail_id: &str) -> PathBuf {
 /// which is also what a daemon that exits inside the window gets. Upgrade: wait
 /// on the cgroup's `cgroup.events` (`populated 0`) instead of polling.
 fn remove_host_cgroup(jail_id: &str) {
-    tokio::spawn(remove_dir_within(host_cgroup_dir(jail_id), Duration::from_secs(2)));
+    tokio::spawn(remove_dir_within(host_cgroup_dir(jail_id), CGROUP_WAIT));
+}
+
+/// One `rmdir` pass: what is still there afterwards. A dir that was never there
+/// is gone; one that refuses (EBUSY: the VM is still being reaped) stays listed.
+fn rmdir_pass(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    dirs.into_iter()
+        .filter(|d| match std::fs::remove_dir(d) {
+            Ok(()) => false,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        })
+        .collect()
 }
 
 /// `rmdir` `dir`, again every 50 ms while it fails, until it is gone (a dir that
 /// was never there counts) or `within` has passed. Whether it is gone.
 async fn remove_dir_within(dir: PathBuf, within: Duration) -> bool {
     let deadline = Instant::now() + within;
+    let mut left = vec![dir];
     loop {
-        match std::fs::remove_dir(&dir) {
-            Ok(()) => return true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-            Err(_) if Instant::now() >= deadline => return false,
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        left = rmdir_pass(left);
+        if left.is_empty() {
+            return true;
         }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The startup sweep's cgroup pass over `root`: one `rmdir` of every entry (a
+/// leftover from a destroy whose retry died with the daemon goes at once), then
+/// the cgroups of the VMs this sweep just killed are retried together until
+/// `within` runs out. Another host process's live VM is not waited for: only
+/// `killed` names are. Blocking, like the `kill_vm` calls beside it. How many
+/// are still there.
+fn sweep_cgroups(root: &std::path::Path, killed: &BTreeSet<String>, within: Duration) -> usize {
+    let all: Vec<PathBuf> = std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut busy: Vec<PathBuf> = rmdir_pass(all)
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| killed.contains(n.to_string_lossy().as_ref())))
+        .collect();
+    let deadline = Instant::now() + within;
+    while !busy.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        busy = rmdir_pass(busy);
+    }
+    busy.len()
 }
 
 fn tap_name(slot: u32) -> String {
@@ -926,6 +974,60 @@ mod tests {
 
         // Never there (a VM that never got its cgroup): nothing to wait for.
         assert!(remove_dir_within(root.join("sbx-none"), Duration::from_secs(5)).await);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The startup sweep kills the previous run's VMs and then has to remove their
+    /// cgroups, which stay busy while the kernel reaps each VM: one `rmdir` per
+    /// orphan (what this replaced) left every one that had not finished behind.
+    /// Here files in temp dirs stand in for the processes.
+    #[test]
+    fn the_sweep_waits_for_the_cgroups_of_the_vms_it_killed_and_only_those() {
+        let root = std::env::temp_dir().join(format!("sbx-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let busy = |name: &str| {
+            let cg = root.join(name);
+            std::fs::create_dir(&cg).unwrap();
+            std::fs::write(cg.join("cgroup.procs"), "1\n").unwrap();
+            cg
+        };
+        // Empty already (a destroy whose retry died with the daemon): goes at once,
+        // killed by this sweep or not.
+        std::fs::create_dir(root.join("sbx-old")).unwrap();
+        // Two orphans still being reaped; they empty after 200 ms.
+        let (a, b) = (busy("sbx-a"), busy("sbx-b"));
+        // Somebody else's live VM: never waited for, never removed.
+        let foreign = busy("sbx-foreign");
+        let reap = std::thread::spawn({
+            let procs = [a.join("cgroup.procs"), b.join("cgroup.procs")];
+            move || {
+                std::thread::sleep(Duration::from_millis(200));
+                for f in procs {
+                    std::fs::remove_file(f).unwrap();
+                }
+            }
+        });
+        let killed: BTreeSet<String> = ["sbx-a", "sbx-b"].map(String::from).into();
+        let t = Instant::now();
+        assert_eq!(sweep_cgroups(&root, &killed, Duration::from_secs(5)), 0);
+        assert!(t.elapsed() >= Duration::from_millis(150), "they were busy until then");
+        assert!(t.elapsed() < Duration::from_secs(2), "and the wait ends when they are gone");
+        reap.join().unwrap();
+        assert!(!root.join("sbx-old").exists() && !a.exists() && !b.exists());
+        assert!(foreign.exists(), "a cgroup with a live process is left alone");
+
+        // Orphans that never empty: one shared deadline, not one each.
+        let stuck: Vec<_> = (0..4).map(|i| busy(&format!("sbx-stuck{i}"))).collect();
+        let killed: BTreeSet<String> = (0..4).map(|i| format!("sbx-stuck{i}")).collect();
+        let t = Instant::now();
+        assert_eq!(sweep_cgroups(&root, &killed, Duration::from_millis(300)), 4);
+        assert!(t.elapsed() >= Duration::from_millis(300), "waited the whole bound");
+        assert!(t.elapsed() < Duration::from_millis(900), "once for all four, not 4 x 300 ms: {:?}", t.elapsed());
+        assert!(stuck.iter().all(|d| d.exists()));
+
+        // A root that is not there (no firecracker cgroup yet): nothing to do.
+        assert_eq!(sweep_cgroups(&root.join("nope"), &killed, Duration::from_secs(5)), 0);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
