@@ -9,7 +9,7 @@ Data path: `pi extension → qafas → guest-agent`. The Go control plane is nev
 - v1 was frozen at Gate A (2026-09-08).
 - **v2 additions** (marked v2) were frozen 2026-09-08 for phase 2.
 - **v5 additions** (sizes, limits, usage; marked v5, §3a "v5 sizes and limits") were frozen 2026-09-15.
-- **v5.4 additions** (marked v5.4): `routes` in the egress policy file (§6: credential injection and per-request rules, D34), the `via`/`route`/`method`/`path`/`injected` fields on `egress.*` events, `POST /ca` on the guest agent, and `entropy` on `POST /restored`. All additive.
+- **v5.4 additions** (marked v5.4): `routes` in the egress policy file (§6: credential injection and per-request rules, D34), the `via`/`duration_ms`/`route`/`method`/`path`/`injected` fields on `egress.*` events, `egress_allow` honoured on every tier (the proxy container asks `GET /internal/egress/peer`), the IPv4-inside-IPv6 address rule (§6), and `POST /ca` on the guest agent. All additive.
 - A tag such as v2, v4c, v5.1, v5.3 or v5.4 marks the version that added a row, field or rule. The v3 material is §3a, §4a and §4b.
 - v1 bodies stay valid: every v2–v5 field has a default.
 
@@ -157,7 +157,7 @@ The control plane exposes every session as an OTLP trace: `GET /api/sessions/{id
 | `PUT /fs/tar?path=` | tar stream (uncompressed) | `204`; extracts under `path`, rejects `..` and absolute entries |
 | `GET /fs/tar?path=` | — | tar stream of `path` |
 | `PUT /workspace` | `{path}` | `204`; v2 |
-| `POST /ca` | `{"pem":"-----BEGIN CERTIFICATE-----…"}` | `204`; v5.4. Writes `/tmp/qafas-ca/ca.pem` and `/tmp/qafas-ca/bundle.pem` (the image's system bundle plus this CA; on the native tier `<scratch>/qafas-ca/`, because a native sandbox's `/tmp` is the host's) so TLS clients can trust the egress proxy for route hosts (§6). Idempotent; qafas calls it at acquire and on wake when the host has routes that apply to the sandbox. `400 {error}` for anything but certificates (a private key included) or a directory the agent does not own |
+| `POST /ca` | `{"pem":"-----BEGIN CERTIFICATE-----…"}` | `204`; v5.4. Writes `/tmp/qafas-ca/ca.pem` and `/tmp/qafas-ca/bundle.pem` (the image's system bundle plus this CA; on the native tier `<scratch>/qafas-ca/`, because a native sandbox's `/tmp` is the host's) so TLS clients can trust the egress proxy for route hosts (§6). Idempotent; qafas calls it at acquire and on wake when the host has routes that apply to the sandbox. `400` for anything but certificates (a private key included) or a directory the agent does not own |
 | `GET /browser/cdp` | WebSocket upgrade | relays to Chromium's browser-level DevTools socket; launches Chromium lazily on first connect |
 
 Notes on the table:
@@ -212,6 +212,7 @@ Listens on `SBX_LISTEN` (default `127.0.0.1:7700`). Every request needs `Authori
 | `GET /healthz` | — | `200 {"ok":true,"backend":"podman","host_id":"mac-local","tls_fingerprint":"<hex>"}` |
 | `POST /sandboxes/{id}/events` | `{"type":"browser.navigate","data":{"url":"…"}}` (`ClientEvent`, from the pi extension; scoped token ok) | `204` |
 | `POST /internal/events` | `[Event]` from the egress proxy container (podman mode) | `204` |
+| `GET /internal/egress/peer?ip=` | admin token only (v5.4): the egress proxy container asks which running sandbox owns a peer address, when the host file has not listed the name | `200 {"egress_allow":[…],"trust":"trusted"}`; `404` for an address no running sandbox has; `400` for a bad `ip`; `403` for a scoped token |
 
 Notes on the table:
 
@@ -786,8 +787,8 @@ How it works:
 - On `CONNECT host:port` for a route, the proxy answers `200`, terminates TLS with a certificate for `host` signed by a per-install CA, speaks HTTP/1.1 only (ALPN), and forwards each request over TLS to the addresses the policy approved (verified against the system roots plus `SBX_EGRESS_CA_FILE`).
 - The placeholder is replaced by the secret in request header values (an `Authorization: Basic` value is decoded, replaced and re-encoded) and in query values. Every copy of the secret is removed from the response headers and body before it reaches the sandbox.
 - The CA lives in `<state_dir>/egress-ca/` and is stable across restarts. qafas puts the placeholders and the CA variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `PIP_CERT`, `NODE_EXTRA_CA_CERTS`, `SBX_CA_SPKI`) in the environment of sandboxes the route applies to, and calls the guest's `POST /ca` at acquire. Chromium trusts it through `--ignore-certificate-errors-spki-list=$SBX_CA_SPKI`.
-- Events: a request inside a route tunnel gives one event `{host, port, method, path, route, injected, bytes, duration_ms, peer}` (no `via`; `reason` on a deny). A connection-level deny on a route host is `{host, port, bytes, route, reason}`. Reasons: `l7 rule`, `port N is not a route port`, `plain http to a route host`, `host header is not the tunnel's host`, `connect inside a route tunnel`, `encoded response cannot be scrubbed`, `tls handshake failed: …`, `upstream …`.
-- Inside the tunnel the proxy refuses a `Host` header or absolute URI other than the CONNECT host (domain fronting with the secret), a CONNECT, and a path that is not canonical (`.`/`..` segments, empty segments, backslashes, needless escapes) before the rules see it. On a route with a secret it sends `Accept-Encoding: identity` upstream; an upstream that compresses anyway answers `502`. The response is scrubbed of the secret in its raw, query-encoded, JSON-escaped and base64 forms, headers, body and trailers.
+- Events: a request inside a route tunnel gives one event `{host, port, method, path, route, injected, bytes, duration_ms, peer}` (no `via`; `reason` on a deny). A connection-level deny on a route host is `{host, port, bytes, route, reason}`. Reasons: the address rules' (`dns resolution failed`, `resolves to non-public address …`, `address … in deny_cidrs_extra`), `l7 rule`, `port N is not a route port`, `plain http to a route host`, `host header is not the tunnel's host`, `connect inside a route tunnel`, `encoded response cannot be scrubbed`, `tls handshake failed: …`, `upstream …`.
+- Inside the tunnel the proxy refuses a `Host` header or absolute URI other than the CONNECT host (domain fronting with the secret), and a CONNECT. On a route with `rules` it also refuses a path that is not canonical (`.`/`..` segments, empty segments, backslashes, needless escapes) before the rules see it; a route with a credential and no rules forwards any path. On a route with a secret it sends `Accept-Encoding: identity` upstream; an upstream that compresses anyway answers `502`. The response is scrubbed of the secret in its raw, query-encoded, JSON-escaped and base64 forms, headers, body and trailers.
 - Limits: HTTP/1.1 only; the request body is not rewritten; WebSocket upgrades pass after the rules check without body scrubbing; Java trust stores are not configured.
 
 ## 7. Correlation headers
