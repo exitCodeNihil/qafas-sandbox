@@ -303,7 +303,7 @@ Notes:
 
 - The name must be one the engine has. Docker: a key of `"runtimes"` in `daemon.json` (`docker info` lists them). A name it does not know makes `qafas doctor` fail and `qafas serve` refuse to start, instead of running under the default.
 - podman applies the per-container runtime only from 6.0. Before that, `doctor` fails with "ignores the create field oci_runtime": set the runtime as the engine's default in `/etc/containers/containers.conf` (`runtime = "runsc"`, which changes every container on that engine, the proxy included) and leave `vm_runtime` empty. The line then reads `engine default, runsc`.
-- gVisor was validated on Docker 29.1.3 (gVisor release-20261012.0, systrap, Ubuntu 24.04 aarch64) and is not yet fit for `trust: untrusted`: `/proc/1/environ` still exposes the agent token there, so the template scan grades `base` F and an untrusted create answers `409`; and a command can `kill -9 1` and end its own sandbox. [security.md](security.md) (Known gaps) has the details. Kata is untested.
+- gVisor was validated on Docker 29.1.3 (gVisor release-20261012.0, systrap, Ubuntu 24.04 aarch64): the template scan grades `base` A, `trust: untrusted` creates work, and the escape battery contains everything except one probe: a command can `kill -9 1` and end its own sandbox (gVisor does not give PID 1 the protection a kernel pid namespace does; a denial of service against itself, not an escape). [security.md](security.md) (Known gaps) has the details. Kata is untested.
 
 ### 5.2 Containers
 
