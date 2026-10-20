@@ -46,6 +46,11 @@ const FORK_GRACE: Duration = Duration::from_millis(500);
 const DISK_EVERY: u64 = (1000 / SWEEP.as_millis()) as u64;
 /// How often the sweep looks for stopped orphans (about 250 ms).
 const STOPPED_EVERY: u64 = (250 / SWEEP.as_millis()) as u64;
+/// How long `/healthz` waits for bpftrace to attach before reporting healthy
+/// without it (it still attaches later). 4x the 15 s measured on nested KVM.
+/// ponytail: a fixed bound, not a function of the host's load; a precompiled
+/// BPF object (D19's aya upgrade) removes the compile and this wait with it.
+const FEED_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ProcInfo {
@@ -149,6 +154,9 @@ struct Inner {
     /// and the watchdog only. On the vm tier bpftrace is absent and the sweep is
     /// the lifecycle feed as before.
     bpftrace_lifecycle: AtomicBool,
+    /// When bpftrace was started, until its BEGIN probe reports in or it exits.
+    /// While set, `/healthz` says 503 (`Monitor::feed_pending`).
+    feed_since: Mutex<Option<std::time::Instant>>,
     /// pid → when we saw its fork; cleared on exec or exit (macOS).
     #[cfg(target_os = "macos")]
     forked: Mutex<HashMap<u32, std::time::Instant>>,
@@ -182,6 +190,36 @@ impl Monitor {
             sys::spawn_canary_watch(m.clone());
         }
         m
+    }
+
+    /// True while bpftrace is still compiling its program — 15 s of one vCPU on
+    /// nested KVM. The remote tier is not ready until then: a sandbox handed out
+    /// earlier runs its first commands unwatched, and a template captured
+    /// earlier makes every clone of it compile again after its restore (both
+    /// measured: bpftrace alerts in 1 of 10 pooled sandboxes). Never true on a
+    /// tier without bpftrace, and never for longer than `FEED_WAIT`.
+    pub fn feed_pending(&self) -> bool {
+        let mut since = self.inner.feed_since.lock().unwrap();
+        match *since {
+            Some(t) if t.elapsed() >= FEED_WAIT => {
+                *since = None;
+                tracing::warn!(after = ?FEED_WAIT, "bpftrace feed not live yet; reporting healthy without it");
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Marks the feed as compiling from `t` (bpftrace's spawn) until `feed_live`.
+    pub fn feed_pending_from(&self, t: std::time::Instant) {
+        *self.inner.feed_since.lock().unwrap() = Some(t);
+    }
+
+    /// The feed attached, or bpftrace is gone and the fallbacks took over:
+    /// either way there is nothing left to wait for.
+    pub fn feed_live(&self) {
+        *self.inner.feed_since.lock().unwrap() = None;
     }
 
     /// The tool call a sandbox-wide signal belongs to: whichever exec is live.
@@ -1264,7 +1302,9 @@ tracepoint:syscalls:sys_enter_setns  { printf("{\"t\":\"setns\",\"pid\":%d,\"c\"
             .spawn();
         let Ok(mut child) = child else { return false };
         let Some(out) = child.stdout.take() else { return false };
-        tracing::info!("bpftrace attached");
+        let spawned = std::time::Instant::now();
+        mon.feed_pending_from(spawned);
+        tracing::info!("bpftrace started; compiling its program");
         // Our own syscalls and bpftrace's are noise to this feed — and worse than
         // noise: in the guest this agent is pid 1, so resolving an event by
         // reading `/proc/1/stat` trips the `/proc/1/` open probe, which produces
@@ -1279,6 +1319,8 @@ tracepoint:syscalls:sys_enter_setns  { printf("{\"t\":\"setns\",\"pid\":%d,\"c\"
                 // sweep announced, so nothing from the first seconds is lost.
                 if v["t"] == "ready" {
                     mon.inner.bpftrace_lifecycle.store(true, std::sync::atomic::Ordering::SeqCst);
+                    mon.feed_live();
+                    tracing::info!(after_ms = spawned.elapsed().as_millis() as u64, "bpftrace feed live");
                     continue;
                 }
                 let (Some(t), Some(pid)) = (v["t"].as_str(), v["pid"].as_u64()) else { continue };
@@ -1346,6 +1388,7 @@ tracepoint:syscalls:sys_enter_setns  { printf("{\"t\":\"setns\",\"pid\":%d,\"c\"
             // EOF: bpftrace refused the program or died. The sweep takes the
             // lifecycle back, and the canary watch replaces the open probe.
             mon.inner.bpftrace_lifecycle.store(false, std::sync::atomic::Ordering::SeqCst);
+            mon.feed_live();
             tracing::warn!("bpftrace stopped; falling back to the /proc sweep and the inotify canary watch");
             spawn_canary_watch(mon);
         });

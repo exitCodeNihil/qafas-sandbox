@@ -731,8 +731,12 @@ impl Firecracker {
         // init + bpftrace compile), so two or three at once on a 4-vCPU nested
         // host take 12–15 s. 15 s here failed the template capture on exactly
         // that host, and a missing template turns every create into a cold boot.
-        // 45 s still bounds a guest that never comes up.
-        super::wait_healthy(&connector, Duration::from_secs(45)).await?;
+        // The guest also holds `/healthz` at 503 until its bpftrace feed is live
+        // (15 s more nested; the guest gives up waiting after 60 s), so that no
+        // sandbox is handed out, and no template captured, unwatched. A restore
+        // of a template captured that way answers at once. 90 s still bounds a
+        // guest that never comes up.
+        super::wait_healthy(&connector, Duration::from_secs(90)).await?;
         Ok(connector)
     }
 
