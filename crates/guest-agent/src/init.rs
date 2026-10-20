@@ -240,6 +240,12 @@ pub struct RestoredReq {
     /// Unix milliseconds. Absent leaves the (stale) clock alone.
     #[serde(default)]
     pub now: Option<i64>,
+    /// Base64 of 32 bytes the daemon drew for this restore alone. Every clone
+    /// of one snapshot wakes up with the same kernel CRNG state; these bytes
+    /// are what makes its `getrandom(2)` output its own. Empty (an older
+    /// daemon) leaves the pool alone.
+    #[serde(default)]
+    pub entropy: String,
 }
 
 /// True only where the restore actually applies: PID 1 with euid 0, i.e. a
@@ -249,6 +255,10 @@ pub fn can_restore() -> bool {
 }
 
 pub fn restored(req: &RestoredReq) {
+    // First: the canary tokens below are drawn from the kernel CRNG.
+    if !req.entropy.is_empty() {
+        reseed_rng(&req.entropy);
+    }
     let _ = nix::unistd::sethostname("sandbox");
     std::env::set_var("SBX_ID", &req.id);
     if !req.ip.is_empty() {
@@ -265,6 +275,34 @@ pub fn restored(req: &RestoredReq) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/agent".into());
     agent_core::rules::Rules::replant_canaries(&home, &req.id);
     tracing::info!(id = req.id, ip = req.ip, "restored");
+}
+
+/// `_IO('R', 0x07)` from <linux/random.h>, the same number on every arch we
+/// ship; the libc crate does not define it.
+const RNDRESEEDCRNG: u32 = 0x5207;
+
+/// Mixes the daemon's bytes into the input pool (a write to `/dev/urandom`)
+/// and makes the CRNG rekey from that pool now (`RNDRESEEDCRNG`, which needs
+/// CAP_SYS_ADMIN: we are root PID 1). Without the ioctl the write would only
+/// count at the kernel's next scheduled reseed, up to a minute later, and until
+/// then every clone draws the same bytes.
+fn reseed_rng(b64: &str) {
+    use std::os::fd::AsRawFd;
+    let Some(seed) = agent_core::b64_decode(b64).filter(|s| !s.is_empty()) else {
+        return tracing::warn!("restore entropy is not base64; the kernel pool is the snapshot's");
+    };
+    let f = match std::fs::OpenOptions::new().write(true).open("/dev/urandom") {
+        Ok(f) => f,
+        Err(e) => return tracing::warn!(error = %e, "cannot open /dev/urandom; the kernel pool is the snapshot's"),
+    };
+    if let Err(e) = std::io::Write::write_all(&mut &f, &seed) {
+        return tracing::warn!(error = %e, "cannot write /dev/urandom; the kernel pool is the snapshot's");
+    }
+    // SAFETY: an argument-less ioctl on an fd we own.
+    if unsafe { libc::ioctl(f.as_raw_fd(), RNDRESEEDCRNG as _) } != 0 {
+        let e = std::io::Error::last_os_error();
+        tracing::warn!(error = %e, "RNDRESEEDCRNG failed; the new bytes count at the next reseed");
+    }
 }
 
 /// The kernel's clock froze when the snapshot was taken; `hwclock` would need a
@@ -362,8 +400,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!((r.id.as_str(), r.now), ("sbx_2", Some(1_757_325_600_123)));
+        assert!(r.entropy.is_empty(), "an older daemon sends no entropy");
         // Not PID 1 as root in a test process, so the route must refuse.
         assert!(!super::can_restore());
+    }
+
+    /// A newer daemon adds `entropy`: 32 bytes, base64.
+    #[test]
+    fn restored_body_carries_entropy() {
+        let r: super::RestoredReq = serde_json::from_str(
+            r#"{"id":"sbx_3","now":1757325600123,"entropy":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="}"#,
+        )
+        .unwrap();
+        assert_eq!(agent_core::b64_decode(&r.entropy).unwrap(), (0u8..32).collect::<Vec<_>>());
     }
 
     #[test]

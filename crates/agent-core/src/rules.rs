@@ -187,7 +187,7 @@ impl Rules {
     }
 
     fn plant(home: &str, sandbox_id: &str, overwrite: bool) {
-        let token = format!("sbx-canary-{sandbox_id}-{}", ulid::Ulid::new());
+        let token = format!("sbx-canary-{sandbox_id}-{}", crate::new_ulid());
         let files = [
             (
                 ".ssh/id_rsa",

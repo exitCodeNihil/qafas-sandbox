@@ -246,7 +246,7 @@ impl Session {
 // ------------------------------------------------------------------ spawn
 
 fn new_id() -> String {
-    ulid::Ulid::new().to_string()
+    crate::new_ulid().to_string()
 }
 
 fn valid_id(id: &str) -> bool {
