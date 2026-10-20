@@ -492,13 +492,19 @@ pub async fn restored(
     now_ms: i64,
 ) -> anyhow::Result<()> {
     let body = restored_body(id, ip, gw, proxy, now_ms);
-    // 404 is a guest image without the route: the VM works, minus the three
-    // things above, and saying so is better than refusing the restore.
-    if guest_call(conn, token, "POST", "/restored", &body).await?.0 == 404 {
-        tracing::warn!(sandbox_id = id, "guest image has no POST /restored; clock and identity are stale");
-        return Ok(());
+    // Exactly one call: a second one redoes the network and the canaries and
+    // winds the clock back to `now_ms` (~80 ms per call on nested KVM).
+    let (status, text) = guest_call(conn, token, "POST", "/restored", &body).await?;
+    match status {
+        200..=299 => Ok(()),
+        // A guest image without the route: the VM works, minus the three
+        // things above, and saying so is better than refusing the restore.
+        404 => {
+            tracing::warn!(sandbox_id = id, "guest image has no POST /restored; clock and identity are stale");
+            Ok(())
+        }
+        _ => anyhow::bail!("/restored returned {status}: {}", &text[..text.len().min(160)]),
     }
-    guest_ok(conn, token, "POST", "/restored", &body).await
 }
 
 /// `entropy` is 32 fresh bytes per restore: every clone of one snapshot wakes
@@ -539,5 +545,29 @@ mod tests {
         assert_eq!(seed(&a).len(), 32);
         assert_ne!(seed(&a), seed(&b));
         assert_eq!((a["id"].as_str(), a["now"].as_i64()), (Some("sbx_1"), Some(1)));
+    }
+
+    /// One restore is one `POST /restored`, whatever the guest answers; a 404
+    /// (an older image) is not an error, a 500 is.
+    #[tokio::test]
+    async fn a_restore_posts_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (reply, ok) in [("204 No Content", true), ("404 Not Found", true), ("500 Oops", false)] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let conn = super::Connector::Tcp(l.local_addr().unwrap());
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let h = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = l.accept().await {
+                    h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(format!("HTTP/1.0 {reply}\r\n\r\n").as_bytes()).await;
+                }
+            });
+            let r = super::restored(&conn, None, "sbx_1", "", "", "", 1).await;
+            assert_eq!(r.is_ok(), ok, "{reply}");
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "{reply}: one call per restore");
+        }
     }
 }
